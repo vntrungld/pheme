@@ -144,13 +144,29 @@ impl Config {
         Ok(Hotkeys { lock })
     }
 
-    pub fn placements(&self) -> Vec<ClientPlacement> {
+    /// The configured client placements; fails on a `span` outside `[0, 1]` or that is
+    /// empty/reversed, which would otherwise silently make an edge unreachable.
+    pub fn placements(&self) -> anyhow::Result<Vec<ClientPlacement>> {
         self.clients
             .iter()
-            .map(|c| ClientPlacement {
-                name: c.name.clone(),
-                side: c.side.into(),
-                span: c.span.map(|s| (s[0], s[1])).unwrap_or((0.0, 1.0)),
+            .map(|c| {
+                let span = c.span.map(|s| (s[0], s[1])).unwrap_or((0.0, 1.0));
+                if !(0.0..=1.0).contains(&span.0)
+                    || !(0.0..=1.0).contains(&span.1)
+                    || span.0 >= span.1
+                {
+                    bail!(
+                        "client {:?}: span must satisfy 0 <= start < end <= 1, got [{}, {}]",
+                        c.name,
+                        span.0,
+                        span.1
+                    );
+                }
+                Ok(ClientPlacement {
+                    name: c.name.clone(),
+                    side: c.side.into(),
+                    span,
+                })
             })
             .collect()
     }
@@ -206,7 +222,7 @@ side = "top"
         assert_eq!(c.role, Role::Server);
         assert_eq!(c.name, "desk");
         assert_eq!(c.hotkeys().unwrap().lock, Some(KeyCode(0x47)));
-        let p = c.placements();
+        let p = c.placements().unwrap();
         assert_eq!(p.len(), 2);
         assert_eq!(p[0].side, Side::Right);
         assert_eq!(p[0].span, (0.25, 0.75));
@@ -222,7 +238,7 @@ side = "top"
         assert!(!c.name.is_empty());
         assert_eq!(c.listen.port(), 24800);
         assert_eq!(c.hotkeys().unwrap().lock, Some(KeyCode(0x47)));
-        assert!(c.placements().is_empty());
+        assert!(c.placements().unwrap().is_empty());
     }
 
     #[test]
@@ -231,6 +247,28 @@ side = "top"
         assert!(
             toml::from_str::<Config>("[[clients]]\nname = \"x\"\nside = \"diagonal\"").is_err()
         );
+    }
+
+    #[test]
+    fn invalid_span_is_an_error() {
+        for span in [
+            "[0.5, 0.5]",
+            "[0.75, 0.25]",
+            "[-0.1, 1.0]",
+            "[0.0, 1.5]",
+            "[1.0, 1.2]",
+        ] {
+            let c: Config = toml::from_str(&format!(
+                "[[clients]]\nname = \"x\"\nside = \"left\"\nspan = {span}"
+            ))
+            .unwrap();
+            let err = c.placements().unwrap_err().to_string();
+            assert!(err.contains("span"), "{span}: {err}");
+        }
+        let c: Config =
+            toml::from_str("[[clients]]\nname = \"x\"\nside = \"left\"\nspan = [0.0, 0.5]")
+                .unwrap();
+        assert_eq!(c.placements().unwrap()[0].span, (0.0, 0.5));
     }
 
     #[test]

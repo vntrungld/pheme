@@ -17,6 +17,9 @@ use crate::{NetError, Result};
 
 const SPAKE_MSG_LEN: usize = 33;
 const SPAKE_ID: &[u8] = b"pheme";
+/// Upper bound on one server-side pairing attempt, so a client that connects and then
+/// stalls cannot hold pairing mode open until the overall pairing window expires.
+const PAIR_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub fn generate_code() -> String {
     format!("{:06}", rand::rng().random_range(0..1_000_000u32))
@@ -62,9 +65,31 @@ fn split_first_frame(bytes: &[u8]) -> Result<(Vec<u8>, String)> {
     Ok((msg.to_vec(), name.to_string()))
 }
 
-/// Server side of one pairing attempt on an already-accepted pairing connection.
+/// Server side of one pairing attempt on an already-accepted pairing connection. An
+/// attempt that does not complete within `PAIR_ATTEMPT_TIMEOUT` fails like a wrong code.
 pub async fn server_pair(
     conn: Connection,
+    client_fp: String,
+    code: &str,
+    id: &Identity,
+    trust: SharedTrust,
+) -> Result<String> {
+    match tokio::time::timeout(
+        PAIR_ATTEMPT_TIMEOUT,
+        server_pair_inner(&conn, client_fp, code, id, trust),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(_) => {
+            conn.close(3u32.into(), b"pairing attempt timed out");
+            Err(NetError::Pairing("attempt timed out".into()))
+        }
+    }
+}
+
+async fn server_pair_inner(
+    conn: &Connection,
     client_fp: String,
     code: &str,
     id: &Identity,

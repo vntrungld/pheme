@@ -4,12 +4,17 @@ use anyhow::Context;
 
 pub const UDEV_RULE: &str = "# Pheme: allow members of the input group to create virtual input devices\nKERNEL==\"uinput\", MODE=\"0660\", GROUP=\"input\", TAG+=\"uaccess\"\n";
 
+/// Makes systemd load the `uinput` module at boot (`modprobe uinput` alone does not
+/// survive a reboot on most distributions).
+pub const MODULES_LOAD: &str = "uinput\n";
+
 #[cfg(target_os = "linux")]
 pub fn run() -> anyhow::Result<()> {
     use std::path::Path;
     use std::process::Command;
 
     let rule_path = Path::new("/etc/udev/rules.d/80-pheme.rules");
+    let modules_path = Path::new("/etc/modules-load.d/pheme.conf");
     let user = std::env::var("SUDO_USER")
         .or_else(|_| std::env::var("USER"))
         .unwrap_or_default();
@@ -19,6 +24,10 @@ pub fn run() -> anyhow::Result<()> {
         println!();
         println!("  cat > {} <<'EOF'\n{}EOF", rule_path.display(), UDEV_RULE);
         println!("  udevadm control --reload && udevadm trigger --name-match=uinput");
+        println!(
+            "  modprobe uinput && echo uinput > {}",
+            modules_path.display()
+        );
         println!("  usermod -aG input {user}");
         println!();
         println!("Then log out and back in so the group change applies.");
@@ -37,6 +46,16 @@ pub fn run() -> anyhow::Result<()> {
         Command::new("udevadm").args(["trigger", "--name-match=uinput"]),
     );
     ok &= run_step("modprobe uinput", Command::new("modprobe").arg("uinput"));
+    match std::fs::write(modules_path, MODULES_LOAD) {
+        Ok(()) => println!("Wrote {} (uinput loads at boot)", modules_path.display()),
+        Err(e) => {
+            eprintln!(
+                "warning: writing {} failed: {e}; uinput will need `modprobe uinput` after each boot",
+                modules_path.display()
+            );
+            ok = false;
+        }
+    }
     if !user.is_empty() && user != "root" {
         let st = Command::new("usermod")
             .args(["-aG", "input", &user])
@@ -108,6 +127,11 @@ pub fn run() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn modules_load_entry_names_the_uinput_module() {
+        assert_eq!(MODULES_LOAD, "uinput\n");
+    }
 
     #[test]
     fn udev_rule_targets_uinput_for_the_input_group() {

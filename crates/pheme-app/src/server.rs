@@ -386,7 +386,7 @@ pub async fn main(cfg: Config, pair: bool, stats: bool) -> anyhow::Result<()> {
             name: cfg.name.clone(),
             capture,
             endpoint,
-            placements: cfg.placements(),
+            placements: cfg.placements()?,
             hotkeys: cfg.hotkeys()?,
             stats,
         },

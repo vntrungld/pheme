@@ -29,6 +29,14 @@ Status: early development — see `docs/superpowers/specs/` for the design.
 
 `ScrollLock` toggles the input lock. `--stats` prints RTT and traffic counters.
 
-Linux server support requires an X11 session for now (Wayland capture is planned).
+## Limitations (sub-project 1)
+
+- One client at a time: the server serves a single client connection; another
+  client is not served until that one disconnects.
+- IPv4 only.
+- A Linux **server** needs an X11 session (input capture uses XInput2). A Linux
+  **client** works under X11 or Wayland (injection goes through uinput).
+- Wayland capture and macOS support come in later sub-projects; audio and clipboard
+  forwarding are not implemented yet.
 
 See `docs/testing.md` for the manual test checklist.

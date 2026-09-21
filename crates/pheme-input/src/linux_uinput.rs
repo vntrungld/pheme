@@ -25,10 +25,17 @@ pub struct UinputInject {
     wheel_acc: (i32, i32),
 }
 
+const ENODEV: i32 = 19;
+
 fn io_err(e: std::io::Error) -> Error {
     if e.kind() == std::io::ErrorKind::PermissionDenied {
         Error::Permission(
             "cannot open /dev/uinput; run `pheme setup` (udev rule + input group) and log in again"
+                .into(),
+        )
+    } else if e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(ENODEV) {
+        Error::Backend(
+            "/dev/uinput is missing: run `sudo modprobe uinput` (pheme setup also persists it)"
                 .into(),
         )
     } else {
