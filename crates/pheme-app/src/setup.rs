@@ -27,24 +27,62 @@ pub fn run() -> anyhow::Result<()> {
     std::fs::write(rule_path, UDEV_RULE)
         .with_context(|| format!("writing {}", rule_path.display()))?;
     println!("Wrote {}", rule_path.display());
-    let _ = Command::new("udevadm")
-        .args(["control", "--reload"])
-        .status();
-    let _ = Command::new("udevadm")
-        .args(["trigger", "--name-match=uinput"])
-        .status();
-    let _ = Command::new("modprobe").arg("uinput").status();
+    let mut ok = true;
+    ok &= run_step(
+        "udevadm control --reload",
+        Command::new("udevadm").args(["control", "--reload"]),
+    );
+    ok &= run_step(
+        "udevadm trigger --name-match=uinput",
+        Command::new("udevadm").args(["trigger", "--name-match=uinput"]),
+    );
+    ok &= run_step("modprobe uinput", Command::new("modprobe").arg("uinput"));
     if !user.is_empty() && user != "root" {
         let st = Command::new("usermod")
             .args(["-aG", "input", &user])
             .status()
-            .context("running usermod")?;
+            .with_context(|| format!("running usermod -aG input {user}"))?;
         if st.success() {
             println!("Added {user} to the input group. Log out and back in for it to apply.");
+        } else {
+            let code = st
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "signal".to_string());
+            anyhow::bail!(
+                "usermod -aG input {user} failed (exit {code}); add the user to the input group manually"
+            );
         }
     }
-    println!("Setup complete.");
+    if ok {
+        println!("Setup complete.");
+    } else {
+        println!(
+            "Setup finished with warnings (see above); reboot or reload udev manually if /dev/uinput stays inaccessible."
+        );
+    }
     Ok(())
+}
+
+/// Runs `cmd`, printing a `warning:` line to stderr and returning `false` on
+/// spawn error or non-zero exit; returns `true` on success.
+#[cfg(target_os = "linux")]
+fn run_step(desc: &str, cmd: &mut std::process::Command) -> bool {
+    match cmd.status() {
+        Ok(st) if st.success() => true,
+        Ok(st) => {
+            let code = st
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "signal".to_string());
+            eprintln!("warning: {desc} failed: exit {code}");
+            false
+        }
+        Err(e) => {
+            eprintln!("warning: {desc} failed: {e}");
+            false
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
