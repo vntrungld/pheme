@@ -102,16 +102,22 @@ impl InputCapture for X11Capture {
             .take()
             .ok_or_else(|| Error::Backend("already started".into()))?;
         let wake_window = self.wake_window;
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let thread = std::thread::Builder::new()
             .name("pheme-x11".into())
             .spawn(move || {
-                if let Err(e) = event_loop(tx, cmd_rx, wake_window) {
+                if let Err(e) = event_loop(tx, cmd_rx, wake_window, ready_tx) {
                     error!("x11 event loop ended: {e}");
                 }
             })
             .map_err(be)?;
         self.thread = Some(thread);
-        Ok(())
+        // Wait for the event thread to select raw events and the wake-window
+        // property mask, so a command sent right after `start()` returns is
+        // never stranded (the thread wasn't watching for it yet).
+        ready_rx.recv().map_err(|_| {
+            Error::Backend("x11 event thread exited before signaling readiness".into())
+        })?
     }
 
     fn set_mode(&mut self, mode: CaptureMode) -> Result<()> {
@@ -132,9 +138,18 @@ impl InputCapture for X11Capture {
 
     fn stop(&mut self) {
         let _ = self.cmd_tx.send(Cmd::Stop);
-        let _ = self.wake();
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
+        match self.wake() {
+            Ok(()) => {
+                if let Some(t) = self.thread.take() {
+                    let _ = t.join();
+                }
+            }
+            Err(e) => {
+                // The event thread will never see the Stop command without the
+                // wake-up; joining would hang forever. Detach it instead.
+                error!("x11 stop: wake failed, detaching event thread: {e}");
+                self.thread.take();
+            }
         }
     }
 }
@@ -146,6 +161,11 @@ struct EventLoop {
     keyboard: u16,
     center: (i16, i16),
     mode: CaptureMode,
+    /// Fractional motion left over after truncating to whole-pixel deltas
+    /// (libinput reports raw deltas normalised to 1000 DPI, which are
+    /// often sub-pixel for slow movement).
+    rem_x: f64,
+    rem_y: f64,
     tx: Sender<CaptureEvent>,
 }
 
@@ -154,7 +174,7 @@ fn fp3232(v: xinput::Fp3232) -> f64 {
 }
 
 /// Extracts (x, y) deltas from a raw motion event's valuator mask/values.
-fn raw_xy(mask: &[u32], values: &[xinput::Fp3232]) -> (i32, i32) {
+fn raw_xy(mask: &[u32], values: &[xinput::Fp3232]) -> (f64, f64) {
     let bit = |axis: usize| {
         mask.get(axis / 32)
             .map(|m| m & (1 << (axis % 32)) != 0)
@@ -170,7 +190,7 @@ fn raw_xy(mask: &[u32], values: &[xinput::Fp3232]) -> (i32, i32) {
     if bit(1) {
         dy = values.get(idx).map(|v| fp3232(*v)).unwrap_or(0.0);
     }
-    (dx.round() as i32, dy.round() as i32)
+    (dx, dy)
 }
 
 /// The raw XI2 event mask this backend watches, as a single OR'd value.
@@ -220,6 +240,10 @@ impl EventLoop {
         }
         let pointer = pointer.ok_or_else(|| be("no master pointer"))?;
         let keyboard = keyboard.ok_or_else(|| be("no master keyboard"))?;
+        // `.check()` forces a round-trip, so by the time `EventLoop::new`
+        // returns we know the server has registered both selections; the
+        // caller uses that as the readiness signal before it lets commands
+        // through (see `start()`).
         conn.xinput_xi_select_events(
             root,
             &[xinput::EventMask {
@@ -227,11 +251,15 @@ impl EventLoop {
                 mask: vec![raw_event_mask()],
             }],
         )
+        .map_err(be)?
+        .check()
         .map_err(be)?;
         conn.change_window_attributes(
             wake_window,
             &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
         )
+        .map_err(be)?
+        .check()
         .map_err(be)?;
         conn.flush().map_err(be)?;
         info!(pointer, keyboard, "x11 capture ready");
@@ -242,6 +270,8 @@ impl EventLoop {
             keyboard,
             center,
             mode: CaptureMode::Observe,
+            rem_x: 0.0,
+            rem_y: 0.0,
             tx,
         })
     }
@@ -285,6 +315,8 @@ impl EventLoop {
                 self.conn.xfixes_hide_cursor(self.root).map_err(be)?;
                 self.warp_center()?;
                 self.mode = CaptureMode::Grab;
+                self.rem_x = 0.0;
+                self.rem_y = 0.0;
                 debug!("grabbed");
                 return Ok(());
             }
@@ -347,8 +379,14 @@ impl EventLoop {
             Event::XinputRawMotion(m) => {
                 if self.mode == CaptureMode::Grab {
                     let (dx, dy) = raw_xy(&m.valuator_mask, &m.axisvalues_raw);
-                    if dx != 0 || dy != 0 {
-                        self.send(CaptureEvent::MotionRel { dx, dy });
+                    self.rem_x += dx;
+                    self.rem_y += dy;
+                    let ix = self.rem_x.trunc() as i32;
+                    let iy = self.rem_y.trunc() as i32;
+                    self.rem_x -= ix as f64;
+                    self.rem_y -= iy as f64;
+                    if ix != 0 || iy != 0 {
+                        self.send(CaptureEvent::MotionRel { dx: ix, dy: iy });
                     }
                     self.warp_center()?;
                 } else {
@@ -404,14 +442,33 @@ impl EventLoop {
                 };
                 self.send(CaptureEvent::Key { code, down });
             }
+            Event::Error(e) => warn!(?e, "x11 error event"),
             _ => {}
         }
         Ok(())
     }
 }
 
-fn event_loop(tx: Sender<CaptureEvent>, cmd_rx: Receiver<Cmd>, wake_window: u32) -> Result<()> {
-    let mut lp = EventLoop::new(tx, wake_window)?;
+fn event_loop(
+    tx: Sender<CaptureEvent>,
+    cmd_rx: Receiver<Cmd>,
+    wake_window: u32,
+    ready_tx: std::sync::mpsc::Sender<Result<()>>,
+) -> Result<()> {
+    let mut lp = match EventLoop::new(tx, wake_window) {
+        Ok(lp) => lp,
+        Err(e) => {
+            let _ = ready_tx.send(Err(e));
+            return Ok(());
+        }
+    };
+    // Raw events and the wake-window property mask are selected (and the
+    // selection round-tripped) by this point; safe to let `start()` return
+    // and commands start flowing.
+    if ready_tx.send(Ok(())).is_err() {
+        // The caller gave up waiting; nothing more to do.
+        return Ok(());
+    }
     loop {
         let ev = lp.conn.wait_for_event().map_err(be)?;
         if let Event::PropertyNotify(p) = &ev {
@@ -419,10 +476,14 @@ fn event_loop(tx: Sender<CaptureEvent>, cmd_rx: Receiver<Cmd>, wake_window: u32)
                 while let Ok(cmd) = cmd_rx.try_recv() {
                     match cmd {
                         Cmd::SetMode(CaptureMode::Grab) if lp.mode != CaptureMode::Grab => {
-                            lp.grab()?
+                            if let Err(e) = lp.grab() {
+                                error!("grab failed: {e}");
+                            }
                         }
                         Cmd::SetMode(CaptureMode::Observe) if lp.mode != CaptureMode::Observe => {
-                            lp.ungrab()?
+                            if let Err(e) = lp.ungrab() {
+                                error!("ungrab failed: {e}");
+                            }
                         }
                         Cmd::SetMode(_) => {}
                         Cmd::Stop => {
