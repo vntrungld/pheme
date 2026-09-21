@@ -127,9 +127,9 @@ pub trait AudioPlayback: Send {
 }
 
 pub enum Error {
-    Unsupported(&'static str),   // no backend for this platform/session
-    Device(String),              // device open/format failure
-    Backend(String),             // backend-internal failure
+    Unsupported(String),   // no backend for this platform/session
+    Device(String),        // device open/format failure
+    Backend(String),       // backend-internal failure
 }
 
 pub fn detect_capture(device: Option<&str>) -> Result<Box<dyn AudioCapture>, Error>;
@@ -189,7 +189,7 @@ pub enum Pop {
 pub struct JitterStats {
     pub depth: usize, pub target: usize,
     pub lost: u64, pub late: u64, pub dup: u64,
-    pub underruns: u64, pub resets: u64,
+    pub underruns: u64, pub resets: u64, pub malformed: u64,
 }
 
 impl JitterBuffer {
@@ -208,7 +208,8 @@ Behaviour:
 | Out-of-order frame not yet passed | stored — this is what the buffer is for |
 | `seq` <= last popped | dropped, `late += 1` |
 | `seq` already stored | dropped, `dup += 1` |
-| `seq` jumps backwards, or a gap > 200 frames (1 s) | flush, `resets += 1`, re-prefill |
+| Payload length is not exactly 960 bytes | dropped, `malformed += 1` |
+| A gap > 200 frames (1 s), ahead or behind | flush, `resets += 1`, re-prefill |
 | Pop while depth < target (startup or after reset) | `Idle` |
 | Pop with the next `seq` present | `Data`, `depth` recomputed |
 | Pop with the next `seq` missing, last real frame **not** silent | `lost += 1`, `underruns += 1`, `Conceal` |
@@ -337,10 +338,13 @@ device just because the peer went away.
 
 A `pw::Stream` in `Direction::Output`, `media.class = "Audio/Playback"`,
 same format, `node.latency = "240/48000"`. With no target it follows the
-default sink. With `audio.playback_device` set, the backend matches the
-value against `node.name` first and `node.description` second; no match
-logs a warning and falls back to the default. `rate()` returns 48000
-because PipeWire performs any device-rate conversion itself.
+default sink. With `audio.playback_device` set, the backend passes the
+value to PipeWire as `target.object`, which matches a node name or
+serial; an unknown value falls back to the default sink. Matching a
+human-readable description would need a registry walk and is not worth
+the code for v1 — `pactl list sinks short` prints the node names.
+`rate()` returns 48000 because PipeWire performs any device-rate
+conversion itself.
 
 `on_process` fills the buffer from the `rtrb` consumer and pads with
 silence on underrun.
@@ -486,14 +490,20 @@ depth.
 Over a real QUIC connection with mock input and mock audio backends:
 
 1. `audio_flows_client_to_server`: the client's mock capture emits a
-   440 Hz sine for 2 s of audio time; the server's mock playback recording
-   matches the transmitted sequence after the prefill offset, sample for
-   sample.
-2. `audio_survives_datagram_loss`: with 5 % of audio datagrams dropped in
-   the test harness, playback continues with zero `Idle` frames and the
-   recording length matches the expected duration within one frame.
+   440 Hz sine; the server's mock playback recording carries a tone of
+   the same amplitude. The comparison is on level and length, not sample
+   for sample, because the playback resampler filters even at a ratio of
+   1.0.
+2. `silence_stops_the_traffic_and_resuming_restores_it`: after 200 ms of
+   silence the client stops sending and `audio_suppressed` rises while
+   `audio_sent` stops; resuming the tone makes playback resume.
 3. `audio_failure_does_not_break_kvm`: the mock capture backend fails to
    start; an edge crossing still switches control and keys still arrive.
+
+Packet loss is not one of these: QUIC on loopback does not drop
+datagrams, and a harness that dropped them would be testing itself. Loss
+handling is covered by the `jitter.rs` unit tests, which can create any
+loss pattern exactly.
 
 ## 7. Latency budget
 
