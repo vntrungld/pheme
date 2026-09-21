@@ -71,5 +71,12 @@ pub fn detect_capture() -> Result<Box<dyn InputCapture>> {
 
 /// Picks the injection backend for this OS.
 pub fn detect_inject() -> Result<Box<dyn InputInject>> {
-    Err(Error::Unsupported("not yet implemented".into()))
+    #[cfg(target_os = "linux")]
+    {
+        linux_uinput::UinputInject::new().map(|i| Box::new(i) as Box<dyn InputInject>)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(Error::Unsupported("not yet implemented".into()))
+    }
 }
