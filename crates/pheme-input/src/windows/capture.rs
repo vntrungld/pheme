@@ -1,5 +1,6 @@
 //! WH_KEYBOARD_LL / WH_MOUSE_LL hooks for observe+grab, Raw Input for unaccelerated deltas.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::thread::JoinHandle;
 
@@ -8,7 +9,9 @@ use pheme_core::{CaptureEvent, Rect};
 use pheme_proto::{Button, ScreenInfo};
 use tracing::{debug, error, info, warn};
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    GetLastError, ERROR_CLASS_ALREADY_EXISTS, HMODULE, HWND, LPARAM, LRESULT, RECT, WPARAM,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{VK_NUMLOCK, VK_PAUSE, VK_SNAPSHOT};
@@ -17,15 +20,15 @@ use windows::Win32::UI::Input::{
     RAWINPUTDEVICE, RAWINPUTHEADER, RIDEV_INPUTSINK, RID_INPUT, RIM_TYPEMOUSE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, ClipCursor, CreateCursor, CreateWindowExW, DefWindowProcW, DispatchMessageW,
-    GetMessageW, PostThreadMessageW, RegisterClassW, SetCursorPos, SetSystemCursor,
-    SetWindowsHookExW, SystemParametersInfoW, TranslateMessage, UnhookWindowsHookEx, HHOOK,
-    HWND_MESSAGE, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED, MSG,
-    MSLLHOOKSTRUCT, OCR_NORMAL, SPI_SETCURSORS, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
-    WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_INPUT, WM_KEYDOWN,
-    WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
-    WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW,
+    CallNextHookEx, ClipCursor, CreateCursor, CreateWindowExW, DefWindowProcW, DestroyCursor,
+    DestroyWindow, DispatchMessageW, GetMessageW, PostThreadMessageW, RegisterClassW, SetCursorPos,
+    SetSystemCursor, SetWindowsHookExW, SystemParametersInfoW, TranslateMessage,
+    UnhookWindowsHookEx, UnregisterClassW, HHOOK, HWND_MESSAGE, KBDLLHOOKSTRUCT, LLKHF_EXTENDED,
+    LLKHF_INJECTED, LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT, OCR_NORMAL, SPI_SETCURSORS,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_APP, WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW,
 };
 
 use crate::keymap::{scancode_to_hid, KEY_NUM_LOCK, KEY_PAUSE, KEY_PRINT_SCREEN};
@@ -35,6 +38,8 @@ use crate::{CaptureMode, Error, InputCapture, Result};
 const WM_SET_MODE: u32 = WM_APP + 1;
 const WM_STOP: u32 = WM_APP + 2;
 
+const WNDCLASS_NAME: PCWSTR = w!("PhemeRawInput");
+
 struct Hooks {
     tx: Sender<CaptureEvent>,
     grab: bool,
@@ -43,10 +48,17 @@ struct Hooks {
 /// Shared with the hook procedures (they are plain functions without a `self`).
 static HOOKS: Mutex<Option<Hooks>> = Mutex::new(None);
 
+/// Count of events dropped because the channel was full; logged at a decaying rate so a
+/// stalled consumer does not spam the log from inside the hook procedures.
+static DROPPED: AtomicU64 = AtomicU64::new(0);
+
 fn send(ev: CaptureEvent) {
     if let Some(h) = HOOKS.lock().unwrap().as_ref() {
         if h.tx.try_send(ev).is_err() {
-            warn!("capture channel full; dropping event");
+            let n = DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() || n % 1000 == 0 {
+                warn!(dropped = n, "capture channel full; dropping event");
+            }
         }
     }
 }
@@ -168,7 +180,7 @@ unsafe extern "system" fn wnd_proc(
                 });
             }
         }
-        return LRESULT(0);
+        // Fall through to DefWindowProc as the Raw Input docs require, for cleanup.
     }
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }
@@ -196,8 +208,18 @@ impl WindowsCapture {
     }
 }
 
+impl Drop for WindowsCapture {
+    /// Ensures a capture dropped while grabbed still restores the system cursor, unclips it
+    /// and unhooks; `stop()` is idempotent so this is safe even after an explicit `stop()`.
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 /// Everything that lives on the hook thread.
 struct HookThread {
+    hinst: HMODULE,
+    hwnd: HWND,
     kbd: HHOOK,
     mouse: HHOOK,
     center: (i32, i32),
@@ -210,15 +232,22 @@ impl HookThread {
         let class = WNDCLASSW {
             lpfnWndProc: Some(wnd_proc),
             hInstance: hinst.into(),
-            lpszClassName: w!("PhemeRawInput"),
+            lpszClassName: WNDCLASS_NAME,
             ..Default::default()
         };
+        // The window class is process-global; `uninstall` unregisters it, but treat
+        // "already registered" (e.g. a prior instance that failed partway through install,
+        // so `uninstall` never ran) as success too, so a retried or fresh `start()` after
+        // `stop()` does not fail with ERROR_CLASS_ALREADY_EXISTS.
         if RegisterClassW(&class) == 0 {
-            return Err(Error::Backend("RegisterClassW failed".into()));
+            let err = GetLastError();
+            if err != ERROR_CLASS_ALREADY_EXISTS {
+                return Err(Error::Backend(format!("RegisterClassW failed: {err:?}")));
+            }
         }
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
-            w!("PhemeRawInput"),
+            WNDCLASS_NAME,
             PCWSTR::null(),
             WINDOW_STYLE(0),
             0,
@@ -244,6 +273,8 @@ impl HookThread {
         let mouse = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), None, 0)
             .map_err(|e| Error::Backend(format!("mouse hook: {e}")))?;
         Ok(HookThread {
+            hinst,
+            hwnd,
             kbd,
             mouse,
             center,
@@ -290,9 +321,13 @@ impl HookThread {
             xor_mask.as_ptr() as *const _,
         ) {
             Ok(blank) => {
-                // SetSystemCursor takes ownership of the handle.
+                // SetSystemCursor takes ownership of the handle on success only; on failure
+                // the handle is still ours to free.
                 if let Err(e) = SetSystemCursor(blank, OCR_NORMAL) {
                     warn!("SetSystemCursor failed: {e}");
+                    if let Err(e) = DestroyCursor(blank) {
+                        debug!("DestroyCursor failed: {e}");
+                    }
                 } else {
                     self.hidden = true;
                 }
@@ -319,6 +354,15 @@ impl HookThread {
         }
         let _ = UnhookWindowsHookEx(self.kbd);
         let _ = UnhookWindowsHookEx(self.mouse);
+        if let Err(e) = DestroyWindow(self.hwnd) {
+            debug!("DestroyWindow failed: {e}");
+        }
+        // Unregister the class so a later `start()` (retry, or after `stop()`) does not hit
+        // ERROR_CLASS_ALREADY_EXISTS; window classes are process-global and otherwise outlive
+        // this HookThread.
+        if let Err(e) = UnregisterClassW(WNDCLASS_NAME, Some(self.hinst.into())) {
+            debug!("UnregisterClassW failed: {e}");
+        }
         *HOOKS.lock().unwrap() = None;
     }
 }
