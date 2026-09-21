@@ -70,7 +70,11 @@ pub fn detect_capture() -> Result<Box<dyn InputCapture>> {
     {
         linux_x11::X11Capture::new().map(|c| Box::new(c) as Box<dyn InputCapture>)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    {
+        Ok(Box::new(windows::WindowsCapture::new()))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         Err(Error::Unsupported("not yet implemented".into()))
     }
@@ -82,7 +86,11 @@ pub fn detect_inject() -> Result<Box<dyn InputInject>> {
     {
         linux_uinput::UinputInject::new().map(|i| Box::new(i) as Box<dyn InputInject>)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    {
+        Err(Error::Unsupported("not yet implemented".into()))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         Err(Error::Unsupported("not yet implemented".into()))
     }
