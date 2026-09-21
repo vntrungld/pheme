@@ -18,9 +18,6 @@ use crate::verifier::PinnedVerifier;
 use crate::{NetError, Result, ALPN_MAIN, ALPN_PAIR};
 
 const CONTROL_BUFFER: usize = 256;
-/// How long `connect_raw` waits, after the local handshake completes, for an asynchronous
-/// mandatory-client-cert rejection from the peer before trusting the connection.
-const REJECT_SETTLE: Duration = Duration::from_millis(50);
 
 pub mod framing {
     use super::*;
@@ -288,17 +285,6 @@ impl Endpoint {
             .map_err(conn_err)?
             .await
             .map_err(conn_err)?;
-        // In TLS 1.3, a client completes its side of the handshake (and quinn resolves the
-        // `Connecting` future) as soon as it has sent its own Finished message, without waiting
-        // for the peer to validate the client's certificate under mandatory client auth. A
-        // server that rejects an untrusted client certificate therefore only signals that
-        // rejection *after* this point, asynchronously. Give a brief settle window for such a
-        // near-immediate rejection (expected within one loopback/LAN round trip) to arrive
-        // before declaring the connection usable.
-        tokio::select! {
-            reason = conn.closed() => return Err(conn_err(reason)),
-            _ = tokio::time::sleep(REJECT_SETTLE) => {}
-        }
         let fp = peer_fingerprint(&conn)?;
         Ok((conn, fp))
     }

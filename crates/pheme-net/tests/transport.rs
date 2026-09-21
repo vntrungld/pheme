@@ -80,6 +80,9 @@ async fn control_and_datagram_roundtrip() {
     assert!(t.elapsed() < Duration::from_secs(2));
 }
 
+// Either the connect itself fails, or (since TLS 1.3 lets the client finish its handshake
+// before the server has verified the client certificate) it briefly succeeds and the server
+// closes it right after: both are acceptable evidence of rejection.
 #[tokio::test]
 async fn untrusted_client_is_rejected() {
     let s = side("server");
@@ -91,7 +94,20 @@ async fn untrusted_client_is_rejected() {
     let client = Endpoint::client(&c.id, c.trust.clone()).unwrap();
     let accept = tokio::spawn(async move { server.accept().await });
     let res = client.connect(addr).await;
-    assert!(res.is_err(), "connect must fail: {res:?}");
+    match res {
+        Err(_) => {}
+        Ok(peer) => {
+            // TLS 1.3 lets the client finish its handshake before the server verifies the
+            // client certificate; the rejection then arrives as a prompt close.
+            let reason = tokio::time::timeout(Duration::from_secs(2), peer.closed())
+                .await
+                .expect("server must close an untrusted client promptly");
+            assert!(
+                !matches!(reason, pheme_net::CloseReason::LocallyClosed),
+                "{reason:?}"
+            );
+        }
+    }
     accept.abort();
 }
 
