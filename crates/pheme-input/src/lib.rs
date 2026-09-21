@@ -38,10 +38,19 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 pub trait InputCapture: Send {
     /// Starts the backend thread; events are delivered on `tx`.
+    ///
+    /// The backend must deliver events with `Sender::try_send`, dropping events when the
+    /// channel is full (never block). `stop()` must stop the backend thread and drop every
+    /// clone of the `Sender` before returning, so the receiver observes disconnection.
     fn start(&mut self, tx: Sender<CaptureEvent>) -> Result<()>;
     fn set_mode(&mut self, mode: CaptureMode) -> Result<()>;
     fn warp_cursor(&mut self, x: i32, y: i32) -> Result<()>;
     fn screens(&self) -> Vec<ScreenInfo>;
+    /// Stops the backend thread.
+    ///
+    /// The backend must deliver events with `Sender::try_send`, dropping events when the
+    /// channel is full (never block). `stop()` must stop the backend thread and drop every
+    /// clone of the `Sender` before returning, so the receiver observes disconnection.
     fn stop(&mut self);
 }
 

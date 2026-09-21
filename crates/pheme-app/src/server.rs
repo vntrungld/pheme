@@ -129,10 +129,14 @@ pub async fn run_server(
 
     if stats {
         let s = shared.clone();
+        let mut stats_shutdown = shutdown.clone();
         tokio::spawn(async move {
             let mut last = (0u64, 0u64, 0u64);
             loop {
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                    _ = stats_shutdown.changed() => break,
+                }
                 let now = (
                     s.counters.events.load(Ordering::Relaxed),
                     s.counters.control_sent.load(Ordering::Relaxed),
@@ -153,8 +157,9 @@ pub async fn run_server(
 
     loop {
         let incoming = tokio::select! {
-            r = endpoint.accept() => r,
+            biased;
             _ = shutdown.changed() => break,
+            r = endpoint.accept() => r,
         };
         match incoming {
             Ok(Incoming::Peer(peer)) => {
@@ -180,11 +185,18 @@ pub async fn run_server(
         }
     };
     shared.execute(actions);
+    // `InputCapture::stop` must stop the backend thread and drop every clone of the event
+    // `Sender` before returning (see the trait contract in pheme-input::InputCapture); only
+    // then does the router thread's `ev_rx.recv()` observe disconnection and return `Err`,
+    // ending its loop below.
     shared.capture.lock().unwrap().stop();
     endpoint.close();
     endpoint.wait_idle().await;
     drop(shared);
-    let _ = router.join();
+    // Join on a blocking task: a backend that violates the stop() contract (event thread
+    // still running, sender clone still alive) would hang `router.join()` forever, and doing
+    // that directly here would stall a tokio worker instead of just this shutdown path.
+    let _ = tokio::task::spawn_blocking(move || router.join()).await;
     Ok(())
 }
 
@@ -196,9 +208,15 @@ async fn handle_peer(
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let mut rx = peer.take_incoming();
-    let hello = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-        .await
-        .context("waiting for Hello")?;
+    let hello = tokio::select! {
+        _ = shutdown.changed() => {
+            peer.close("server shutting down");
+            return Ok(());
+        }
+        r = tokio::time::timeout(Duration::from_secs(5), rx.recv()) => {
+            r.context("waiting for Hello")?
+        }
+    };
     let Some(Msg::Hello {
         version,
         name,

@@ -102,9 +102,15 @@ async fn session(
             screens: screens.clone(),
         })
         .await?;
-    let ack = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-        .await
-        .context("waiting for HelloAck")?;
+    let ack = tokio::select! {
+        _ = shutdown.changed() => {
+            peer.close("client shutting down");
+            return Ok(());
+        }
+        r = tokio::time::timeout(Duration::from_secs(5), rx.recv()) => {
+            r.context("waiting for HelloAck")?
+        }
+    };
     match ack {
         Some(Msg::HelloAck {
             version,
@@ -124,6 +130,11 @@ async fn session(
     let mut last_stats = Instant::now();
     let result = loop {
         tokio::select! {
+            biased;
+            _ = shutdown.changed() => {
+                let _ = sender.send_control(&Msg::Bye { reason: "client shutting down".into() }).await;
+                break Ok(());
+            }
             msg = rx.recv() => match msg {
                 Some(Msg::Ping(n)) => { let _ = sender.send_control(&Msg::Pong(n)).await; }
                 Some(Msg::Pong(_)) => {}
@@ -145,10 +156,6 @@ async fn session(
                     received = 0;
                     last_stats = Instant::now();
                 }
-            }
-            _ = shutdown.changed() => {
-                let _ = sender.send_control(&Msg::Bye { reason: "client shutting down".into() }).await;
-                break Ok(());
             }
         }
     };

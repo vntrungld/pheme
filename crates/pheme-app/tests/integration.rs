@@ -258,3 +258,85 @@ async fn client_reconnects_after_server_restart() {
         .unwrap()
         .unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn server_releases_grab_when_client_vanishes_silently() {
+    let sdir = tempfile::tempdir().unwrap();
+    let cdir = tempfile::tempdir().unwrap();
+    let sid = Identity::load_or_create(sdir.path(), "server").unwrap();
+    let cid = Identity::load_or_create(cdir.path(), "lap").unwrap();
+    let strust = TrustStore::load(sdir.path()).unwrap().shared();
+    let ctrust = TrustStore::load(cdir.path()).unwrap().shared();
+    strust.write().unwrap().add("lap", &cid.fingerprint);
+    ctrust.write().unwrap().add("server", &sid.fingerprint);
+
+    let server_ep = Endpoint::server("127.0.0.1:0".parse().unwrap(), &sid, strust).unwrap();
+    let server_addr = server_ep.local_addr().unwrap();
+    let client_ep = Endpoint::client(&cid, ctrust).unwrap();
+
+    let (capture, cap_handle) = MockCapture::new(screens(1920, 1080));
+    let (inject, _inj_log) = MockInject::new(screens(1000, 500));
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let server = tokio::spawn(run_server(
+        ServerDeps {
+            name: "server".into(),
+            capture: Box::new(capture),
+            endpoint: server_ep,
+            placements: vec![ClientPlacement {
+                name: "lap".into(),
+                side: Side::Right,
+                span: (0.0, 1.0),
+            }],
+            hotkeys: Hotkeys::default(),
+            stats: false,
+        },
+        shutdown_rx.clone(),
+    ));
+    let client = tokio::spawn(run_client(
+        ClientDeps {
+            name: "lap".into(),
+            inject: Box::new(inject),
+            endpoint: client_ep,
+            server_addr,
+            stats: false,
+        },
+        shutdown_rx.clone(),
+    ));
+
+    assert!(
+        wait_until(|| cap_handle.is_started(), Duration::from_secs(5)).await,
+        "capture started"
+    );
+    let connected = wait_until(
+        || {
+            cap_handle.push(CaptureEvent::MotionAbs { x: 1900, y: 540 });
+            cap_handle.push(CaptureEvent::MotionAbs { x: 1919, y: 540 });
+            cap_handle.mode() == CaptureMode::Grab
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(connected, "client never connected");
+
+    // The client vanishes without a clean Bye/Leave handshake: aborting the task drops its
+    // `Peer` (and the endpoint it was moved into), which closes the QUIC connection but never
+    // sends an application-level Bye.
+    client.abort();
+
+    assert!(
+        wait_until(
+            || cap_handle.mode() == CaptureMode::Observe,
+            Duration::from_secs(8)
+        )
+        .await,
+        "server never released the grab after the client vanished (idle timeout is 5s)"
+    );
+
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
