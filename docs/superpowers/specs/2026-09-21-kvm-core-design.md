@@ -304,9 +304,10 @@ Capture (`windows` crate):
   returns `1` (swallow) for every event; additionally
   `RegisterRawInputDevices` (mouse, `RIDEV_INPUTSINK`) on a hidden window
   to get raw `dx/dy` (no pointer acceleration), `ClipCursor` to a 1×1
-  rectangle at the screen center, `ShowCursor(FALSE)` until the count is
-  < 0 (the system cursor is usually hidden anyway when the hook swallows
-  moves; verify manually).
+  rectangle at the screen center, and the arrow cursor replaced by a
+  blank one via `SetSystemCursor(OCR_NORMAL)` (restored with
+  `SystemParametersInfo(SPI_SETCURSORS)`); `ShowCursor` is per-thread and
+  cannot hide the cursor over other applications' windows.
 - Ignore events flagged `LLKHF_INJECTED` / `LLMHF_INJECTED`.
 - Scancode from `KBDLLHOOKSTRUCT.scanCode` + `LLKHF_EXTENDED`; Pause and
   PrintScreen have special scancodes and are handled explicitly.
@@ -325,12 +326,16 @@ normalized to 0..65535 on the virtual desktop. Wheel:
 ### Linux X11
 
 Capture (`x11rb` with the `xinput`, `xtest`, `xfixes`, `randr` extensions):
-- Dedicated thread with its own X connection. `XISelectEvents` on the
-  root window with `XIAllMasterDevices`: Observe selects `XI_Motion`
-  (non-raw) → read `root_x/root_y` directly, emit `MotionAbs`; Grab
-  selects `XI_RawMotion`, `XI_RawButtonPress/Release`,
-  `XI_RawKeyPress/Release` → emit `MotionRel` from `raw_values`
-  (pre-acceleration) plus keys/buttons.
+- Dedicated event thread with its own X connection (a second connection
+  is used by the app thread for `warp_cursor` and to wake the event loop
+  with a `ClientMessage`). `XISelectEvents` on the root window with
+  `XIAllMasterDevices` for `XI_RawMotion`, `XI_RawButtonPress/Release`,
+  `XI_RawKeyPress/Release` (raw events reach the root window regardless
+  of which window is under the pointer; non-raw `XI_Motion` would not).
+  Observe: on every RawMotion call `QueryPointer(root)` and emit
+  `MotionAbs`; raw keys are emitted as `Key` (needed for the lock
+  hotkey) and nothing is blocked. Grab: emit `MotionRel` from
+  `raw_values` (pre-acceleration) plus keys/buttons.
 - Grab: `XIGrabDevice` on the master pointer + master keyboard with
   `owner_events = false` (apps receive nothing), `XFixesHideCursor` on
   root, warp to center with `XIWarpPointer` after every RawMotion.
@@ -424,7 +429,8 @@ Manual (`docs/testing.md`), for all 4 combinations of Linux X11/Windows
   fallback `ReleaseLocalModifiers`.
 - libinput may reject a hybrid rel+abs uinput device — fallback: split
   into 2 devices.
-- Windows: `ShowCursor` is a per-thread reference count — must be called
-  on the hook thread.
+- Windows: if the process dies while grabbed, the blank system cursor
+  persists until `SPI_SETCURSORS` runs again (re-running Pheme or
+  toggling any pointer setting restores it).
 - X11 `XIGrabDevice` fails if another app holds a grab (an open menu) →
   retry 3 times 10 ms apart, then skip that switch and stay Local.
