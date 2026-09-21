@@ -4,6 +4,7 @@ members = [
     "crates/pheme-proto",
     "crates/pheme-core",
     "crates/pheme-input",
+    "crates/pheme-audio",
     "crates/pheme-net",
     "crates/pheme-app",
 ]
@@ -19,10 +20,13 @@ rust-version = "1.85"
 pheme-proto = { path = "crates/pheme-proto" }
 pheme-core = { path = "crates/pheme-core" }
 pheme-input = { path = "crates/pheme-input" }
+pheme-audio = { path = "crates/pheme-audio" }
 pheme-net = { path = "crates/pheme-net" }
 
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["use-std"] }
+rtrb = "0.3"
+rubato = "0.16"
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"

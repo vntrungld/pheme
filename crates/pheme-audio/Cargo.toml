@@ -1,0 +1,12 @@
+[package]
+name = "pheme-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rtrb = { workspace = true }
+rubato = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
