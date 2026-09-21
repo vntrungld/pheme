@@ -1,25 +1,26 @@
 # Sub-project 1 — KVM core
 
-Ngày: 2026-09-21
-Kiến trúc tổng: `2026-09-21-pheme-architecture-design.md`
-Kết quả mong đợi: chạy `pheme server` trên máy A, `pheme client <ip>` trên
-máy B, đưa chuột qua cạnh màn hình là điều khiển được B bằng bàn phím và
-chuột của A; quay lại khi đi ngược. Windows và Linux X11 làm server;
-Windows và Linux (uinput) làm client.
+Date: 2026-09-21
+Overall architecture: `2026-09-21-pheme-architecture-design.md`
+Expected outcome: run `pheme server` on machine A and `pheme client <ip>`
+on machine B; moving the pointer across the screen edge controls B with
+A's keyboard and mouse, and moving back returns control. Windows and
+Linux X11 can be servers; Windows and Linux (uinput) can be clients.
 
-## 1. Phạm vi
+## 1. Scope
 
-Có:
+In:
 
-- `pheme-proto`: đầy đủ `Msg` (kể cả biến thể Audio/Clipboard để không
-  đổi wire format sau — chưa dùng).
-- `pheme-net`: QUIC, identity, pairing SPAKE2, pin fingerprint, reconnect.
+- `pheme-proto`: the complete `Msg` enum (including Audio/Clipboard
+  variants so the wire format does not change later — unused for now).
+- `pheme-net`: QUIC, identity, SPAKE2 pairing, fingerprint pinning,
+  reconnect.
 - `pheme-core`: layout, state machine, shadow key state, lock hotkey.
-- `pheme-input`: keymap HID; capture Windows + Linux X11; inject Windows
-  (SendInput) + Linux (uinput); backend `mock`.
-- `pheme-app`: CLI `server`, `client`, `pair`, `setup`; config TOML; log.
+- `pheme-input`: HID keymap; Windows + Linux X11 capture; Windows
+  (SendInput) + Linux (uinput) inject; `mock` backend.
+- `pheme-app`: CLI `server`, `client`, `pair`, `setup`; TOML config; logging.
 
-Không: audio, clipboard, mDNS, Wayland capture, tray/GUI, macOS.
+Out: audio, clipboard, mDNS, Wayland capture, tray/GUI, macOS.
 
 ## 2. `pheme-proto`
 
@@ -30,8 +31,8 @@ pub enum Os { Linux, Windows, MacOs }
 
 pub struct ScreenInfo { pub x: i32, pub y: i32, pub w: u32, pub h: u32, pub primary: bool }
 
-pub struct Modifiers(u8);         // bit: Shift, Ctrl, Alt, Meta (trái/phải gộp)
-pub struct KeyCode(pub u16);      // USB HID usage (page 0x07 keyboard; 0x0C consumer dùng bit 15)
+pub struct Modifiers(u8);         // bits: Shift, Ctrl, Alt, Meta (left/right merged)
+pub struct KeyCode(pub u16);      // USB HID usage (page 0x07 keyboard; page 0x0C consumer uses bit 15)
 pub enum Button { Left, Right, Middle, Back, Forward }
 pub enum AudioStream { Playback, Mic }
 pub struct AudioParams { pub rate: u32, pub channels: u8, pub frame_samples: u16 }
@@ -49,58 +50,62 @@ pub enum Msg {
     // Datagram (unreliable)
     MouseMove{ seq: u32, dx: i16, dy: i16 },
     MouseAbs { seq: u32, x: u16, y: u16 },
-    Wheel    { seq: u32, dx: i16, dy: i16 },       // 1/120 notch
+    Wheel    { seq: u32, dx: i16, dy: i16 },       // 1/120 of a notch
     Audio    { stream: AudioStream, seq: u32, ts_us: u64, samples: Vec<i16> },
     // Clipboard stream
     Clipboard{ mime: String, data: Vec<u8> },
 }
 
-pub fn encode(m: &Msg, buf: &mut Vec<u8>);             // postcard, không alloc nếu buf đủ
+pub fn encode(m: &Msg, buf: &mut Vec<u8>);             // postcard; no allocation if buf is large enough
 pub fn decode(bytes: &[u8]) -> Result<Msg, ProtoError>;
 impl Msg { pub fn is_datagram(&self) -> bool; }
 ```
 
-`seq` là bộ đếm u32 riêng cho mỗi hướng, tăng mỗi message input; dùng để
-log mất gói datagram (không dùng để resync). `Enter.x/y` là tọa độ trong
-không gian client, đơn vị pixel, gốc góc trên-trái màn hình ảo của client.
+`seq` is a separate u32 counter per direction, incremented per input
+message; it is used to log datagram loss (not for resync). `Enter.x/y`
+are in client space, in pixels, origin at the top-left of the client's
+virtual screen.
 
-Test: round-trip mọi variant; `MouseMove` encode ≤ 8 byte; `Key` ≤ 8 byte.
+Tests: round-trip every variant; `MouseMove` encodes to ≤ 8 bytes; `Key`
+≤ 8 bytes.
 
 ## 3. `pheme-net`
 
 ### Identity & trust
 
-- `identity.key` (Ed25519 PKCS#8) + `identity.crt` (X.509 tự ký, CN =
-  `name`) tạo bằng `rcgen` khi chưa có. Fingerprint = SHA-256(DER cert).
+- `identity.key` (Ed25519 PKCS#8) + `identity.crt` (self-signed X.509,
+  CN = `name`) generated with `rcgen` when missing. Fingerprint =
+  SHA-256(DER cert).
 - `trusted.toml`: `[[peers]] name = "..." fingerprint = "hex"`.
-- Verifier rustls tùy biến (server: `ClientCertVerifier`; client:
-  `ServerCertVerifier`) chỉ so fingerprint với `trusted.toml`, bỏ qua CA
-  chain, tên, thời hạn.
+- Custom rustls verifiers (server: `ClientCertVerifier`; client:
+  `ServerCertVerifier`) only compare the fingerprint against
+  `trusted.toml`; CA chain, name and validity period are ignored.
 
 ### Pairing
 
-Chạy trên **cùng port QUIC** với ALPN riêng `pheme-pair/1` (ALPN chính
-là `pheme/1`). Server chỉ chấp nhận ALPN pair khi đang ở chế độ pairing
-(`pheme server --pair` hoặc mục menu tray sau này); chế độ này tự tắt sau
-120 s hoặc sau một lần pairing thành công.
+Runs on the **same QUIC port** with a dedicated ALPN `pheme-pair/1` (the
+main ALPN is `pheme/1`). The server only accepts the pairing ALPN while
+in pairing mode (`pheme server --pair`, or a tray menu item later); the
+mode ends after 120 s or after one successful pairing.
 
-1. Server sinh mã 6 chữ số ngẫu nhiên, in ra.
-2. Client mở kết nối QUIC với ALPN pair, cert chưa được trust → verifier
-   ở chế độ pairing chấp nhận mọi cert nhưng ghi lại fingerprint.
-3. Trên stream: SPAKE2 (crate `spake2`, nhóm Ed25519) với password = mã.
-   Hai bên tính `K`.
-4. Mỗi bên gửi `HMAC(K, fingerprint_của_mình || fingerprint_peer_thấy)`.
-   Bên kia kiểm tra. Sai → đóng, server đếm 3 lần sai thì thoát chế độ
-   pairing.
-5. Đúng → cả hai ghi peer vào `trusted.toml`. Xong.
+1. The server generates a random 6-digit code and prints it.
+2. The client opens a QUIC connection with the pairing ALPN; its cert is
+   not yet trusted, so the pairing-mode verifier accepts any cert but
+   records the fingerprint.
+3. On a stream: SPAKE2 (`spake2` crate, Ed25519 group) with password =
+   code. Both sides derive `K`.
+4. Each side sends `HMAC(K, own_fingerprint || observed_peer_fingerprint)`.
+   The other side verifies. On mismatch: close; after 3 failures the
+   server leaves pairing mode.
+5. On success both sides write the peer into `trusted.toml`. Done.
 
-Mã chỉ dùng cho một handshake, brute-force online bị giới hạn 3 lần,
-offline bất khả thi nhờ SPAKE2.
+The code is valid for one handshake, online brute force is limited to 3
+attempts, and offline brute force is infeasible thanks to SPAKE2.
 
 ### Transport
 
 ```rust
-pub struct Endpoint;                        // bọc quinn::Endpoint + config
+pub struct Endpoint;                        // wraps quinn::Endpoint + config
 impl Endpoint {
     pub fn server(cfg: &NetConfig, id: &Identity, trust: &TrustStore) -> Result<Self>;
     pub fn client(cfg: &NetConfig, id: &Identity, trust: &TrustStore) -> Result<Self>;
@@ -112,29 +117,30 @@ pub struct Peer;
 impl Peer {
     pub fn remote_name(&self) -> &str;
     pub async fn send_control(&self, m: &Msg) -> Result<()>;
-    pub fn send_datagram(&self, m: &Msg);        // bỏ qua lỗi, log ở mức debug
-    pub fn incoming(&self) -> &mpsc::Receiver<Msg>;  // gộp control + datagram
+    pub fn send_datagram(&self, m: &Msg);        // errors ignored, logged at debug
+    pub fn incoming(&self) -> &mpsc::Receiver<Msg>;  // merged control + datagram
     pub fn rtt(&self) -> Duration;
     pub async fn closed(&self) -> CloseReason;
 }
 ```
 
-Tuning quinn: `max_idle_timeout = 5 s`, `keep_alive_interval = 1 s`,
+quinn tuning: `max_idle_timeout = 5 s`, `keep_alive_interval = 1 s`,
 `initial_rtt = 1 ms`, `datagram_send_buffer_size = 16 KiB`,
 `datagram_receive_buffer_size = 64 KiB`, `max_concurrent_bidi_streams =
-4`. Control stream: mỗi message = `u16 LE length` + postcard bytes.
+4`. Control stream framing: `u16 LE length` + postcard bytes.
 
-Reconnect (client): vòng lặp `connect → run → closed → backoff` với
-backoff 0.5 s ×2 tới trần 5 s; reset khi kết nối được ≥ 10 s.
+Reconnect (client): loop `connect → run → closed → backoff`; backoff
+starts at 0.5 s, doubles, caps at 5 s; resets after a connection lasts
+≥ 10 s.
 
-Test: hai `Endpoint` trên `127.0.0.1` cùng process: (a) pairing đúng mã →
-trusted có nhau; (b) sai mã → lỗi, không ghi trust; (c) client chưa
-trust → server từ chối ở TLS; (d) round-trip control + datagram; (e) ngắt
-server → `closed()` trả về trong < 6 s.
+Tests: two `Endpoint`s on `127.0.0.1` in one process: (a) correct code →
+both trust stores contain each other; (b) wrong code → error, nothing
+written; (c) untrusted client → rejected at TLS; (d) control + datagram
+round-trip; (e) server shutdown → `closed()` returns in < 6 s.
 
 ## 4. `pheme-core`
 
-### Kiểu
+### Types
 
 ```rust
 pub enum Side { Left, Right, Top, Bottom }
@@ -152,7 +158,7 @@ pub enum CaptureEvent {
 pub enum Action {
     SendControl(Msg), SendDatagram(Msg),
     Grab, Ungrab, WarpCursor { x: i32, y: i32 },
-    SetLocked(bool),                        // để app cập nhật tray/log
+    SetLocked(bool),                        // lets the app update tray/log
 }
 
 pub struct ServerCore { .. }
@@ -164,78 +170,85 @@ impl ServerCore {
     pub fn active(&self) -> Active;         // Local | Remote(name)
 }
 
-pub struct ClientCore { .. }                // theo dõi phím đang giữ; release_all khi Leave/disconnect
+pub struct ClientCore { .. }                // tracks held keys; release_all on Leave/disconnect
 impl ClientCore {
     pub fn on_msg(&mut self, m: Msg) -> Vec<InjectAction>;
-    pub fn on_disconnect(&mut self) -> Vec<InjectAction>;   // release mọi thứ đang giữ
+    pub fn on_disconnect(&mut self) -> Vec<InjectAction>;   // release everything held
 }
 ```
 
-### Hành vi `ServerCore`
+### `ServerCore` behaviour
 
-- **Local**: chỉ xử lý `MotionAbs`. Với mỗi client, tính đoạn cạnh
-  `[a, b]` trên hình chữ nhật bao của `server_screens` theo `side` và
-  `span`. Nếu `x`/`y` nằm đúng biên (`x == min_x` với Left, `x == max_x-1`
-  với Right, tương tự Top/Bottom), tọa độ dọc cạnh nằm trong `[a, b]`, và
-  sự kiện trước đó có tọa độ *không* nằm trên biên đó (tức là đang tiến
-  ra ngoài), và `!locked`, và client đang kết nối → chuyển Remote:
-  - Tính vị trí vào phía client: chiếu vị trí dọc cạnh sang cạnh đối diện
-    của client theo tỉ lệ `(pos - a) / (b - a)` × kích thước client; tọa
-    độ vuông góc = 0 (Right → client x = 0; Left → x = client_w - 1; …).
-  - Trả `[Grab, WarpCursor{center}, SendControl(Enter{x,y,mods})]`.
-  - `mods` lấy từ shadow key state để client biết modifier đang giữ.
-- **Remote(c)**: mọi sự kiện đều chuyển tiếp:
-  - `MotionRel` → cập nhật vị trí ảo `(vx, vy)` trong không gian client
-    (clamp vào màn hình client); `SendDatagram(MouseMove{dx,dy})`. Nếu vị
-    trí ảo vượt cạnh đối diện của client (cạnh nối về server) →
-    `[SendControl(Leave), Ungrab, WarpCursor{điểm tương ứng trên cạnh
-    server}]`, về Local. Vị trí ảo ở các cạnh khác chỉ clamp, không rời.
-  - `Key` → cập nhật shadow set; nếu là hotkey lock → toggle `locked`,
-    `SetLocked`, *không* forward; ngược lại `SendControl(Key)`.
+- **Local**: only `MotionAbs` is handled. For each client, compute the
+  edge segment `[a, b]` on the bounding rectangle of `server_screens`
+  from `side` and `span`. If `x`/`y` is exactly on the boundary
+  (`x == min_x` for Left, `x == max_x - 1` for Right, likewise
+  Top/Bottom), the along-edge coordinate is within `[a, b]`, the previous
+  event was *not* on that boundary (i.e. the pointer is moving outward),
+  `!locked`, and the client is connected → switch to Remote:
+  - Compute the entry position on the client: project the along-edge
+    position onto the client's opposite edge using
+    `(pos - a) / (b - a)` × client size; the perpendicular coordinate is
+    0 (Right → client x = 0; Left → x = client_w - 1; …).
+  - Return `[Grab, WarpCursor{center}, SendControl(Enter{x,y,mods})]`.
+  - `mods` comes from the shadow key state so the client knows which
+    modifiers are held.
+- **Remote(c)**: every event is forwarded:
+  - `MotionRel` → update the virtual position `(vx, vy)` in client space
+    (clamped to the client screen); `SendDatagram(MouseMove{dx,dy})`. If
+    the virtual position crosses the client's opposite edge (the one
+    leading back to the server) →
+    `[SendControl(Leave), Ungrab, WarpCursor{matching point on the server edge}]`,
+    back to Local. Other client edges only clamp; they never leave.
+  - `Key` → update the shadow set; if it is the lock hotkey → toggle
+    `locked`, emit `SetLocked`, do *not* forward; otherwise
+    `SendControl(Key)`.
   - `Button`/`Wheel` → `SendControl(Button)` / `SendDatagram(Wheel)`.
-- **Lock** ở Local: phím lock toggle `locked`; khi `locked`, không bao giờ
-  chuyển Remote. Ở Remote, lock nghĩa là "ở lại client" — không rời khi
-  vượt cạnh; bấm lại mới thả.
-- `client_disconnected` khi đang Remote(c) → `[Ungrab, WarpCursor{center
-  server}]`, về Local, shadow set giữ nguyên (phím vẫn đang được giữ vật
-  lý; hook LL/XI2 sẽ báo release sau — nhưng vì ở Local ta không forward
-  nên chỉ clear shadow khi nhận release).
-- Khi về Local vì `Leave`, để tránh modifier kẹt phía server (server đã
-  nuốt key-down khi Grab): với mỗi modifier trong shadow set,
-  `InjectLocal` **không** cần — lý do: hook LL/XI2 grab chỉ chặn *forward
-  tới app*, còn OS vẫn thấy key-up vật lý sau khi Ungrab. Nếu thực tế trên
-  OS nào đó modifier vẫn kẹt, thêm `Action::ReleaseLocalModifiers` ở đó
-  (ghi nhận là rủi ro cần verify thủ công ở §7).
+- **Lock** while Local: the lock key toggles `locked`; while `locked`,
+  never switch to Remote. While Remote, lock means "stay on the client" —
+  do not leave when crossing the edge; pressing it again releases.
+- `client_disconnected` while Remote(c) → `[Ungrab, WarpCursor{server center}]`,
+  back to Local; the shadow set is kept (keys are still physically held;
+  the LL hook / XI2 will report the release later — but since we are
+  Local we do not forward, so the shadow set is only cleared on release).
+- On returning to Local via `Leave`, no local injection is needed to
+  avoid stuck modifiers on the server: the LL hook / XI2 grab only
+  blocks *forwarding to apps*; the OS still sees the physical key-up after
+  Ungrab. If a modifier does get stuck on some OS in practice, add
+  `Action::ReleaseLocalModifiers` there (recorded as a risk to verify
+  manually in §7).
 
-### Hành vi `ClientCore`
+### `ClientCore` behaviour
 
-- `Enter` → `MoveAbs(x,y)`; ghi `mods` để log (không inject modifier từ
-  `mods` — key-down thật đã/đang được forward qua `Key`).
-- `Key`/`Button` → cập nhật held set, inject.
-- `Leave`, `Bye`, disconnect → `release_all()` cho mọi phím/nút trong
-  held set, clear.
-- `MouseMove`/`Wheel` → inject thẳng.
+- `Enter` → `MoveAbs(x,y)`; `mods` is recorded for logging (modifiers are
+  not injected from `mods` — the real key-down was/is forwarded via `Key`).
+- `Key`/`Button` → update the held set, inject.
+- `Leave`, `Bye`, disconnect → `release_all()` for every key/button in
+  the held set, then clear.
+- `MouseMove`/`Wheel` → inject directly.
 
-### Test (unit, không OS)
+### Tests (unit, no OS)
 
-1. Right/left/top/bottom, `span` toàn phần và một phần: vào đúng vị trí,
-   tọa độ chiếu đúng cả khi độ phân giải client khác server.
-2. Con trỏ chạm cạnh mà sự kiện trước đã ở trên cạnh (kéo dọc theo cạnh)
-   → không chuyển.
-3. Cạnh không có client → không chuyển.
-4. Client chưa kết nối → không chuyển.
-5. Remote: vượt cạnh về → Leave + Ungrab + Warp đúng điểm; vượt cạnh khác
-   → chỉ clamp.
-6. Lock: ở Local chặn chuyển; ở Remote chặn rời; phím lock không forward.
-7. Disconnect khi Remote → Ungrab, về Local.
-8. `ClientCore`: giữ 3 phím + 1 nút rồi `Leave` → 4 release đúng thứ tự
-   (nút trước, phím sau, modifier cuối).
-9. Property test (`proptest`): chuỗi sự kiện ngẫu nhiên không bao giờ
-   phát `Grab` hai lần liên tiếp hoặc `Ungrab` khi đang Local.
+1. Right/left/top/bottom, full and partial `span`: enters at the right
+   position; projected coordinates are correct when client resolution
+   differs from the server's.
+2. Pointer on the edge while the previous event was already on the edge
+   (dragging along the edge) → no switch.
+3. Edge with no client → no switch.
+4. Client not connected → no switch.
+5. Remote: crossing back → Leave + Ungrab + Warp to the right point;
+   crossing another edge → clamp only.
+6. Lock: blocks switching while Local; blocks leaving while Remote; the
+   lock key is not forwarded.
+7. Disconnect while Remote → Ungrab, back to Local.
+8. `ClientCore`: hold 3 keys + 1 button then `Leave` → 4 releases in the
+   right order (buttons first, then keys, modifiers last).
+9. Property test (`proptest`): a random event sequence never emits `Grab`
+   twice in a row or `Ungrab` while Local.
 
 ## 5. `pheme-input`
 
-### Trait
+### Traits
 
 ```rust
 pub enum CaptureMode { Observe, Grab }
@@ -257,150 +270,161 @@ pub trait InputInject: Send {
     fn screens(&self) -> Vec<ScreenInfo>;
 }
 
-pub fn detect_capture() -> Result<Box<dyn InputCapture>>;  // theo OS/session
+pub fn detect_capture() -> Result<Box<dyn InputCapture>>;  // by OS/session
 pub fn detect_inject()  -> Result<Box<dyn InputInject>>;
 ```
 
-`set_mode(Grab)` phải: chặn bàn phím + chuột không tới app local, ẩn con
-trỏ, ghim con trỏ (warp về giữa mỗi sự kiện hoặc `ClipCursor` 1×1), và
-chuyển sang phát `MotionRel`. `set_mode(Observe)` hoàn tác tất cả.
-`set_mode` được gọi từ thread app; backend phải chuyển yêu cầu sang thread
-của nó (Windows: `PostThreadMessage`; X11: pipe/eventfd vào event loop).
+`set_mode(Grab)` must: block keyboard + mouse from reaching local apps,
+hide the cursor, confine the cursor (warp to center on every event or
+`ClipCursor` to 1×1), and switch to emitting `MotionRel`.
+`set_mode(Observe)` undoes all of that. `set_mode` is called from the app
+thread; the backend must hand the request to its own thread (Windows:
+`PostThreadMessage`; X11: pipe/eventfd into the event loop).
 
 ### Keymap
 
-`keymap/hid.rs`: hằng `KeyCode` cho mọi HID usage phổ biến.
+`keymap/hid.rs`: `KeyCode` constants for every common HID usage.
 `keymap/evdev.rs`: `hid_to_evdev(KeyCode) -> Option<u16>`,
-`evdev_to_hid(u16) -> Option<KeyCode>` — bảng tĩnh sinh từ
+`evdev_to_hid(u16) -> Option<KeyCode>` — static table generated from
 `linux/input-event-codes.h`.
 `keymap/win.rs`: `hid_to_scancode(KeyCode) -> Option<(u16, bool /*ext*/)>`
-và ngược lại — bảng tĩnh từ USB HID Usage Tables §10 + Windows scancode
-set 1. X11 keycode = evdev + 8.
+and the inverse — static table from the USB HID Usage Tables §10 +
+Windows scancode set 1. X11 keycode = evdev + 8.
 
-Test: mọi entry round-trip; không hai HID map cùng scancode; các phím
-khó (Pause, PrintScreen, NumLock, phím mũi tên extended, Right Ctrl/Alt,
-Win/Meta, phím media cơ bản) có test riêng.
+Tests: every entry round-trips; no two HID codes map to the same
+scancode; tricky keys (Pause, PrintScreen, NumLock, extended arrow keys,
+Right Ctrl/Alt, Win/Meta, basic media keys) have dedicated tests.
 
 ### Windows
 
 Capture (`windows` crate):
-- Thread riêng chạy message loop. `SetWindowsHookExW(WH_KEYBOARD_LL)` và
-  `WH_MOUSE_LL`. Observe: hook chỉ đọc vị trí chuột từ `MSLLHOOKSTRUCT`,
-  trả `CallNextHookEx`. Grab: hook trả `1` (nuốt) cho mọi sự kiện; đồng
-  thời `RegisterRawInputDevices` (mouse, `RIDEV_INPUTSINK`) trên cửa sổ
-  ẩn để lấy `dx/dy` thô (không bị pointer acceleration), `ClipCursor`
-  vào hình chữ nhật 1×1 tại giữa màn hình, `ShowCursor(FALSE)` cho tới
-  khi đếm < 0 (con trỏ hệ thống ẩn khi hook nuốt move nên thường không
-  cần, verify thủ công).
-- Bỏ qua sự kiện có `LLKHF_INJECTED` / `LLMHF_INJECTED`.
-- Scancode từ `KBDLLHOOKSTRUCT.scanCode` + `LLKHF_EXTENDED`; Pause và
-  PrintScreen có scancode đặc biệt, xử lý riêng.
-- Wheel: `mouseData` HIWORD (signed, đơn vị 120) → giữ nguyên đơn vị.
-- `screens()`: `EnumDisplayMonitors`; DPI-aware (`SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)`) để tọa độ là pixel vật lý.
+- Dedicated thread running a message loop. `SetWindowsHookExW(WH_KEYBOARD_LL)`
+  and `WH_MOUSE_LL`. Observe: the hook only reads the pointer position
+  from `MSLLHOOKSTRUCT` and returns `CallNextHookEx`. Grab: the hook
+  returns `1` (swallow) for every event; additionally
+  `RegisterRawInputDevices` (mouse, `RIDEV_INPUTSINK`) on a hidden window
+  to get raw `dx/dy` (no pointer acceleration), `ClipCursor` to a 1×1
+  rectangle at the screen center, `ShowCursor(FALSE)` until the count is
+  < 0 (the system cursor is usually hidden anyway when the hook swallows
+  moves; verify manually).
+- Ignore events flagged `LLKHF_INJECTED` / `LLMHF_INJECTED`.
+- Scancode from `KBDLLHOOKSTRUCT.scanCode` + `LLKHF_EXTENDED`; Pause and
+  PrintScreen have special scancodes and are handled explicitly.
+- Wheel: `mouseData` HIWORD (signed, units of 120) → keep the unit.
+- `screens()`: `EnumDisplayMonitors`; DPI-aware
+  (`SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)`) so coordinates
+  are physical pixels.
 
-Inject: `SendInput`. Key: `KEYEVENTF_SCANCODE` (+`EXTENDEDKEY`). Chuột
-relative: `MOUSEEVENTF_MOVE` (Windows áp acceleration của client — chấp
-nhận, vì bàn phím/chuột USB thật cũng vậy). Abs: `MOUSEEVENTF_ABSOLUTE |
-VIRTUALDESK` với tọa độ chuẩn hóa 0..65535 trên virtual desktop. Wheel:
-`MOUSEEVENTF_WHEEL`/`HWHEEL` với `mouseData` = giá trị 1/120.
+Inject: `SendInput`. Keys: `KEYEVENTF_SCANCODE` (+`EXTENDEDKEY`).
+Relative mouse: `MOUSEEVENTF_MOVE` (Windows applies the client's
+acceleration — accepted, a physical USB mouse behaves the same).
+Absolute: `MOUSEEVENTF_ABSOLUTE | VIRTUALDESK` with coordinates
+normalized to 0..65535 on the virtual desktop. Wheel:
+`MOUSEEVENTF_WHEEL`/`HWHEEL` with `mouseData` = 1/120 value.
 
 ### Linux X11
 
-Capture (`x11rb` với extension `xinput`, `xtest`, `xfixes`, `randr`):
-- Thread riêng với kết nối X riêng. `XISelectEvents` trên root với
-  `XIAllMasterDevices`: Observe chọn `XI_Motion` (không raw) → đọc
-  `root_x/root_y` trực tiếp, phát `MotionAbs`; Grab chọn `XI_RawMotion`,
-  `XI_RawButtonPress/Release`, `XI_RawKeyPress/Release` → phát
-  `MotionRel` từ `raw_values` (chưa acceleration) và phím/nút.
-- Grab: `XIGrabDevice` cho master pointer + master keyboard với
-  `owner_events = false` (app không nhận), `XFixesHideCursor` root, mỗi
-  RawMotion → `XIWarpPointer` về giữa; delta lấy từ `raw_values` (chưa
-  acceleration).
-- Keycode X11 − 8 → evdev → HID.
-- `screens()`: RandR CRTC.
+Capture (`x11rb` with the `xinput`, `xtest`, `xfixes`, `randr` extensions):
+- Dedicated thread with its own X connection. `XISelectEvents` on the
+  root window with `XIAllMasterDevices`: Observe selects `XI_Motion`
+  (non-raw) → read `root_x/root_y` directly, emit `MotionAbs`; Grab
+  selects `XI_RawMotion`, `XI_RawButtonPress/Release`,
+  `XI_RawKeyPress/Release` → emit `MotionRel` from `raw_values`
+  (pre-acceleration) plus keys/buttons.
+- Grab: `XIGrabDevice` on the master pointer + master keyboard with
+  `owner_events = false` (apps receive nothing), `XFixesHideCursor` on
+  root, warp to center with `XIWarpPointer` after every RawMotion.
+- X11 keycode − 8 → evdev → HID.
+- `screens()`: RandR CRTCs.
 - Wayland session (`$XDG_SESSION_TYPE == wayland`) → `detect_capture()`
-  trả lỗi rõ ràng: "Wayland capture chưa hỗ trợ (sub-project 4); dùng
-  session X11 hoặc chạy máy này làm client".
+  returns a clear error: "Wayland capture is not supported yet
+  (sub-project 4); use an X11 session or run this machine as a client".
 
 Inject (`evdev` crate, `/dev/uinput`):
-- Một thiết bị uinput "Pheme Virtual Input" có `EV_KEY` (toàn bộ keycode
-  bàn phím + BTN_LEFT/RIGHT/MIDDLE/SIDE/EXTRA), `EV_REL` (REL_X, REL_Y,
+- One uinput device "Pheme Virtual Input" with `EV_KEY` (all keyboard
+  keycodes + BTN_LEFT/RIGHT/MIDDLE/SIDE/EXTRA), `EV_REL` (REL_X, REL_Y,
   REL_WHEEL, REL_HWHEEL, REL_WHEEL_HI_RES, REL_HWHEEL_HI_RES), `EV_ABS`
-  (ABS_X, ABS_Y với range = màn hình ảo) — libinput chấp nhận thiết bị lai
-  nếu có cả `INPUT_PROP_POINTER`; nếu thực tế libinput từ chối, tách
-  thành 2 thiết bị (keyboard+rel mouse, abs tablet). Ghi nhận rủi ro.
-- Wheel: gửi cả `REL_WHEEL_HI_RES` (1/120) và `REL_WHEEL` khi tích lũy đủ
-  120.
-- `screens()`: X11 → RandR; Wayland → chưa có API chuẩn, dùng
-  `wl_output` qua `wayland-client` (chỉ đọc geometry, không cần quyền
-  gì).
-- Thiếu quyền `/dev/uinput` → lỗi kèm hướng dẫn chạy `pheme setup`.
+  (ABS_X, ABS_Y with range = virtual screen) — libinput accepts a hybrid
+  device if `INPUT_PROP_POINTER` is set; if libinput rejects it in
+  practice, split into 2 devices (keyboard + relative mouse, absolute
+  tablet). Recorded as a risk.
+- Wheel: send both `REL_WHEEL_HI_RES` (1/120) and `REL_WHEEL` once 120
+  has accumulated.
+- `screens()`: X11 → RandR; Wayland → no standard API, use `wl_output`
+  via `wayland-client` (geometry only, no permission required).
+- Missing `/dev/uinput` permission → error with a hint to run
+  `pheme setup`.
 
 ### Mock
 
-`MockCapture` (đẩy sự kiện từ test) và `MockInject` (ghi lại lời gọi vào
-`Vec`) để test tích hợp `pheme-app`.
+`MockCapture` (events pushed from tests) and `MockInject` (records calls
+into a `Vec`) for `pheme-app` integration tests.
 
 ## 6. `pheme-app`
 
-Runtime server:
+Server runtime:
 
 ```
 tokio main
-├── task accept: Endpoint::accept → Peer → HelloAck; chỉ 1 peer/client-name
-├── thread capture (OS) ──crossbeam──► task router:
+├── accept task: Endpoint::accept → Peer → HelloAck; only 1 peer per client name
+├── capture thread (OS) ──crossbeam──► router task:
 │      loop { ev = rx.recv(); for a in core.on_event(ev) { execute(a) } }
-│      execute: SendControl → peer.send_control (spawn, không chờ)
+│      execute: SendControl → peer.send_control (spawned, not awaited)
 │               SendDatagram → peer.send_datagram
 │               Grab/Ungrab/Warp → capture.set_mode / warp_cursor
-└── task peer reader: incoming → Ping/Pong, Bye → core.client_disconnected
+└── peer reader task: incoming → Ping/Pong, Bye → core.client_disconnected
 ```
 
-Runtime client: `connect loop` → `Hello` → task reader: `core.on_msg` →
+Client runtime: `connect loop` → `Hello` → reader task: `core.on_msg` →
 inject. Disconnect → `core.on_disconnect` → release_all → backoff.
 
 CLI (`clap`): `server [--config] [--pair]`, `client <host[:port]>
-[--config]`, `pair <host[:port]> <code>`, `setup`, `--stats`,
-`-v/-vv`. Config TOML như spec tổng, chỉ các khóa dùng trong SP1 (`role`,
-`name`, `listen`, `connect`, `hotkeys.lock`, `clients`). Vị trí mặc định
-`~/.config/pheme/config.toml` / `%APPDATA%\pheme\config.toml`; không có
-file → giá trị mặc định + tham số CLI.
+[--config]`, `pair <host[:port]> <code>`, `setup`, `--stats`, `-v/-vv`.
+TOML config as in the overall spec, only the keys used by SP1 (`role`,
+`name`, `listen`, `connect`, `hotkeys.lock`, `clients`). Default location
+`~/.config/pheme/config.toml` / `%APPDATA%\pheme\config.toml`; no file →
+defaults + CLI arguments.
 
-`--stats`: mỗi 1 s log RTT (QUIC), số sự kiện gửi/nhận, datagram mất
-(qua `seq` gap).
+`--stats`: log RTT (QUIC), events sent/received and lost datagrams
+(via `seq` gaps) every second.
 
-`pheme setup` (Linux): ghi udev rule, `usermod -aG input`, `udevadm
-control --reload` — cần sudo, in lệnh nếu không có quyền. (Windows): SP1
-không làm gì ngoài in "OK".
+`pheme setup` (Linux): write the udev rule, `usermod -aG input`,
+`udevadm control --reload` — needs sudo; prints the commands if not
+privileged. (Windows): SP1 only prints "OK".
 
-## 7. Tiêu chí hoàn thành
+## 7. Definition of done
 
-Tự động: `cargo test --workspace` xanh trên Linux và Windows (CI);
-test tích hợp mock: server+client cùng process, 10 000 `MouseMove` qua
-QUIC localhost, RTT trung bình < 0.5 ms, không mất gói.
+Automated: `cargo test --workspace` green on Linux and Windows (CI); mock
+integration test: server + client in one process, 10 000 `MouseMove`
+over QUIC localhost, mean RTT < 0.5 ms, no loss.
 
-Thủ công (`docs/testing.md`), cho cả 4 tổ hợp Linux X11/Windows ×
-Linux/Windows:
+Manual (`docs/testing.md`), for all 4 combinations of Linux X11/Windows
+× Linux/Windows:
 
-1. Pair thành công; máy thứ ba không pair thử kết nối → bị từ chối.
-2. Chuột qua cạnh phải → điều khiển client, quay lại qua cạnh trái client.
-3. Kéo dọc theo cạnh không nhảy máy.
-4. Gõ 100 ký tự gồm Shift/Ctrl/Alt combo, phím mũi tên, Numpad,
-   PrintScreen, Pause — đúng và không kẹt.
-5. Giữ Shift khi kéo qua cạnh, thả bên client → không kẹt ở cả hai máy.
-6. Scroll dọc/ngang mượt (hi-res).
-7. Lock hotkey: bật → không thể rời; tắt → rời được.
-8. Rút mạng client khi đang Remote → server có lại chuột < 5 s; cắm lại →
-   client tự kết nối lại < 10 s, không phím kẹt.
-9. Client đa màn hình: `Enter` vào đúng màn hình, di chuyển qua tất cả.
+1. Pairing succeeds; a third, unpaired machine attempting to connect is
+   rejected.
+2. Pointer across the right edge → controls the client; returns across
+   the client's left edge.
+3. Dragging along the edge does not switch machines.
+4. Type 100 characters including Shift/Ctrl/Alt combos, arrow keys,
+   Numpad, PrintScreen, Pause — correct and nothing stuck.
+5. Hold Shift while crossing the edge, release on the client → not stuck
+   on either machine.
+6. Vertical/horizontal scrolling is smooth (hi-res).
+7. Lock hotkey: on → cannot leave; off → can leave.
+8. Unplug the client's network while Remote → the server regains its
+   mouse in < 5 s; plug back in → the client reconnects in < 10 s, no
+   stuck keys.
+9. Multi-monitor client: `Enter` lands on the right monitor; the pointer
+   can travel across all of them.
 
-## 8. Rủi ro đã biết
+## 8. Known risks
 
-- Modifier kẹt phía server sau Ungrab (§4) — verify thủ công; fallback
-  `ReleaseLocalModifiers`.
-- libinput có thể không chấp nhận thiết bị uinput lai rel+abs — fallback
-  tách 2 thiết bị.
-- Windows: `ShowCursor` đếm tham chiếu theo thread — phải gọi trên đúng
-  thread hook.
-- X11 `XIGrabDevice` thất bại nếu app khác đang grab (menu đang mở) →
-  retry 3 lần cách 10 ms rồi bỏ qua lần chuyển đó, ở lại Local.
+- Stuck modifiers on the server after Ungrab (§4) — verify manually;
+  fallback `ReleaseLocalModifiers`.
+- libinput may reject a hybrid rel+abs uinput device — fallback: split
+  into 2 devices.
+- Windows: `ShowCursor` is a per-thread reference count — must be called
+  on the hook thread.
+- X11 `XIGrabDevice` fails if another app holds a grab (an open menu) →
+  retry 3 times 10 ms apart, then skip that switch and stay Local.
