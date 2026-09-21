@@ -88,7 +88,7 @@ pub fn detect_inject() -> Result<Box<dyn InputInject>> {
     }
     #[cfg(target_os = "windows")]
     {
-        Err(Error::Unsupported("not yet implemented".into()))
+        Ok(Box::new(windows::WindowsInject::new()))
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
