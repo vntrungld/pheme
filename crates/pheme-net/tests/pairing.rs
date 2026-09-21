@@ -87,6 +87,45 @@ async fn wrong_code_fails_and_trusts_nothing() {
 }
 
 #[tokio::test]
+async fn pairing_mode_ends_after_one_success() {
+    let s = side("server");
+    let c = side("client");
+    let server = Endpoint::server("127.0.0.1:0".parse().unwrap(), &s.id, s.trust.clone()).unwrap();
+    let addr = server.local_addr().unwrap();
+    let code = "123456".to_string();
+    let (s_id, s_trust) = (s.id, s.trust.clone());
+    let server_task = tokio::spawn(async move {
+        let r =
+            run_server_pairing(&server, &code, &s_id, s_trust, 3, Duration::from_secs(10)).await;
+        (server, r)
+    });
+    let client = Endpoint::pairing_client(&c.id, c.trust.clone()).unwrap();
+    let server_name = client_pair(&client, addr, "123456", &c.id, c.trust.clone())
+        .await
+        .unwrap();
+    assert_eq!(server_name, "server");
+    let (server, client_name) = server_task.await.unwrap();
+    assert_eq!(client_name.unwrap(), "client");
+
+    let intruder = side("intruder");
+    let accept = tokio::spawn(async move { server.accept().await });
+    let intruder_client = Endpoint::pairing_client(&intruder.id, intruder.trust.clone()).unwrap();
+    let res = tokio::time::timeout(
+        Duration::from_secs(5),
+        client_pair(
+            &intruder_client,
+            addr,
+            "123456",
+            &intruder.id,
+            intruder.trust.clone(),
+        ),
+    )
+    .await;
+    assert!(matches!(res, Ok(Err(_))), "{res:?}");
+    accept.abort();
+}
+
+#[tokio::test]
 async fn pairing_is_refused_when_not_in_pairing_mode() {
     let s = side("server");
     let c = side("client");

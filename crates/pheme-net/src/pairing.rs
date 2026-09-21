@@ -36,6 +36,14 @@ fn confirm(key: &[u8], first_fp: &str, second_fp: &str) -> Vec<u8> {
     mac.finalize().into_bytes().to_vec()
 }
 
+/// Constant-time verification of a received confirmation tag.
+fn verify_confirm(key: &[u8], first_fp: &str, second_fp: &str, tag: &[u8]) -> bool {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("hmac accepts any key length");
+    mac.update(first_fp.as_bytes());
+    mac.update(second_fp.as_bytes());
+    mac.verify_slice(tag).is_ok()
+}
+
 fn split_first_frame(bytes: &[u8]) -> Result<(Vec<u8>, String)> {
     if bytes.len() < SPAKE_MSG_LEN {
         return Err(NetError::Pairing("short SPAKE2 message".into()));
@@ -45,6 +53,11 @@ fn split_first_frame(bytes: &[u8]) -> Result<(Vec<u8>, String)> {
         .map_err(|_| NetError::Pairing("peer name is not UTF-8".into()))?;
     if name.is_empty() || name.len() > 64 {
         return Err(NetError::Pairing("bad peer name length".into()));
+    }
+    if name.chars().any(char::is_control) {
+        return Err(NetError::Pairing(
+            "peer name contains control characters".into(),
+        ));
     }
     Ok((msg.to_vec(), name.to_string()))
 }
@@ -78,19 +91,23 @@ pub async fn server_pair(
     let theirs = framing::read_raw(&mut recv, &mut buf)
         .await?
         .ok_or_else(|| NetError::Pairing("client hung up".into()))?;
-    if theirs != confirm(&key, &client_fp, &id.fingerprint).as_slice() {
+    if !verify_confirm(&key, &client_fp, &id.fingerprint, theirs) {
         conn.close(2u32.into(), b"bad code");
         return Err(NetError::Pairing("wrong code".into()));
     }
-    framing::write_raw(&mut send, &confirm(&key, &id.fingerprint, &client_fp)).await?;
-    framing::write_raw(&mut send, b"ok").await?;
-    let _ = send.finish();
 
+    // Persist trust before telling the client it can trust us: a save failure here must
+    // never leave the client trusting a server that does not (yet) trust it back.
     {
         let mut t = trust.write().unwrap();
         t.add(&client_name, &client_fp);
         t.save()?;
     }
+
+    framing::write_raw(&mut send, &confirm(&key, &id.fingerprint, &client_fp)).await?;
+    framing::write_raw(&mut send, b"ok").await?;
+    let _ = send.finish();
+
     info!(name = %client_name, fp = %client_fp, "paired client");
     // Give the client time to read before closing.
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -129,7 +146,7 @@ pub async fn client_pair(
     let theirs = framing::read_raw(&mut recv, &mut buf)
         .await?
         .ok_or_else(|| NetError::Pairing("wrong code".into()))?;
-    if theirs != confirm(&key, &server_fp, &id.fingerprint).as_slice() {
+    if !verify_confirm(&key, &server_fp, &id.fingerprint, theirs) {
         return Err(NetError::Pairing("server confirmation mismatch".into()));
     }
     let ok = framing::read_raw(&mut recv, &mut buf)
@@ -148,8 +165,20 @@ pub async fn client_pair(
     Ok(server_name)
 }
 
+/// Disables pairing mode on the wrapped endpoint when dropped, whether that happens because
+/// `run_server_pairing`'s future completed normally or because it was cancelled/aborted
+/// (e.g. a "cancel pairing" action) part-way through.
+struct PairingModeGuard<'a>(&'a Endpoint);
+
+impl Drop for PairingModeGuard<'_> {
+    fn drop(&mut self) {
+        self.0.set_pairing(false);
+    }
+}
+
 /// Enables pairing mode on `endpoint`, serves attempts until one succeeds, `max_failures`
-/// wrong codes are seen, or `timeout` passes. Pairing mode is always disabled on return.
+/// wrong codes are seen, or `timeout` passes. Pairing mode is disabled when this future
+/// completes or is dropped.
 pub async fn run_server_pairing(
     endpoint: &Endpoint,
     code: &str,
@@ -159,6 +188,7 @@ pub async fn run_server_pairing(
     timeout: Duration,
 ) -> Result<String> {
     endpoint.set_pairing(true);
+    let _guard = PairingModeGuard(endpoint);
     let result = tokio::time::timeout(timeout, async {
         let mut failures = 0;
         loop {
@@ -182,7 +212,6 @@ pub async fn run_server_pairing(
         }
     })
     .await;
-    endpoint.set_pairing(false);
     match result {
         Ok(r) => r,
         Err(_) => Err(NetError::Pairing("timed out".into())),
