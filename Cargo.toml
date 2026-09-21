@@ -1,0 +1,49 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pheme-proto",
+    "crates/pheme-core",
+    "crates/pheme-input",
+    "crates/pheme-net",
+    "crates/pheme-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+repository = "https://github.com/trungld/pheme"
+rust-version = "1.85"
+
+[workspace.dependencies]
+pheme-proto = { path = "crates/pheme-proto" }
+pheme-core = { path = "crates/pheme-core" }
+pheme-input = { path = "crates/pheme-input" }
+pheme-net = { path = "crates/pheme-net" }
+
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "signal"] }
+crossbeam-channel = "0.5"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
+rustls-pki-types = "1"
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }
+sha2 = "0.10"
+hmac = "0.12"
+spake2 = "0.4"
+rand = "0.9"
+hex = "0.4"
+toml = "0.8"
+dirs = "6"
+clap = { version = "4", features = ["derive"] }
+proptest = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
