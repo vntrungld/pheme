@@ -43,6 +43,14 @@ pub trait InputCapture: Send {
     /// channel is full (never block). `stop()` must stop the backend thread and drop every
     /// clone of the `Sender` before returning, so the receiver observes disconnection.
     fn start(&mut self, tx: Sender<CaptureEvent>) -> Result<()>;
+    /// Switches between observing and grabbing. **Synchronous**: returns only after the
+    /// backend has applied the mode (grab acquired / released) or failed to, so a
+    /// `warp_cursor` issued right after `set_mode(Observe)` is not undone by a still-active
+    /// grab/clip, and a failed grab is reported to the caller instead of leaving the backend
+    /// silently in the previous mode. Backends that hand the request to their own thread
+    /// must wait for that thread's acknowledgement with an internal timeout of 1 s, mapping
+    /// a timeout to `Error::Backend("mode change timed out")`. On `Err` the mode is
+    /// unchanged.
     fn set_mode(&mut self, mode: CaptureMode) -> Result<()>;
     fn warp_cursor(&mut self, x: i32, y: i32) -> Result<()>;
     fn screens(&self) -> Vec<ScreenInfo>;

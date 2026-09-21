@@ -121,6 +121,19 @@ impl ServerCore {
         }
     }
 
+    /// Cancels a switch whose `Grab` failed: returns to Local as if the crossing never
+    /// happened. No `Leave` is sent because `Enter` has not been sent yet (`Grab` is the
+    /// first action of a switch). Returns nothing when already Local.
+    pub fn abort_switch(&mut self) -> Vec<Action> {
+        if self.remote.take().is_none() {
+            return Vec::new();
+        }
+        let (x, y) = self.server.center();
+        self.last_pos = Some((x, y));
+        debug!("switch aborted; back to local");
+        vec![Action::WarpCursor { x, y }]
+    }
+
     pub fn on_event(&mut self, ev: CaptureEvent) -> Vec<Action> {
         if let CaptureEvent::Key { code, down } = ev {
             if Some(code) == self.hotkeys.lock {
@@ -494,6 +507,22 @@ mod tests {
         ));
         assert_eq!(c.active(), Active::Local);
         assert!(enter_right(&mut c).is_empty(), "client is gone");
+    }
+
+    #[test]
+    fn abort_switch_returns_to_local_without_leave() {
+        let mut c = core(Side::Right, (0.0, 1.0));
+        assert!(c.abort_switch().is_empty(), "nothing to abort while local");
+        enter_right(&mut c);
+        assert_eq!(c.active(), Active::Remote("lap".into()));
+        let a = c.abort_switch();
+        assert_eq!(a, vec![Action::WarpCursor { x: 960, y: 540 }]);
+        assert_eq!(c.active(), Active::Local);
+        // The next edge hit is a fresh crossing: the centre counts as the previous position.
+        let a = c.on_event(CaptureEvent::MotionAbs { x: 1919, y: 540 });
+        assert!(matches!(a[0], Action::Grab));
+        assert!(has_enter(&a).is_some());
+        assert_eq!(c.active(), Active::Remote("lap".into()));
     }
 
     #[test]

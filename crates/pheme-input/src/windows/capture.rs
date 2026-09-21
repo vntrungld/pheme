@@ -1,8 +1,9 @@
 //! WH_KEYBOARD_LL / WH_MOUSE_LL hooks for observe+grab, Raw Input for unaccelerated deltas.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{mpsc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use crossbeam_channel::Sender;
 use pheme_core::{CaptureEvent, Rect};
@@ -40,9 +41,14 @@ const WM_STOP: u32 = WM_APP + 2;
 
 const WNDCLASS_NAME: PCWSTR = w!("PhemeRawInput");
 
+/// How long `set_mode` waits for the hook thread to apply (or fail) a mode change.
+const MODE_CHANGE_TIMEOUT: Duration = Duration::from_secs(1);
+
 struct Hooks {
     tx: Sender<CaptureEvent>,
     grab: bool,
+    /// Where the hook thread reports the result of the pending `WM_SET_MODE`, if any.
+    ack: Option<mpsc::Sender<Result<()>>>,
 }
 
 /// Shared with the hook procedures (they are plain functions without a `self`).
@@ -61,6 +67,17 @@ fn send(ev: CaptureEvent) {
             }
         }
     }
+}
+
+fn set_grab_flag(on: bool) {
+    if let Some(h) = HOOKS.lock().unwrap().as_mut() {
+        h.grab = on;
+    }
+}
+
+/// Takes the pending `set_mode` acknowledgement sender out of `HOOKS`, if any.
+fn take_ack() -> Option<mpsc::Sender<Result<()>>> {
+    HOOKS.lock().unwrap().as_mut().and_then(|h| h.ack.take())
 }
 
 fn grabbing() -> bool {
@@ -282,26 +299,49 @@ impl HookThread {
         })
     }
 
-    unsafe fn set_grab(&mut self, on: bool) {
-        if let Some(h) = HOOKS.lock().unwrap().as_mut() {
-            h.grab = on;
-        }
-        if on {
+    /// Applies a mode. Never holds the `HOOKS` lock while calling into Win32 (the hook
+    /// procedures take that lock on the same thread's message dispatch). On `Err` the
+    /// previous mode is restored so a failed grab leaves nothing clipped or swallowed.
+    unsafe fn set_grab(&mut self, on: bool) -> Result<()> {
+        set_grab_flag(on);
+        let r = if on {
             let (cx, cy) = self.center;
-            let _ = SetCursorPos(cx, cy);
             let rect = RECT {
                 left: cx,
                 top: cy,
                 right: cx + 1,
                 bottom: cy + 1,
             };
-            let _ = ClipCursor(Some(&rect));
-            self.hide_cursor();
+            let r = SetCursorPos(cx, cy)
+                .map_err(|e| Error::Backend(format!("SetCursorPos: {e}")))
+                .and_then(|_| {
+                    ClipCursor(Some(&rect)).map_err(|e| Error::Backend(format!("ClipCursor: {e}")))
+                });
+            match r {
+                Ok(()) => {
+                    self.hide_cursor();
+                    Ok(())
+                }
+                Err(e) => {
+                    set_grab_flag(false);
+                    let _ = ClipCursor(None);
+                    Err(e)
+                }
+            }
         } else {
-            let _ = ClipCursor(None);
+            let r = ClipCursor(None).map_err(|e| Error::Backend(format!("ClipCursor(None): {e}")));
+            // Show the cursor even if unclipping failed: staying invisible is worse.
             self.show_cursor();
+            if r.is_err() {
+                set_grab_flag(true);
+            }
+            r
+        };
+        match &r {
+            Ok(()) => debug!(grab = on, "mode applied"),
+            Err(e) => error!(grab = on, "mode change failed: {e}"),
         }
-        debug!(grab = on, "mode applied");
+        r
     }
 
     /// Replaces the arrow cursor with a blank one system-wide (hooks stop it from moving anyway).
@@ -350,7 +390,7 @@ impl HookThread {
 
     unsafe fn uninstall(mut self) {
         if grabbing() {
-            self.set_grab(false);
+            let _ = self.set_grab(false);
         }
         let _ = UnhookWindowsHookEx(self.kbd);
         let _ = UnhookWindowsHookEx(self.mouse);
@@ -380,14 +420,26 @@ fn hook_thread_main(
                 return;
             }
         };
-        *HOOKS.lock().unwrap() = Some(Hooks { tx, grab: false });
+        *HOOKS.lock().unwrap() = Some(Hooks {
+            tx,
+            grab: false,
+            ack: None,
+        });
         let _ = ready.send(Ok(GetCurrentThreadId()));
         let mut ht = ht;
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             if msg.hwnd.0.is_null() {
                 match msg.message {
-                    WM_SET_MODE => ht.set_grab(msg.wParam.0 == 1),
+                    WM_SET_MODE => {
+                        // Take the sender out (and release the lock) before Win32 calls.
+                        let ack = take_ack();
+                        let r = ht.set_grab(msg.wParam.0 == 1);
+                        if let Some(ack) = ack {
+                            // The caller may have given up (timeout); nothing to do then.
+                            let _ = ack.send(r);
+                        }
+                    }
                     WM_STOP => break,
                     _ => {}
                 }
@@ -420,13 +472,36 @@ impl InputCapture for WindowsCapture {
         Ok(())
     }
 
+    /// Synchronous (see the trait contract): posts the request to the hook thread and
+    /// waits for it to report the actual `ClipCursor`/`SetCursorPos` result, so a
+    /// `warp_cursor` issued after `set_mode(Observe)` is never clamped by a still-active clip.
     fn set_mode(&mut self, mode: CaptureMode) -> Result<()> {
         let id = self
             .thread_id
             .ok_or_else(|| Error::Backend("not started".into()))?;
+        let (ack_tx, ack_rx) = mpsc::channel::<Result<()>>();
+        {
+            let mut hooks = HOOKS.lock().unwrap();
+            let h = hooks
+                .as_mut()
+                .ok_or_else(|| Error::Backend("hook thread is gone".into()))?;
+            h.ack = Some(ack_tx);
+        }
         let grab = matches!(mode, CaptureMode::Grab) as usize;
-        unsafe { PostThreadMessageW(id, WM_SET_MODE, WPARAM(grab), LPARAM(0)) }
-            .map_err(|e| Error::Backend(e.to_string()))
+        if let Err(e) = unsafe { PostThreadMessageW(id, WM_SET_MODE, WPARAM(grab), LPARAM(0)) } {
+            take_ack();
+            return Err(Error::Backend(format!("PostThreadMessageW: {e}")));
+        }
+        match ack_rx.recv_timeout(MODE_CHANGE_TIMEOUT) {
+            Ok(r) => r,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                take_ack();
+                Err(Error::Backend("mode change timed out".into()))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(Error::Backend(
+                "hook thread exited before applying the mode change".into(),
+            )),
+        }
     }
 
     fn warp_cursor(&mut self, x: i32, y: i32) -> Result<()> {

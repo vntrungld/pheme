@@ -6,13 +6,22 @@ use crossbeam_channel::Sender;
 use pheme_core::CaptureEvent;
 use pheme_proto::{Button, KeyCode, ScreenInfo};
 
-use crate::{CaptureMode, InputCapture, InputInject, Result};
+use crate::{CaptureMode, Error, InputCapture, InputInject, Result};
 
 #[derive(Default)]
 struct CaptureState {
     tx: Option<Sender<CaptureEvent>>,
     mode: Option<CaptureMode>,
-    warps: Vec<(i32, i32)>,
+    /// Every warp with the capture mode in force when it was recorded.
+    warps: Vec<((i32, i32), CaptureMode)>,
+    /// When set, the next `set_mode(Grab)` fails once (and clears this).
+    fail_next_grab: bool,
+}
+
+impl CaptureState {
+    fn mode(&self) -> CaptureMode {
+        self.mode.unwrap_or(CaptureMode::Observe)
+    }
 }
 
 pub struct MockCapture {
@@ -54,15 +63,28 @@ impl MockCaptureHandle {
     }
 
     pub fn mode(&self) -> CaptureMode {
-        self.state
-            .lock()
-            .unwrap()
-            .mode
-            .unwrap_or(CaptureMode::Observe)
+        self.state.lock().unwrap().mode()
     }
 
     pub fn warps(&self) -> Vec<(i32, i32)> {
+        self.warps_with_mode().into_iter().map(|(p, _)| p).collect()
+    }
+
+    /// Every warp so far, paired with the capture mode in force when it happened.
+    pub fn warps_with_mode(&self) -> Vec<((i32, i32), CaptureMode)> {
         self.state.lock().unwrap().warps.clone()
+    }
+
+    /// Makes the next `set_mode(Grab)` fail with `Error::Backend("mock grab failure")`,
+    /// leaving the mode unchanged; the flag is cleared by that failing call.
+    pub fn fail_next_grab(&self) {
+        self.state.lock().unwrap().fail_next_grab = true;
+    }
+
+    /// Simulates the backend thread dying: drops the event `Sender` so the receiver
+    /// observes disconnection, as a real backend's event loop exiting would.
+    pub fn disconnect(&self) {
+        self.state.lock().unwrap().tx = None;
     }
 }
 
@@ -73,12 +95,18 @@ impl InputCapture for MockCapture {
     }
 
     fn set_mode(&mut self, mode: CaptureMode) -> Result<()> {
-        self.state.lock().unwrap().mode = Some(mode);
+        let mut st = self.state.lock().unwrap();
+        if mode == CaptureMode::Grab && std::mem::take(&mut st.fail_next_grab) {
+            return Err(Error::Backend("mock grab failure".into()));
+        }
+        st.mode = Some(mode);
         Ok(())
     }
 
     fn warp_cursor(&mut self, x: i32, y: i32) -> Result<()> {
-        self.state.lock().unwrap().warps.push((x, y));
+        let mut st = self.state.lock().unwrap();
+        let mode = st.mode();
+        st.warps.push(((x, y), mode));
         Ok(())
     }
 
@@ -197,6 +225,57 @@ mod tests {
         cap.warp_cursor(5, 6).unwrap();
         assert_eq!(handle.warps(), vec![(5, 6)]);
         assert_eq!(cap.screens(), screens());
+    }
+
+    #[test]
+    fn fail_next_grab_fails_once_and_leaves_mode_unchanged() {
+        let (mut cap, handle) = MockCapture::new(screens());
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        cap.start(tx).unwrap();
+        handle.fail_next_grab();
+        let err = cap.set_mode(CaptureMode::Grab).unwrap_err();
+        assert!(matches!(err, Error::Backend(ref m) if m == "mock grab failure"));
+        assert_eq!(handle.mode(), CaptureMode::Observe, "mode unchanged");
+        // The flag is consumed: the next attempt succeeds.
+        cap.set_mode(CaptureMode::Grab).unwrap();
+        assert_eq!(handle.mode(), CaptureMode::Grab);
+        // Ungrab is never affected by the flag.
+        handle.fail_next_grab();
+        cap.set_mode(CaptureMode::Observe).unwrap();
+        assert_eq!(handle.mode(), CaptureMode::Observe);
+        assert!(cap.set_mode(CaptureMode::Grab).is_err(), "flag still armed");
+    }
+
+    #[test]
+    fn warps_record_the_mode_at_warp_time() {
+        let (mut cap, handle) = MockCapture::new(screens());
+        cap.warp_cursor(1, 1).unwrap();
+        cap.set_mode(CaptureMode::Grab).unwrap();
+        cap.warp_cursor(2, 2).unwrap();
+        cap.set_mode(CaptureMode::Observe).unwrap();
+        cap.warp_cursor(3, 3).unwrap();
+        assert_eq!(handle.warps(), vec![(1, 1), (2, 2), (3, 3)]);
+        assert_eq!(
+            handle.warps_with_mode(),
+            vec![
+                ((1, 1), CaptureMode::Observe),
+                ((2, 2), CaptureMode::Grab),
+                ((3, 3), CaptureMode::Observe),
+            ]
+        );
+    }
+
+    #[test]
+    fn disconnect_drops_the_sender_so_the_receiver_sees_eof() {
+        let (mut cap, handle) = MockCapture::new(screens());
+        let (tx, rx) = crossbeam_channel::unbounded();
+        cap.start(tx).unwrap();
+        assert!(handle.is_started());
+        handle.disconnect();
+        assert!(!handle.is_started());
+        assert!(rx.recv().is_err(), "receiver observes disconnection");
+        assert!(!handle.push(CaptureEvent::MotionAbs { x: 0, y: 0 }));
+        cap.stop(); // still idempotent after disconnect
     }
 
     #[test]

@@ -1,6 +1,8 @@
 //! X11 capture backend: XInput2 raw events, XIGrabDevice, XFixes cursor hiding.
 
+use std::sync::mpsc;
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender};
 use pheme_core::CaptureEvent;
@@ -22,8 +24,12 @@ use crate::keymap::evdev_to_hid;
 use crate::linux_screens::x11_screens;
 use crate::{CaptureMode, Error, InputCapture, Result};
 
+/// How long `set_mode` waits for the event thread to apply (or fail) a mode change.
+const MODE_CHANGE_TIMEOUT: Duration = Duration::from_secs(1);
+
 enum Cmd {
-    SetMode(CaptureMode),
+    /// Apply a mode; the event thread reports the actual grab/ungrab result on the sender.
+    SetMode(CaptureMode, mpsc::Sender<Result<()>>),
     Stop,
 }
 
@@ -95,6 +101,14 @@ impl X11Capture {
     }
 }
 
+impl Drop for X11Capture {
+    /// A capture dropped while grabbed still releases the grab and shows the cursor;
+    /// `stop()` is idempotent so this is safe after an explicit `stop()`.
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 impl InputCapture for X11Capture {
     fn start(&mut self, tx: Sender<CaptureEvent>) -> Result<()> {
         let cmd_rx = self
@@ -120,9 +134,23 @@ impl InputCapture for X11Capture {
         })?
     }
 
+    /// Synchronous (see the trait contract): waits for the event thread to acquire or
+    /// release the grab and returns its actual result.
     fn set_mode(&mut self, mode: CaptureMode) -> Result<()> {
-        self.cmd_tx.send(Cmd::SetMode(mode)).map_err(be)?;
-        self.wake()
+        let (ack_tx, ack_rx) = mpsc::channel();
+        self.cmd_tx
+            .send(Cmd::SetMode(mode, ack_tx))
+            .map_err(|_| Error::Backend("x11 event thread is gone".into()))?;
+        self.wake()?;
+        match ack_rx.recv_timeout(MODE_CHANGE_TIMEOUT) {
+            Ok(r) => r,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                Err(Error::Backend("mode change timed out".into()))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(Error::Backend(
+                "x11 event thread exited before applying the mode change".into(),
+            )),
+        }
     }
 
     fn warp_cursor(&mut self, x: i32, y: i32) -> Result<()> {
@@ -312,8 +340,17 @@ impl EventLoop {
                 .map_err(be)?
                 .status;
             if ok_p == GrabStatus::SUCCESS && ok_k == GrabStatus::SUCCESS {
-                self.conn.xfixes_hide_cursor(self.root).map_err(be)?;
-                self.warp_center()?;
+                // Hide + centre; if either fails, release the grabs again so an `Err`
+                // leaves the backend exactly as it was (still Observe, nothing held).
+                if let Err(e) = self
+                    .conn
+                    .xfixes_hide_cursor(self.root)
+                    .map_err(be)
+                    .and_then(|_| self.warp_center())
+                {
+                    let _ = self.ungrab();
+                    return Err(e);
+                }
                 self.mode = CaptureMode::Grab;
                 self.rem_x = 0.0;
                 self.rem_y = 0.0;
@@ -475,17 +512,22 @@ fn event_loop(
             if p.window == wake_window {
                 while let Ok(cmd) = cmd_rx.try_recv() {
                     match cmd {
-                        Cmd::SetMode(CaptureMode::Grab) if lp.mode != CaptureMode::Grab => {
-                            if let Err(e) = lp.grab() {
-                                error!("grab failed: {e}");
+                        Cmd::SetMode(mode, ack) => {
+                            // A failed grab must not kill the loop: report it to the
+                            // caller (who aborts the switch) and keep observing.
+                            let r = if mode == lp.mode {
+                                Ok(())
+                            } else if mode == CaptureMode::Grab {
+                                lp.grab()
+                            } else {
+                                lp.ungrab()
+                            };
+                            if let Err(e) = &r {
+                                error!(?mode, "mode change failed: {e}");
                             }
+                            // The caller may have given up (timeout); nothing to do then.
+                            let _ = ack.send(r);
                         }
-                        Cmd::SetMode(CaptureMode::Observe) if lp.mode != CaptureMode::Observe => {
-                            if let Err(e) = lp.ungrab() {
-                                error!("ungrab failed: {e}");
-                            }
-                        }
-                        Cmd::SetMode(_) => {}
                         Cmd::Stop => {
                             if lp.mode == CaptureMode::Grab {
                                 let _ = lp.ungrab();

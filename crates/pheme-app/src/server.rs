@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{bail, Context};
+use anyhow::{anyhow, bail, Context};
 use pheme_core::{Action, CaptureEvent, ClientPlacement, Hotkeys, Layout, ServerCore};
 use pheme_input::{CaptureMode, InputCapture};
 use pheme_net::pairing::{generate_code, run_server_pairing};
@@ -47,6 +47,11 @@ struct Shared {
 }
 
 impl Shared {
+    /// Executes a list of actions in order. A failed `Grab` aborts the switch: the core
+    /// is reset to Local, its recovery actions run instead, and the rest of the list
+    /// (`WarpCursor{centre}`, `SendControl(Enter)`) is dropped so the client never hears
+    /// of a switch that did not happen. A failed `Ungrab` is logged and the list continues
+    /// (the pointer is still warped back).
     fn execute(&self, actions: Vec<Action>) {
         if actions.is_empty() {
             return;
@@ -54,6 +59,15 @@ impl Shared {
         let link = self.link.lock().unwrap().clone();
         for a in actions {
             match a {
+                Action::Grab => {
+                    let r = self.capture.lock().unwrap().set_mode(CaptureMode::Grab);
+                    if let Err(e) = r {
+                        error!("grab failed; aborting switch: {e}");
+                        let recovery = self.core.lock().unwrap().abort_switch();
+                        self.execute(recovery);
+                        return;
+                    }
+                }
                 Action::SendControl(m) => {
                     if let Some(l) = &link {
                         let _ = l.control.send(m);
@@ -66,7 +80,6 @@ impl Shared {
                         self.counters.datagrams_sent.fetch_add(1, Ordering::Relaxed);
                     }
                 }
-                Action::Grab => self.capture_call(|c| c.set_mode(CaptureMode::Grab)),
                 Action::Ungrab => self.capture_call(|c| c.set_mode(CaptureMode::Observe)),
                 Action::WarpCursor { x, y } => self.capture_call(|c| c.warp_cursor(x, y)),
                 Action::SetLocked(locked) => info!(locked, "input lock toggled"),
@@ -112,6 +125,9 @@ pub async fn run_server(
     });
 
     // Router thread: blocking receive from the capture backend, no async hop for datagrams.
+    // It owns `router_alive`; dropping it when the loop ends (the backend closed the event
+    // channel, i.e. its thread died) is the signal the async side selects on below.
+    let (router_alive, mut router_dead) = watch::channel(());
     let router_shared = shared.clone();
     let router = std::thread::Builder::new()
         .name("pheme-router".into())
@@ -124,6 +140,7 @@ pub async fn run_server(
                 let actions = router_shared.core.lock().unwrap().on_event(ev);
                 router_shared.execute(actions);
             }
+            drop(router_alive);
         })
         .context("spawning router thread")?;
 
@@ -155,15 +172,32 @@ pub async fn run_server(
         });
     }
 
+    // `Ok(())` if the accept loop ended by request, `Err` if the router thread exited
+    // on its own (capture backend gone) before shutdown was requested.
+    let mut outcome = Ok(());
     loop {
         let incoming = tokio::select! {
             biased;
             _ = shutdown.changed() => break,
+            // Nothing is ever sent on this watch, so `changed()` only completes (with an
+            // error) once the router thread has dropped its sender.
+            _ = router_dead.changed() => {
+                error!("router thread exited: input capture backend stopped");
+                outcome = Err(anyhow!("input capture backend stopped unexpectedly"));
+                break;
+            }
             r = endpoint.accept() => r,
         };
         match incoming {
             Ok(Incoming::Peer(peer)) => {
-                if let Err(e) = handle_peer(peer, &name, shared.clone(), shutdown.clone()).await {
+                let session = handle_peer(
+                    peer,
+                    &name,
+                    shared.clone(),
+                    shutdown.clone(),
+                    router_dead.clone(),
+                );
+                if let Err(e) = session.await {
                     warn!("peer session ended with error: {e}");
                 }
             }
@@ -197,7 +231,7 @@ pub async fn run_server(
     // still running, sender clone still alive) would hang `router.join()` forever, and doing
     // that directly here would stall a tokio worker instead of just this shutdown path.
     let _ = tokio::task::spawn_blocking(move || router.join()).await;
-    Ok(())
+    outcome
 }
 
 /// Runs one client session to completion (disconnect or shutdown).
@@ -206,6 +240,7 @@ async fn handle_peer(
     server_name: &str,
     shared: Arc<Shared>,
     mut shutdown: watch::Receiver<bool>,
+    mut router_dead: watch::Receiver<()>,
 ) -> anyhow::Result<()> {
     let mut rx = peer.take_incoming();
     let hello = tokio::select! {
@@ -286,6 +321,12 @@ async fn handle_peer(
             _ = shutdown.changed() => {
                 let _ = peer.sender().send_control(&Msg::Bye { reason: "server shutting down".into() }).await;
                 break Ok(());
+            }
+            // The capture backend died mid-session: end the session so the accept loop
+            // can observe the same signal and fail `run_server`.
+            _ = router_dead.changed() => {
+                let _ = peer.sender().send_control(&Msg::Bye { reason: "server input capture stopped".into() }).await;
+                break Err(anyhow!("input capture backend stopped unexpectedly"));
             }
         }
     };
