@@ -8,7 +8,7 @@ pub mod trust;
 pub mod verifier;
 
 pub use identity::Identity;
-// pub use transport::{CloseReason, Endpoint, Incoming, Peer, PeerSender};
+pub use transport::{CloseReason, Endpoint, Incoming, Peer, PeerSender};
 pub use trust::{SharedTrust, TrustStore, TrustedPeer};
 
 pub const ALPN_MAIN: &[u8] = b"pheme/1";
