@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use pheme_net::{Endpoint, Identity, Incoming, TrustStore};
+use pheme_net::{Endpoint, Identity, Incoming, NetError, TrustStore};
 use pheme_proto::{Msg, Os};
 
 struct Side {
@@ -120,7 +120,8 @@ async fn untrusted_server_is_rejected_by_client() {
     let addr = server.local_addr().unwrap();
     let client = Endpoint::client(&c.id, c.trust.clone()).unwrap();
     let accept = tokio::spawn(async move { server.accept().await });
-    assert!(client.connect(addr).await.is_err());
+    let err = client.connect(addr).await.unwrap_err();
+    assert!(matches!(err, NetError::Untrusted(_)), "{err:?}");
     accept.abort();
 }
 
@@ -146,4 +147,36 @@ async fn server_shutdown_closes_peer_quickly() {
     let _ = peer.closed().await;
     assert!(t.elapsed() < Duration::from_secs(6));
     accept.await.unwrap();
+}
+
+#[tokio::test]
+async fn dropping_peer_closes_the_connection() {
+    let s = side("server");
+    let c = side("client");
+    trust_each_other(&s, &c);
+    let server = Endpoint::server("127.0.0.1:0".parse().unwrap(), &s.id, s.trust.clone()).unwrap();
+    let addr = server.local_addr().unwrap();
+    let client = Endpoint::client(&c.id, c.trust.clone()).unwrap();
+
+    let server_task = tokio::spawn(async move {
+        let Incoming::Peer(peer) = server.accept().await.unwrap() else {
+            panic!("expected peer")
+        };
+        peer
+    });
+
+    let peer = client.connect(addr).await.unwrap();
+    peer.sender().send_control(&hello("client")).await.unwrap();
+    let server_peer = server_task.await.unwrap();
+
+    // Drop without an explicit close(); `Peer`'s `Drop` impl must close the connection itself.
+    drop(peer);
+
+    let reason = tokio::time::timeout(Duration::from_secs(2), server_peer.closed())
+        .await
+        .expect("server-side peer must observe the drop-triggered close promptly");
+    assert!(
+        !matches!(reason, pheme_net::CloseReason::LocallyClosed),
+        "{reason:?}"
+    );
 }

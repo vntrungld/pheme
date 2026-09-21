@@ -6,8 +6,9 @@ use std::sync::Arc;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
-use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
+use rustls::{CertificateError, DigitallySignedStruct, DistinguishedName, Error, SignatureScheme};
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
+use tracing::debug;
 
 use crate::identity::fingerprint;
 use crate::trust::SharedTrust;
@@ -42,9 +43,13 @@ impl PinnedVerifier {
         if self.trust.read().unwrap().is_trusted(&fp) {
             Ok(())
         } else {
-            Err(rustls::Error::General(format!(
-                "untrusted certificate {fp}"
-            )))
+            debug!(%fp, "rejecting untrusted certificate");
+            // `ApplicationVerificationFailure` is the variant rustls/quinn carry over the wire
+            // as a TLS alert, letting the connecting side (transport::connect_raw) distinguish
+            // "you are not in my trust store" from other handshake/transport failures.
+            Err(Error::InvalidCertificate(
+                CertificateError::ApplicationVerificationFailure,
+            ))
         }
     }
 }

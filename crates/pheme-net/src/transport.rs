@@ -18,6 +18,9 @@ use crate::verifier::PinnedVerifier;
 use crate::{NetError, Result, ALPN_MAIN, ALPN_PAIR};
 
 const CONTROL_BUFFER: usize = 256;
+/// How long `accept()` waits for a connected, trusted peer to open its control stream before
+/// giving up on it and moving on to the next connection.
+const CONTROL_STREAM_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub mod framing {
     use super::*;
@@ -216,6 +219,13 @@ impl Endpoint {
     }
 
     /// Accepts the next connection. Untrusted peers on the main ALPN are closed and skipped.
+    ///
+    /// QUIC streams are invisible to the peer until data is written on them, so a connected,
+    /// trusted peer that never opens its control stream (or opens one but never writes to it)
+    /// would otherwise wedge this loop for every other connection; `accept()` gives such a peer
+    /// a fixed grace period (currently 5 seconds) to send its first control frame (its `Hello`)
+    /// before closing the connection and moving on. Callers of [`Endpoint::connect`] must send
+    /// that first control frame promptly after connecting for the same reason.
     pub async fn accept(&self) -> Result<Incoming> {
         debug_assert!(self.is_server);
         loop {
@@ -249,17 +259,27 @@ impl Endpoint {
                 conn.close(1u32.into(), b"untrusted");
                 continue;
             };
-            let (send, recv) = match conn.accept_bi().await {
-                Ok(s) => s,
-                Err(e) => {
-                    debug!("no control stream: {e}");
-                    continue;
-                }
-            };
+            let (send, recv) =
+                match tokio::time::timeout(CONTROL_STREAM_TIMEOUT, conn.accept_bi()).await {
+                    Ok(Ok(s)) => s,
+                    Ok(Err(e)) => {
+                        debug!("no control stream: {e}");
+                        continue;
+                    }
+                    Err(_) => {
+                        conn.close(1u32.into(), b"no control stream");
+                        continue;
+                    }
+                };
             return Ok(Incoming::Peer(Peer::new(conn, name, fp, send, recv)));
         }
     }
 
+    /// Connects to a trusted server and opens the control stream.
+    ///
+    /// QUIC streams are invisible to the peer until data is written on them: the returned
+    /// `Peer` must have its first control frame (its `Hello`) sent promptly, or the server's
+    /// `accept()` will time out waiting for it and close the connection.
     pub async fn connect(&self, addr: SocketAddr) -> Result<Peer> {
         let (conn, fp) = self.connect_raw(addr).await?;
         let name = self
@@ -284,7 +304,22 @@ impl Endpoint {
             .connect(addr, "pheme")
             .map_err(conn_err)?
             .await
-            .map_err(conn_err)?;
+            .map_err(|e| match e {
+                // `PinnedVerifier::check` rejects an untrusted certificate with
+                // `rustls::CertificateError::ApplicationVerificationFailure`, which rustls
+                // carries over the wire as a TLS `access_denied` alert (code 0x31 / 49, per
+                // `impl From<CertificateError> for AlertDescription` and RFC 8446 §6.2 — *not*
+                // `bad_certificate` (0x2a / 42), which rustls reserves for malformed/expired/
+                // untrusted-CA certificates). quinn-proto surfaces the alert as a QUIC
+                // `TransportErrorCode::crypto(alert)`. Empirically confirmed via
+                // `untrusted_server_is_rejected_by_client`.
+                quinn::ConnectionError::TransportError(ref te)
+                    if te.code == quinn::TransportErrorCode::crypto(0x31) =>
+                {
+                    NetError::Untrusted("server certificate is not in the trust store".into())
+                }
+                other => conn_err(other),
+            })?;
         let fp = peer_fingerprint(&conn)?;
         Ok((conn, fp))
     }
@@ -330,6 +365,10 @@ impl PeerSender {
     }
 }
 
+/// A connected, authenticated peer. Dropping a `Peer` closes its underlying QUIC connection
+/// (see the `Drop` impl below) — otherwise its reader tasks (and the connection itself) could
+/// outlive the `Peer` indefinitely under mutual keep-alives, since neither side's idle timeout
+/// would ever fire.
 #[derive(Debug)]
 pub struct Peer {
     conn: Connection,
@@ -425,5 +464,13 @@ impl Peer {
 
     pub fn close(&self, reason: &str) {
         self.conn.close(0u32.into(), reason.as_bytes());
+    }
+}
+
+impl Drop for Peer {
+    /// Closing an already-closed `quinn::Connection` is a no-op, so an earlier explicit
+    /// `close(reason)` is unaffected; this only matters for `Peer`s that were simply dropped.
+    fn drop(&mut self) {
+        self.conn.close(0u32.into(), b"peer dropped");
     }
 }
