@@ -42,9 +42,10 @@ Run before every release, for **each** row of the matrix. Record the result
    `Shift+letters`, `Ctrl+A`/`Ctrl+C`/`Ctrl+V`, `Alt+Tab`, arrows, Home/End, Numpad
    digits with NumLock on, `PrintScreen`, `Pause`, F1–F12. Everything arrives, nothing
    repeats, no key is left held (check with `xev`/`evtest` on Linux or by typing after).
-5. **Modifier across the edge** — hold Shift on the server, cross to the client, type
-   `a` (expect `A`), release Shift on the client, type `a` (expect `a`), cross back,
-   type `a` on the server (expect `a`).
+5. **Modifier across the edge** — hold Shift on the server, cross to the client, release
+   Shift on the client, then type `a` on the client (expect `a`) and, after crossing
+   back, `a` on the server (expect `a`): nothing stays stuck on either side. (The
+   modifier state at `Enter` is logged, not replayed on the client.)
 6. **Scrolling** — vertical and horizontal wheel on the client scroll smoothly; one
    notch = one notch. Hi-res mice (free-spin) scroll proportionally.
 7. **Lock hotkey** — press ScrollLock on the server: the pointer can no longer leave;
@@ -56,5 +57,8 @@ Run before every release, for **each** row of the matrix. Record the result
    switch works again.
 9. **Multi-monitor client** — with two monitors on the client, `Enter` lands on the
    monitor adjacent to the server edge and the pointer can travel across both.
-10. **Stats** — run both sides with `--stats`: on a wired LAN the reported RTT is
-    below 1 ms and `datagrams` lost stay at 0 during 1 minute of continuous movement.
+10. **Stats** — run both sides with `--stats`. The client logs a `stats/s` line every
+    second with `rtt_us`, `received` and `lost` (datagrams missing from the `seq`
+    numbering); the server logs `events`, `control` and `datagrams` sent. On a wired
+    LAN `rtt_us` stays below 1000 and `lost` stays at 0 during 1 minute of continuous
+    movement.

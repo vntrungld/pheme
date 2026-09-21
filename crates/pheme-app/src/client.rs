@@ -36,6 +36,41 @@ fn apply(inject: &mut dyn InputInject, a: InjectAction) {
     }
 }
 
+/// Datagram loss accounting from `seq` gaps: given the highest `seq` seen so far and a
+/// newly received one, returns how many datagrams were skipped and the new high-water
+/// mark. A late or duplicate datagram (`seq` at or behind the mark, modulo wraparound)
+/// counts as no loss and leaves the mark alone; a wrap from `u32::MAX` to `0` is a gap
+/// of 0.
+fn count_gap(last: Option<u32>, seq: u32) -> (u64, Option<u32>) {
+    let Some(last) = last else {
+        return (0, Some(seq));
+    };
+    let ahead = seq.wrapping_sub(last);
+    if ahead == 0 || ahead > u32::MAX / 2 {
+        (0, Some(last))
+    } else {
+        (u64::from(ahead - 1), Some(seq))
+    }
+}
+
+/// The `seq` of an input message. The server numbers every input message (control and
+/// datagram) from one counter per direction, so loss must be tracked across all of them:
+/// tracking datagrams alone would report each interleaved `Key`/`Button` as a lost
+/// datagram. Control messages cannot be lost, so a gap that survives reordering is a
+/// lost datagram. `None` for handshake/keepalive and audio (its own per-stream numbering).
+fn input_seq(m: &Msg) -> Option<u32> {
+    match m {
+        Msg::Key { seq, .. }
+        | Msg::Button { seq, .. }
+        | Msg::Enter { seq, .. }
+        | Msg::Leave { seq, .. }
+        | Msg::MouseMove { seq, .. }
+        | Msg::MouseAbs { seq, .. }
+        | Msg::Wheel { seq, .. } => Some(*seq),
+        _ => None,
+    }
+}
+
 pub async fn run_client(
     deps: ClientDeps,
     mut shutdown: watch::Receiver<bool>,
@@ -127,6 +162,8 @@ async fn session(
     let mut ping = tokio::time::interval(Duration::from_secs(1));
     let mut ping_seq = 0u64;
     let mut received = 0u64;
+    let mut lost = 0u64;
+    let mut last_seq: Option<u32> = None;
     let mut last_stats = Instant::now();
     let result = loop {
         tokio::select! {
@@ -144,6 +181,11 @@ async fn session(
                 }
                 Some(m) => {
                     received += 1;
+                    if let Some(seq) = input_seq(&m) {
+                        let (gap, next) = count_gap(last_seq, seq);
+                        lost += gap;
+                        last_seq = next;
+                    }
                     for a in core.on_msg(&m) { apply(inject, a); }
                 }
                 None => break Ok(()),
@@ -152,8 +194,9 @@ async fn session(
                 ping_seq += 1;
                 let _ = sender.send_control(&Msg::Ping(ping_seq)).await;
                 if stats && last_stats.elapsed() >= Duration::from_secs(1) {
-                    info!(rtt_us = peer.rtt().as_micros(), received, active = core.active(), "stats/s");
+                    info!(rtt_us = peer.rtt().as_micros(), received, lost, active = core.active(), "stats/s");
                     received = 0;
+                    lost = 0;
                     last_stats = Instant::now();
                 }
             }
@@ -207,4 +250,85 @@ pub async fn pair(cfg: Config, host: &str, code: &str) -> anyhow::Result<()> {
     let server_name = client_pair(&endpoint, addr, code.trim(), &identity, trust).await?;
     println!("Paired with {server_name} at {addr}. You can now run `pheme client {host}`.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{count_gap, input_seq};
+    use pheme_proto::{Button, KeyCode, Modifiers, Msg};
+
+    #[test]
+    fn first_datagram_starts_tracking_without_loss() {
+        assert_eq!(count_gap(None, 7), (0, Some(7)));
+    }
+
+    #[test]
+    fn consecutive_sequence_numbers_lose_nothing() {
+        assert_eq!(count_gap(Some(7), 8), (0, Some(8)));
+    }
+
+    #[test]
+    fn a_gap_counts_the_missing_datagrams() {
+        assert_eq!(count_gap(Some(5), 9), (3, Some(9)));
+    }
+
+    #[test]
+    fn reordered_or_duplicate_datagrams_are_ignored() {
+        assert_eq!(count_gap(Some(9), 7), (0, Some(9)), "late arrival");
+        assert_eq!(count_gap(Some(9), 9), (0, Some(9)), "duplicate");
+    }
+
+    #[test]
+    fn every_input_message_feeds_the_sequence_tracker() {
+        let seqd = [
+            Msg::Key {
+                seq: 1,
+                code: KeyCode(0x04),
+                down: true,
+            },
+            Msg::Button {
+                seq: 2,
+                btn: Button::Left,
+                down: true,
+            },
+            Msg::Enter {
+                seq: 3,
+                x: 0,
+                y: 0,
+                mods: Modifiers(0),
+            },
+            Msg::Leave { seq: 4 },
+            Msg::MouseMove {
+                seq: 5,
+                dx: 0,
+                dy: 0,
+            },
+            Msg::MouseAbs { seq: 6, x: 0, y: 0 },
+            Msg::Wheel {
+                seq: 7,
+                dx: 0,
+                dy: 0,
+            },
+        ];
+        for (i, m) in seqd.iter().enumerate() {
+            assert_eq!(input_seq(m), Some(i as u32 + 1), "{m:?}");
+        }
+        assert_eq!(input_seq(&Msg::Ping(1)), None);
+        assert_eq!(
+            input_seq(&Msg::Bye {
+                reason: String::new()
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn wraparound_is_tolerated_as_no_loss() {
+        assert_eq!(count_gap(Some(u32::MAX), 0), (0, Some(0)));
+        assert_eq!(
+            count_gap(Some(u32::MAX - 1), 1),
+            (2, Some(1)),
+            "gap across the wrap"
+        );
+    }
 }
