@@ -76,8 +76,24 @@ fn transport_config() -> Arc<quinn::TransportConfig> {
     ));
     t.keep_alive_interval(Some(Duration::from_secs(1)));
     t.initial_rtt(Duration::from_millis(1));
-    t.datagram_send_buffer_size(16 * 1024);
-    t.datagram_receive_buffer_size(Some(64 * 1024));
+    // `Connection::send_datagram` queues with `drop = true`: once this buffer is full it
+    // silently evicts the *oldest* unsent datagram to make room for the new one, with no
+    // error returned to the caller (see quinn-proto's `Datagrams::send`). Each queued entry
+    // costs `size_of::<Datagram>()` (~32 bytes, dominated by `Bytes`'s header) plus its
+    // payload, so the previous 16 KiB budget held only ~390 of our ~9-12 byte `MouseMove`
+    // datagrams. A legitimate high-rate burst (e.g. a fast mouse swipe, or this crate's own
+    // integration test pushing 10 000 relative moves back to back) produces them faster than
+    // the connection driver task can flush the socket, so most of the burst was silently
+    // dropped even though every call to `send_datagram` reported success. 1 MiB comfortably
+    // covers a burst an order of magnitude larger than that (~440 KiB) without materially
+    // increasing per-connection memory use.
+    t.datagram_send_buffer_size(1024 * 1024);
+    // Mirrors the send-side budget: under backpressure from a slow consumer (e.g. the
+    // integration test's mock inject path briefly losing the scheduler to CPU contention),
+    // `DatagramState::received` evicts the *oldest* buffered-but-undelivered datagram once
+    // this window is exceeded (quinn-proto, "dropping stale datagram"), which is just as
+    // silent to the application as the send-side eviction above.
+    t.datagram_receive_buffer_size(Some(1024 * 1024));
     t.max_concurrent_bidi_streams(4u32.into());
     Arc::new(t)
 }
