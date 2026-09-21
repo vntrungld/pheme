@@ -34,7 +34,7 @@ pub struct Rect {
 }
 
 impl Rect {
-    /// Bounding rectangle of all screens; a 1×1 rect at the origin when there are none.
+    /// Bounding rectangle of all screens; always at least 1×1, never degenerate.
     pub fn bounds(screens: &[ScreenInfo]) -> Rect {
         let mut it = screens.iter();
         let Some(first) = it.next() else {
@@ -56,8 +56,8 @@ impl Rect {
         Rect {
             x: x0,
             y: y0,
-            w: x1 - x0,
-            h: y1 - y0,
+            w: (x1 - x0).max(1),
+            h: (y1 - y0).max(1),
         }
     }
 
@@ -196,6 +196,34 @@ mod tests {
                 h: 1
             }
         );
+    }
+
+    #[test]
+    fn bounds_never_degenerate_to_zero_size() {
+        let r = Rect::bounds(&[s(10, 20, 0, 0)]);
+        assert_eq!(
+            r,
+            Rect {
+                x: 10,
+                y: 20,
+                w: 1,
+                h: 1
+            }
+        );
+        // projections must not panic on the smallest possible client rect
+        let seg = EdgeSegment {
+            side: Side::Right,
+            start: 0,
+            end: 1080,
+        };
+        assert_eq!(project_entry(&seg, 540, &r), (0, 0));
+        let server = Rect {
+            x: 0,
+            y: 0,
+            w: 1920,
+            h: 1080,
+        };
+        assert_eq!(project_exit(&seg, &r, -1, 0, &server), (1918, 0));
     }
 
     #[test]
