@@ -125,8 +125,8 @@ impl Peer {
 ```
 
 quinn tuning: `max_idle_timeout = 5 s`, `keep_alive_interval = 1 s`,
-`initial_rtt = 1 ms`, `datagram_send_buffer_size = 16 KiB`,
-`datagram_receive_buffer_size = 64 KiB`, `max_concurrent_bidi_streams =
+`initial_rtt = 1 ms`, `datagram_send_buffer_size = 1 MiB`,
+`datagram_receive_buffer_size = 1 MiB` (quinn evicts the oldest unsent datagram when the buffer is full, and every dropped relative move is lost cursor distance), `max_concurrent_bidi_streams =
 4`. Control stream framing: `u16 LE length` + postcard bytes.
 
 Reconnect (client): loop `connect → run → closed → backoff`; backoff
