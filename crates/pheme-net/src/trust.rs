@@ -6,6 +6,7 @@ use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
 
+use crate::fsutil::write_atomic;
 use crate::{NetError, Result};
 
 pub type SharedTrust = Arc<RwLock<TrustStore>>;
@@ -75,7 +76,7 @@ impl TrustStore {
             peers: self.peers.clone(),
         })
         .expect("serializable");
-        fs::write(&self.path, text)?;
+        write_atomic(&self.path, text.as_bytes(), 0o644)?;
         Ok(())
     }
 }
@@ -99,5 +100,20 @@ mod tests {
         assert_eq!(t2.name_of("ab"), Some("lap-renamed".to_string()));
         assert_eq!(t2.peers().len(), 2);
         assert!(dir.path().join("trusted.toml").exists());
+    }
+
+    #[test]
+    fn save_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = TrustStore::load(dir.path()).unwrap();
+        t.add("lap", "ab");
+        t.save().unwrap();
+
+        let entries: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(entries.contains(&"trusted.toml".to_string()));
+        assert!(!entries.iter().any(|n| n.ends_with(".tmp")));
     }
 }

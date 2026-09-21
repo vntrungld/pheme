@@ -1,5 +1,6 @@
 //! QUIC transport with pinned-certificate mTLS, pairing and reconnect helpers.
 
+mod fsutil;
 pub mod identity;
 pub mod pairing;
 pub mod transport;

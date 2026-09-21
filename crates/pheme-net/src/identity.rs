@@ -6,6 +6,7 @@ use std::path::Path;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use sha2::{Digest, Sha256};
 
+use crate::fsutil::write_atomic;
 use crate::{NetError, Result};
 
 pub struct Identity {
@@ -25,8 +26,15 @@ impl Identity {
         fs::create_dir_all(dir)?;
         let cert_path = dir.join("identity.crt");
         let key_path = dir.join("identity.key");
-        let (cert_der, key_der) = if cert_path.exists() && key_path.exists() {
+        let cert_exists = cert_path.exists();
+        let key_exists = key_path.exists();
+        let (cert_der, key_der) = if cert_exists && key_exists {
             (fs::read(&cert_path)?, fs::read(&key_path)?)
+        } else if cert_exists || key_exists {
+            return Err(NetError::Tls(format!(
+                "incomplete identity in {}: expected both identity.crt and identity.key (delete both to regenerate)",
+                dir.display()
+            )));
         } else {
             let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519)
                 .map_err(|e| NetError::Tls(e.to_string()))?;
@@ -42,13 +50,8 @@ impl Identity {
                 .map_err(|e| NetError::Tls(e.to_string()))?;
             let cert_der = cert.der().to_vec();
             let key_der = key.serialize_der();
-            fs::write(&cert_path, &cert_der)?;
-            fs::write(&key_path, &key_der)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))?;
-            }
+            write_atomic(&cert_path, &cert_der, 0o644)?;
+            write_atomic(&key_path, &key_der, 0o600)?;
             (cert_der, key_der)
         };
         let cert = CertificateDer::from(cert_der);
@@ -90,5 +93,33 @@ mod tests {
         let a = Identity::load_or_create(d1.path(), "x").unwrap();
         let b = Identity::load_or_create(d2.path(), "x").unwrap();
         assert_ne!(a.fingerprint, b.fingerprint);
+    }
+
+    #[test]
+    fn incomplete_identity_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        Identity::load_or_create(dir.path(), "desk").unwrap();
+        let cert_path = dir.path().join("identity.crt");
+        let key_path = dir.path().join("identity.key");
+        let cert_before = fs::read(&cert_path).unwrap();
+        fs::remove_file(&key_path).unwrap();
+
+        let result = Identity::load_or_create(dir.path(), "desk");
+        assert!(matches!(result, Err(NetError::Tls(_))));
+
+        let cert_after = fs::read(&cert_path).unwrap();
+        assert_eq!(cert_before, cert_after);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        Identity::load_or_create(dir.path(), "desk").unwrap();
+        let key_path = dir.path().join("identity.key");
+        let mode = fs::metadata(&key_path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 }
