@@ -51,7 +51,7 @@ pub enum Msg {
     MouseMove{ seq: u32, dx: i16, dy: i16 },
     MouseAbs { seq: u32, x: u16, y: u16 },
     Wheel    { seq: u32, dx: i16, dy: i16 },       // 1/120 of a notch
-    Audio    { stream: AudioStream, seq: u32, ts_us: u64, samples: Vec<i16> },
+    Audio    { stream: AudioStream, seq: u32, ts_us: u64, samples: Vec<u8> }, // interleaved i16 LE PCM bytes
     // Clipboard stream
     Clipboard{ mime: String, data: Vec<u8> },
 }

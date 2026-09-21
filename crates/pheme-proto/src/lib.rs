@@ -165,7 +165,8 @@ pub enum Msg {
         stream: AudioStream,
         seq: u32,
         ts_us: u64,
-        samples: Vec<i16>,
+        /// Interleaved i16 little-endian PCM bytes (channels × frame_samples × 2).
+        samples: Vec<u8>,
     },
     // Clipboard stream
     Clipboard {
@@ -266,7 +267,7 @@ mod tests {
             stream: AudioStream::Mic,
             seq: 8,
             ts_us: 123,
-            samples: vec![1, -1, 0],
+            samples: vec![1, 255, 0],
         });
         roundtrip(Msg::Clipboard {
             mime: "text/plain".into(),
@@ -298,7 +299,7 @@ mod tests {
             stream: AudioStream::Playback,
             seq: 1,
             ts_us: u64::MAX,
-            samples: vec![i16::MIN; 480],
+            samples: vec![0xFF; 960],
         });
         assert!(n <= 1200, "audio frame is {n} bytes");
     }
