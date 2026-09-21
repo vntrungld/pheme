@@ -66,7 +66,14 @@ pub trait InputInject: Send {
 
 /// Picks the capture backend for this OS and session.
 pub fn detect_capture() -> Result<Box<dyn InputCapture>> {
-    Err(Error::Unsupported("not yet implemented".into()))
+    #[cfg(target_os = "linux")]
+    {
+        linux_x11::X11Capture::new().map(|c| Box::new(c) as Box<dyn InputCapture>)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(Error::Unsupported("not yet implemented".into()))
+    }
 }
 
 /// Picks the injection backend for this OS.
