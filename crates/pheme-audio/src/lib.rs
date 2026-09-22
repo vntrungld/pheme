@@ -7,6 +7,8 @@
 pub mod drift;
 pub mod frame;
 pub mod jitter;
+#[cfg(target_os = "linux")]
+pub mod linux_pipewire;
 pub mod mock;
 pub mod pack;
 
@@ -84,10 +86,25 @@ pub trait AudioPlayback: Send {
 /// Picks the capture backend for this OS. `device` names a specific device; `None` means
 /// the platform default.
 pub fn detect_capture(device: Option<&str>) -> Result<Box<dyn AudioCapture>> {
-    let _ = device;
-    Err(Error::Unsupported(
-        "no audio capture backend for this platform".into(),
-    ))
+    #[cfg(target_os = "linux")]
+    {
+        // On Linux we *are* the device: the sink we create is what the user selects.
+        // A named capture device is a Windows-only concept (see the spec, §5).
+        if let Some(d) = device {
+            tracing::warn!(
+                device = d,
+                "audio.capture_device is ignored on Linux; applications select \"Pheme Speaker\" instead"
+            );
+        }
+        Ok(Box::new(linux_pipewire::PipewireCapture::new()))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = device;
+        Err(Error::Unsupported(
+            "no audio capture backend for this platform".into(),
+        ))
+    }
 }
 
 /// Picks the playback backend for this OS. `device` names a specific device; `None`

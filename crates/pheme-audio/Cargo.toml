@@ -10,3 +10,11 @@ rtrb = { workspace = true }
 rubato = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# "v1_2_0" unlocks version-gated keys such as `keys::AUDIO_RATE` (added in
+# libpipewire 0.3.32); the machine this targets runs 1.6.8, well past that.
+pipewire = { version = "0.10", features = ["v1_2_0"] }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
