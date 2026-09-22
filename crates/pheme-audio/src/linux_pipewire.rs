@@ -25,7 +25,7 @@ use pw::spa::param::ParamType;
 use pw::spa::pod::serialize::PodSerializer;
 use pw::spa::pod::{Object, Pod, Value};
 use pw::spa::utils::{Direction, SpaTypes};
-use pw::stream::StreamFlags;
+use pw::stream::{StreamFlags, StreamState};
 use tracing::{debug, warn};
 
 use crate::{AudioCapture, AudioPlayback, Error, Result, CHANNELS, RATE};
@@ -80,9 +80,44 @@ fn format_pod() -> Result<Vec<u8>> {
 struct Running {
     cmd: pw::channel::Sender<Cmd>,
     thread: JoinHandle<()>,
-    /// Cleared by the PipeWire thread when its main loop returns, which is how a daemon
-    /// restart becomes visible to the supervisor in `pheme-app`.
+    /// Cleared by `AliveGuard` when the PipeWire thread's stack is torn down, which is
+    /// how a daemon restart becomes visible to the supervisor in `pheme-app`.
     alive: Arc<AtomicBool>,
+}
+
+/// Clears a backend's `alive` flag when the PipeWire thread's stack unwinds or returns.
+///
+/// This is a guard rather than a statement after the call so that a panic inside a
+/// PipeWire callback — which unwinds the thread without ever reaching that statement —
+/// also flips `healthy()` to false. A thread that has died is a thread that has died,
+/// however it died, and the supervisor's rebuild is the only thing that brings audio
+/// back either way.
+struct AliveGuard(Arc<AtomicBool>);
+
+impl Drop for AliveGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Decides, from a stream state change, whether the stream is gone for good.
+///
+/// `Error` is unambiguous. `Unconnected` is not: every stream starts there, so it only
+/// means the stream has died once it has been `Streaming` at least once — which is what
+/// `streamed` tracks. Everything else (`Connecting`, `Paused`) is ordinary: a sink with
+/// no application playing into it sits in `Paused` indefinitely.
+fn stream_died(streamed: &mut bool, new: &StreamState) -> Option<String> {
+    match new {
+        StreamState::Streaming => {
+            *streamed = true;
+            None
+        }
+        StreamState::Error(e) => Some(format!("the stream reported an error: {e}")),
+        StreamState::Unconnected if *streamed => {
+            Some("the stream was disconnected after running".into())
+        }
+        _ => None,
+    }
 }
 
 /// The client's virtual sink: applications play into "Pheme Speaker" and we read it.
@@ -115,8 +150,8 @@ impl AudioCapture for PipewireCapture {
         let thread = std::thread::Builder::new()
             .name("pheme-pw-sink".into())
             .spawn(move || {
+                let _alive = AliveGuard(thread_alive);
                 capture_thread(sink, ready_tx, cmd_rx);
-                thread_alive.store(false, Ordering::SeqCst);
             })
             .map_err(|e| Error::Backend(format!("spawning the PipeWire thread: {e}")))?;
 
@@ -218,6 +253,24 @@ fn run(
         .connect_rc(None)
         .map_err(|e| Error::Device(format!("connecting to PipeWire: {e}")))?;
 
+    // A stream listener only sees what happens to *our* node. When the daemon itself
+    // goes away the connection to it is what breaks, and the core reports that here.
+    // `error` is documented as fatal and non-recoverable, so there is nothing to do but
+    // end the loop and let the supervisor build a fresh backend against the new daemon.
+    let _core_listener = core
+        .add_listener_local()
+        .error({
+            let quit_loop = mainloop.clone();
+            move |id, seq, res, message| {
+                warn!(
+                    id,
+                    seq, res, message, "the PipeWire connection failed; ending the PipeWire thread"
+                );
+                quit_loop.quit();
+            }
+        })
+        .register();
+
     // `Direction::Input` plus `media.class = Audio/Sink` is what makes this a sink that
     // other applications can select, rather than a recording stream.
     let stream = pw::stream::StreamBox::new(
@@ -259,8 +312,16 @@ fn run(
                 let _ = data.sink.push(s);
             }
         })
-        .state_changed(|_, _, old, new| {
-            debug!(?old, ?new, "Pheme Speaker state");
+        .state_changed({
+            let quit_loop = mainloop.clone();
+            let mut streamed = false;
+            move |_, _, old, new| {
+                debug!(?old, ?new, "Pheme Speaker state");
+                if let Some(why) = stream_died(&mut streamed, &new) {
+                    warn!("Pheme Speaker is gone: {why}; ending the PipeWire thread");
+                    quit_loop.quit();
+                }
+            }
         })
         .register()
         .map_err(|e| Error::Device(format!("registering the stream listener: {e}")))?;
@@ -325,8 +386,8 @@ impl AudioPlayback for PipewirePlayback {
         let thread = std::thread::Builder::new()
             .name("pheme-pw-play".into())
             .spawn(move || {
+                let _alive = AliveGuard(thread_alive);
                 playback_thread(source, device, ready_tx, cmd_rx);
-                thread_alive.store(false, Ordering::SeqCst);
             })
             .map_err(|e| Error::Backend(format!("spawning the PipeWire thread: {e}")))?;
 
@@ -434,6 +495,24 @@ fn play_run(
         .connect_rc(None)
         .map_err(|e| Error::Device(format!("connecting to PipeWire: {e}")))?;
 
+    // A stream listener only sees what happens to *our* node. When the daemon itself
+    // goes away the connection to it is what breaks, and the core reports that here.
+    // `error` is documented as fatal and non-recoverable, so there is nothing to do but
+    // end the loop and let the supervisor build a fresh backend against the new daemon.
+    let _core_listener = core
+        .add_listener_local()
+        .error({
+            let quit_loop = mainloop.clone();
+            move |id, seq, res, message| {
+                warn!(
+                    id,
+                    seq, res, message, "the PipeWire connection failed; ending the PipeWire thread"
+                );
+                quit_loop.quit();
+            }
+        })
+        .register();
+
     let mut props = pw::properties::properties! {
         *pw::keys::MEDIA_TYPE => "Audio",
         *pw::keys::MEDIA_CATEGORY => "Playback",
@@ -495,8 +574,16 @@ fn play_run(
             *chunk.stride_mut() = stride as i32;
             *chunk.size_mut() = (frames * stride) as u32;
         })
-        .state_changed(|_, _, old, new| {
-            debug!(?old, ?new, "Pheme playback state");
+        .state_changed({
+            let quit_loop = mainloop.clone();
+            let mut streamed = false;
+            move |_, _, old, new| {
+                debug!(?old, ?new, "Pheme playback state");
+                if let Some(why) = stream_died(&mut streamed, &new) {
+                    warn!("Pheme playback is gone: {why}; ending the PipeWire thread");
+                    quit_loop.quit();
+                }
+            }
         })
         .register()
         .map_err(|e| Error::Device(format!("registering the stream listener: {e}")))?;

@@ -70,14 +70,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if last_report.elapsed() >= Duration::from_secs(5) {
             let st = jitter.stats();
             println!(
-                "depth {} target {} lost {} underruns {} ratio {:.6}",
+                "depth {} target {} lost {} underruns {} ratio {:.6} healthy {}/{}",
                 st.depth,
                 st.target,
                 st.lost,
                 st.underruns,
-                drift.ratio()
+                drift.ratio(),
+                cap.healthy(),
+                play.healthy()
             );
             last_report = Instant::now();
+        }
+        // The supervisor in `pheme-app` polls exactly this and rebuilds both backends.
+        // Stopping here instead is what makes a daemon restart visible in this example.
+        if !cap.healthy() || !play.healthy() {
+            println!(
+                "a backend reported ill health (capture {}, playback {}); stopping",
+                cap.healthy(),
+                play.healthy()
+            );
+            break;
         }
         std::thread::sleep(Duration::from_millis(2));
     }

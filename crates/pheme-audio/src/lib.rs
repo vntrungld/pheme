@@ -57,6 +57,15 @@ pub trait AudioCapture: Send {
     /// device that cannot be reopened. The supervisor polls this and rebuilds the
     /// backend, which is the only way a failure after a successful `start` is noticed.
     /// Backends with no thread to lose keep the default.
+    ///
+    /// **A backend recovers one way or the other, never half of each.** A backend may
+    /// reopen a new device internally and stay healthy throughout, as WASAPI does for
+    /// `AUDCLNT_E_DEVICE_INVALIDATED`; or it may end its thread and report false, as
+    /// PipeWire does when the daemon goes away, and let the supervisor build a fresh
+    /// one. What it must not do is survive a change the rest of the pipeline was
+    /// configured against — `rate()` above all — while still reporting true, because
+    /// nothing downstream will ever be told. Reporting false is always safe: the
+    /// supervisor rebuilds everything from `detect_*` down.
     fn healthy(&self) -> bool {
         true
     }
@@ -77,7 +86,12 @@ pub trait AudioPlayback: Send {
     /// The device actually in use, for logs. Valid only after `start` succeeded.
     fn device_name(&self) -> String;
     /// False once the backend's device thread has died. Same contract as
-    /// `AudioCapture::healthy`.
+    /// `AudioCapture::healthy`, and the same choice of recovery mechanism: reopen
+    /// internally and stay healthy, or end the thread and report false. The playback
+    /// worker reads `rate()` once and bakes it into its resampler, so a backend that
+    /// reopens internally at a different rate must report false rather than quietly
+    /// republish the rate — the pipeline would otherwise play at the wrong pitch for
+    /// the life of the process.
     fn healthy(&self) -> bool {
         true
     }

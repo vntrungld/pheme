@@ -40,12 +40,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         if last_report.elapsed() >= Duration::from_secs(1) {
+            // `healthy` is what the supervisor in `pheme-app` polls: once it goes false
+            // the backend is torn down and rebuilt. Printing it here is what makes a
+            // PipeWire daemon restart visible while this example is running.
             println!(
-                "peak {peak:>6}  ({:.0}% of full scale)",
-                peak as f32 / 327.68
+                "peak {peak:>6}  ({:.0}% of full scale)  healthy {}",
+                peak as f32 / 327.68,
+                cap.healthy()
             );
             peak = 0;
             last_report = Instant::now();
+        }
+        if !cap.healthy() {
+            println!("the backend reported ill health; stopping");
+            break;
         }
         std::thread::sleep(Duration::from_millis(5));
     }
