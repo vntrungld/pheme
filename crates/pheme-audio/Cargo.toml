@@ -20,5 +20,18 @@ tracing = { workspace = true }
 # minimum buildable libpipewire far past what this crate actually needs.
 pipewire = { version = "0.10", features = ["v0_3_32"] }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_Foundation",
+    "Win32_Media",
+    "Win32_Media_Audio",
+    "Win32_Media_Multimedia",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_UI_Shell_PropertiesSystem",
+] }
+
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

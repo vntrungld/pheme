@@ -11,6 +11,8 @@ pub mod jitter;
 pub mod linux_pipewire;
 pub mod mock;
 pub mod pack;
+#[cfg(target_os = "windows")]
+pub mod windows;
 
 /// Sample rate on the wire, in hertz.
 pub const RATE: u32 = 48_000;
@@ -98,7 +100,13 @@ pub fn detect_capture(device: Option<&str>) -> Result<Box<dyn AudioCapture>> {
         }
         Ok(Box::new(linux_pipewire::PipewireCapture::new()))
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    {
+        Ok(Box::new(windows::wasapi::WasapiCapture::new(
+            device.map(str::to_string),
+        )))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         let _ = device;
         Err(Error::Unsupported(
