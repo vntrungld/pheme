@@ -19,7 +19,7 @@ use pheme_audio::{FRAME_US, RATE};
 use pheme_net::PeerSender;
 use pheme_proto::{AudioStream, Msg};
 use rubato::Resampler;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// How long a failed backend waits before it is rebuilt.
 const RETRY: Duration = Duration::from_secs(5);
@@ -99,6 +99,43 @@ impl Drop for AudioOut {
     }
 }
 
+/// Logs a repeating failure loudly once and quietly while it repeats unchanged.
+///
+/// `detect_*` never returns `Unsupported` on Linux or Windows — a daemon that is not
+/// running at startup but appears later must still be picked up — so a machine with no
+/// usable audio fails the same way every five seconds for the life of the process. At
+/// one `warn!` each that is roughly 17 000 lines a day, which buries the input logs
+/// this project actually needs. The first failure of a kind stays at `warn!`; identical
+/// repeats drop to `debug!`; a success restores the volume.
+#[derive(Default)]
+struct FailureLog {
+    last: Option<String>,
+}
+
+impl FailureLog {
+    /// Records `msg` and returns whether it deserves a `warn!` rather than a `debug!`.
+    fn is_new(&mut self, msg: &str) -> bool {
+        if self.last.as_deref() == Some(msg) {
+            return false;
+        }
+        self.last = Some(msg.to_string());
+        true
+    }
+
+    fn report(&mut self, msg: String) {
+        if self.is_new(&msg) {
+            warn!("{msg}");
+        } else {
+            debug!("{msg}");
+        }
+    }
+
+    /// The backend came up: the next failure is loud again.
+    fn cleared(&mut self) {
+        self.last = None;
+    }
+}
+
 /// Sleeps in short steps so `stop` is noticed promptly. Returns false if asked to stop.
 fn nap(total: Duration, stop: &AtomicBool) -> bool {
     let mut left = total;
@@ -124,6 +161,7 @@ fn out_thread(
         CaptureSource::Backend(b) => (None, Some(b), false),
         CaptureSource::Disabled => return,
     };
+    let mut failures = FailureLog::default();
     loop {
         if stop.load(Ordering::SeqCst) {
             return;
@@ -139,7 +177,7 @@ fn out_thread(
                 return;
             }
             Err(e) => {
-                warn!("audio capture unavailable: {e}");
+                failures.report(format!("audio capture unavailable: {e}"));
                 if !rebuild || !nap(RETRY, &stop) {
                     return;
                 }
@@ -149,23 +187,34 @@ fn out_thread(
         let (producer, consumer) =
             rtrb::RingBuffer::<i16>::new(FRAME_INTERLEAVED * CAPTURE_RING_FRAMES);
         if let Err(e) = backend.start(producer) {
-            warn!("audio capture failed to start: {e}");
+            failures.report(format!("audio capture failed to start: {e}"));
             if !rebuild || !nap(RETRY, &stop) {
                 return;
             }
             continue;
         }
+        failures.cleared();
         info!(device = %backend.device_name(), "audio capture started");
-        pump_out(backend.as_ref(), consumer, &peer, &stop, &counters);
+        let end = pump_out(backend.as_ref(), consumer, &peer, &stop, &counters);
         backend.stop();
+        if let PumpEnd::Failed(why) = end {
+            failures.report(format!("audio capture stopped: {why}"));
+        }
         if stop.load(Ordering::SeqCst) || !rebuild {
             return;
         }
-        warn!("audio capture stopped; rebuilding in 5 s");
         if !nap(RETRY, &stop) {
             return;
         }
     }
+}
+
+/// Why a pump returned.
+enum PumpEnd {
+    /// A stop was requested, or the sender was dropped: do not rebuild.
+    Stopped,
+    /// The device, or something the pump owns, failed: rebuild after the retry delay.
+    Failed(String),
 }
 
 /// Packs whole frames out of the ring and sends them while a peer is attached. Returns
@@ -176,14 +225,13 @@ fn pump_out(
     peer: &Mutex<Option<PeerSender>>,
     stop: &AtomicBool,
     counters: &OutCounters,
-) {
+) -> PumpEnd {
     let mut packer = Packer::new();
     let mut frame = Vec::with_capacity(FRAME_INTERLEAVED);
     let mut taken = 0u64;
     while !stop.load(Ordering::SeqCst) {
         if !backend.healthy() {
-            warn!("the audio capture device stopped");
-            return;
+            return PumpEnd::Failed("the capture device stopped".into());
         }
         while consumer.slots() >= FRAME_INTERLEAVED {
             frame.clear();
@@ -218,6 +266,7 @@ fn pump_out(
         }
         std::thread::sleep(TICK);
     }
+    PumpEnd::Stopped
 }
 
 /// Playback ring, in wire frames' worth of samples. It is sized for the worst plausible
@@ -326,6 +375,7 @@ fn in_thread(
         PlaybackSource::Backend(b) => (None, Some(b), false),
         PlaybackSource::Disabled => return,
     };
+    let mut failures = FailureLog::default();
     loop {
         if stop.load(Ordering::SeqCst) {
             return;
@@ -341,7 +391,7 @@ fn in_thread(
                 return;
             }
             Err(e) => {
-                warn!("audio playback unavailable: {e}");
+                failures.report(format!("audio playback unavailable: {e}"));
                 if !rebuild || !nap(RETRY, &stop) {
                     return;
                 }
@@ -350,12 +400,13 @@ fn in_thread(
         };
         let (producer, consumer) = rtrb::RingBuffer::<i16>::new(PLAYBACK_RING_SAMPLES);
         if let Err(e) = backend.start(consumer) {
-            warn!("audio playback failed to start: {e}");
+            failures.report(format!("audio playback failed to start: {e}"));
             if !rebuild || !nap(RETRY, &stop) {
                 return;
             }
             continue;
         }
+        failures.cleared();
         let rate = backend.rate();
         info!(device = %backend.device_name(), rate, "audio playback started");
         match pump_in(backend.as_ref(), producer, &rx, &stop, &stats, rate) {
@@ -364,8 +415,8 @@ fn in_thread(
                 return;
             }
             PumpEnd::Failed(why) => {
-                warn!("audio playback stopped: {why}");
                 backend.stop();
+                failures.report(format!("audio playback stopped: {why}"));
             }
         }
         if stop.load(Ordering::SeqCst) || !rebuild {
@@ -375,13 +426,6 @@ fn in_thread(
             return;
         }
     }
-}
-
-enum PumpEnd {
-    /// A stop was requested, or the sender was dropped: do not rebuild.
-    Stopped,
-    /// The device or the resampler failed: rebuild after the retry delay.
-    Failed(String),
 }
 
 fn pump_in(
@@ -443,6 +487,13 @@ fn pump_in(
                 Err(e) => return PumpEnd::Failed(format!("resampling: {e}")),
             };
             for i in 0..produced {
+                // Whole frames only. Pushing sample by sample and discarding the
+                // `Result` means a ring that fills mid-pair takes one channel and drops
+                // the other, which shifts every later sample by one and swaps left and
+                // right permanently — the ring never resynchronises on its own.
+                if producer.slots() < CHANNELS {
+                    break;
+                }
                 for plane in output.iter() {
                     let v = (plane[i] * 32_768.0).round().clamp(-32_768.0, 32_767.0) as i16;
                     let _ = producer.push(v);
@@ -486,6 +537,23 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         f()
+    }
+
+    #[test]
+    fn a_repeating_failure_is_only_loud_once() {
+        let mut log = FailureLog::default();
+        assert!(log.is_new("audio capture unavailable: no PipeWire"));
+        assert!(!log.is_new("audio capture unavailable: no PipeWire"));
+        assert!(!log.is_new("audio capture unavailable: no PipeWire"));
+        assert!(
+            log.is_new("audio capture unavailable: something else"),
+            "a different failure is news again"
+        );
+        log.cleared();
+        assert!(
+            log.is_new("audio capture unavailable: something else"),
+            "a success in between makes the next failure news again"
+        );
     }
 
     #[test]

@@ -60,8 +60,13 @@ recording one VB-CABLE also creates):
 
 ```toml
 [audio]
-capture_device = "CABLE Input"
+capture_device = "CABLE Input (VB-Audio Virtual Cable)"
 ```
+
+Any part of the name is enough, as long as only one device contains it —
+`capture_device = "CABLE Input"` picks the same endpoint. If several devices
+match, pheme logs the ones it found and uses the default instead, so write more
+of the name you meant.
 
 ### Choosing the server's speakers
 
@@ -73,7 +78,8 @@ playback_device = "Speakers (Realtek High Definition Audio)"
 ```
 
 On Linux the value is a PipeWire node name — `pactl list sinks short` prints
-them. On Windows it is the device's name as shown in the sound settings.
+them. On Windows it is the device's name as shown in the sound settings, or any
+part of it that only one device matches.
 
 ### Building on Linux
 

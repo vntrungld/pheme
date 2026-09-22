@@ -134,31 +134,73 @@ pub fn friendly_name(device: &IMMDevice) -> String {
     }
 }
 
+/// True when `needle` appears anywhere in `haystack`, ignoring ASCII case.
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    haystack
+        .to_ascii_lowercase()
+        .contains(&needle.to_ascii_lowercase())
+}
+
 /// Opens a render endpoint: the one whose friendly name matches `name`, or the default.
 ///
-/// A name that matches nothing logs a warning and falls back to the default, so a typo
-/// in the config costs the user a log line rather than silence.
+/// The match is exact and case-insensitive first, then a unique case-insensitive
+/// substring. The substring step is not a convenience: Windows reports VB-CABLE's render
+/// endpoint as `CABLE Input (VB-Audio Virtual Cable)`, while the README and the spec both
+/// tell the user to configure `CABLE Input`, so an exact-only match sends the one user
+/// who installed VB-CABLE precisely to keep the client silent straight back to the
+/// default output.
+///
+/// A name that matches nothing, or that matches several endpoints, logs a warning and
+/// falls back to the default, so a typo or an ambiguous value costs the user a log line
+/// rather than silence. The ambiguous case names the candidates, because the fix is to
+/// type more of one of them.
 pub fn open_render_device(name: Option<&str>) -> Result<IMMDevice> {
     // SAFETY: standard MMDevice enumeration; every raw pointer stays inside this block.
     unsafe {
         let enumerator: IMMDeviceEnumerator =
             CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
                 .map_err(|e| Error::Device(format!("creating the device enumerator: {e}")))?;
-        if let Some(wanted) = name {
-            let collection = enumerator
-                .EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)
-                .map_err(|e| Error::Device(format!("enumerating render endpoints: {e}")))?;
-            let count = collection
-                .GetCount()
-                .map_err(|e| Error::Device(format!("counting render endpoints: {e}")))?;
-            for i in 0..count {
-                if let Ok(dev) = collection.Item(i) {
-                    if friendly_name(&dev).eq_ignore_ascii_case(wanted) {
+        match name.map(str::trim).filter(|w| !w.is_empty()) {
+            None => {}
+            Some(wanted) => {
+                let collection = enumerator
+                    .EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)
+                    .map_err(|e| Error::Device(format!("enumerating render endpoints: {e}")))?;
+                let count = collection
+                    .GetCount()
+                    .map_err(|e| Error::Device(format!("counting render endpoints: {e}")))?;
+                let mut partial: Vec<(IMMDevice, String)> = Vec::new();
+                for i in 0..count {
+                    let Ok(dev) = collection.Item(i) else {
+                        continue;
+                    };
+                    let found = friendly_name(&dev);
+                    if found.eq_ignore_ascii_case(wanted) {
                         return Ok(dev);
+                    }
+                    if contains_ignore_ascii_case(&found, wanted) {
+                        partial.push((dev, found));
+                    }
+                }
+                match partial.len() {
+                    1 => {
+                        let (dev, found) = partial.remove(0);
+                        debug!(device = wanted, matched = %found, "matched an audio device by substring");
+                        return Ok(dev);
+                    }
+                    0 => warn!(device = wanted, "no such audio device; using the default"),
+                    _ => {
+                        let candidates: Vec<&str> =
+                            partial.iter().map(|(_, n)| n.as_str()).collect();
+                        warn!(
+                            device = wanted,
+                            candidates = %candidates.join("; "),
+                            "several audio devices match; using the default. Write more of \
+                             one of the candidate names to pick it"
+                        );
                     }
                 }
             }
-            warn!(device = wanted, "no such audio device; using the default");
         }
         enumerator
             .GetDefaultAudioEndpoint(eRender, eConsole)
@@ -298,8 +340,21 @@ fn push_sample(sink: &mut rtrb::Producer<i16>, v: f32) -> u64 {
 struct Running {
     stop: Arc<AtomicBool>,
     thread: JoinHandle<()>,
-    /// Cleared when the device thread returns, so the supervisor can rebuild.
+    /// Cleared by `AliveGuard` when the device thread's stack is torn down, so the
+    /// supervisor can rebuild.
     alive: Arc<AtomicBool>,
+}
+
+/// Clears a backend's `alive` flag when the device thread's stack unwinds or returns.
+///
+/// A guard rather than a statement after the call, so a panic inside a device thread
+/// also flips `healthy()` to false. Matches `linux_pipewire::AliveGuard`.
+struct AliveGuard(Arc<AtomicBool>);
+
+impl Drop for AliveGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
 }
 
 /// Records what the default (or configured) output endpoint is playing.
@@ -334,8 +389,8 @@ impl AudioCapture for WasapiCapture {
         let thread = std::thread::Builder::new()
             .name("pheme-wasapi-cap".into())
             .spawn(move || {
+                let _alive = AliveGuard(thread_alive);
                 capture_thread(device, sink, thread_stop, name, ready_tx);
-                thread_alive.store(false, Ordering::SeqCst);
             })
             .map_err(|e| Error::Backend(format!("spawning the WASAPI thread: {e}")))?;
         match ready_rx.recv_timeout(START_TIMEOUT) {
@@ -592,8 +647,8 @@ impl AudioPlayback for WasapiPlayback {
         let thread = std::thread::Builder::new()
             .name("pheme-wasapi-play".into())
             .spawn(move || {
+                let _alive = AliveGuard(thread_alive);
                 render_thread(device, source, thread_stop, name, rate, ready_tx);
-                thread_alive.store(false, Ordering::SeqCst);
             })
             .map_err(|e| Error::Backend(format!("spawning the WASAPI thread: {e}")))?;
         match ready_rx.recv_timeout(START_TIMEOUT) {
@@ -656,6 +711,27 @@ impl Drop for WasapiPlayback {
     }
 }
 
+/// Why a render session ended.
+///
+/// A session that merely lost its device reopens against whatever the default is now,
+/// which is the whole point of handling `AUDCLNT_E_DEVICE_INVALIDATED` internally. A
+/// session that cannot be reopened *compatibly* must not: the playback worker read
+/// `rate()` once and baked it into both its base resample ratio and its resampler, so
+/// carrying on at a different rate would play everything at the wrong pitch, silently,
+/// for the life of the process.
+enum RenderEnd {
+    /// Open a fresh device after a short pause.
+    Reopen(Error),
+    /// End the thread so `alive` clears and the supervisor rebuilds the pipeline.
+    Fatal(Error),
+}
+
+impl From<Error> for RenderEnd {
+    fn from(e: Error) -> RenderEnd {
+        RenderEnd::Reopen(e)
+    }
+}
+
 fn render_thread(
     device: Option<String>,
     mut source: rtrb::Consumer<i16>,
@@ -678,7 +754,7 @@ fn render_thread(
     let mut signaled = false;
     let mut underruns = 0u64;
     while !stop.load(Ordering::SeqCst) {
-        match render_session(
+        let end = render_session(
             device.as_deref(),
             &mut source,
             &stop,
@@ -687,17 +763,22 @@ fn render_thread(
             &mut underruns,
             &ready,
             &mut signaled,
-        ) {
-            Ok(()) => {}
-            Err(e) => {
-                if !signaled {
-                    let _ = ready.send(Err(e));
-                    return;
-                }
-                warn!("WASAPI render session ended: {e}; reopening");
-                std::thread::sleep(Duration::from_millis(200));
-            }
+        );
+        let (e, reopen) = match end {
+            Ok(()) => continue,
+            Err(RenderEnd::Reopen(e)) => (e, true),
+            Err(RenderEnd::Fatal(e)) => (e, false),
+        };
+        if !signaled {
+            let _ = ready.send(Err(e));
+            return;
         }
+        if !reopen {
+            warn!("WASAPI render thread ending: {e}");
+            break;
+        }
+        warn!("WASAPI render session ended: {e}; reopening");
+        std::thread::sleep(Duration::from_millis(200));
     }
     debug!(underruns, "WASAPI render thread finished");
 }
@@ -717,7 +798,7 @@ fn render_session(
     underruns: &mut u64,
     ready: &mpsc::Sender<Result<()>>,
     signaled: &mut bool,
-) -> Result<()> {
+) -> std::result::Result<(), RenderEnd> {
     // SAFETY: a standard shared-mode, event-driven render session. Every GetBuffer is
     // matched by a ReleaseBuffer, and the event handle is closed on every exit path.
     unsafe {
@@ -747,6 +828,21 @@ fn render_session(
         CoTaskMemFree(Some(mix as *const _));
         let fmt = fmt?;
         init.map_err(|e| Error::Device(format!("initialising render: {e}")))?;
+        let published = rate.load(Ordering::SeqCst);
+        if *signaled && fmt.rate != published {
+            // Unplugging headphones and landing on a 44.1 kHz endpoint used to be
+            // inaudible in the logs and about 9 % fast forever in the speakers.
+            warn!(
+                was = published,
+                now = fmt.rate,
+                "the render device reopened at a different sample rate; ending the \
+                 playback thread so the whole pipeline is rebuilt around the new rate"
+            );
+            return Err(RenderEnd::Fatal(Error::Device(format!(
+                "the render device reopened at {} Hz after running at {published} Hz",
+                fmt.rate
+            ))));
+        }
         rate.store(fmt.rate, Ordering::SeqCst);
         debug!(?fmt, "WASAPI render format");
 
@@ -759,7 +855,7 @@ fn render_session(
         // SAFETY: `event` was created by `CreateEventW` just above and is not used
         // again after this call, on every exit path from this function.
         let _ = CloseHandle(event);
-        result
+        result.map_err(RenderEnd::from)
     }
 }
 
@@ -850,11 +946,18 @@ unsafe fn render_loop(
             // One stereo pair per device frame; a device with more channels gets
             // silence in the rest, a mono device gets the left channel only.
             let mut pair = [0i16; CHANNELS];
+            let mut starved = false;
             for p in pair.iter_mut() {
                 match source.pop() {
                     Ok(s) => *p = s,
-                    Err(_) => *underruns += 1,
+                    // One underrun per device frame, not per sample: counting samples
+                    // made the thread-exit diagnostic read exactly CHANNELS times too
+                    // high, on a path nobody has ever executed.
+                    Err(_) => starved = true,
                 }
+            }
+            if starved {
+                *underruns += 1;
             }
             for c in 0..ch {
                 let v = pair.get(c).copied().unwrap_or(0);
@@ -870,4 +973,30 @@ unsafe fn render_loop(
         let _ = render.ReleaseBuffer(frames, 0);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::contains_ignore_ascii_case;
+
+    #[test]
+    fn a_configured_name_matches_the_endpoint_it_is_a_prefix_of() {
+        // What Windows reports for VB-CABLE against what the README tells users to write.
+        assert!(contains_ignore_ascii_case(
+            "CABLE Input (VB-Audio Virtual Cable)",
+            "CABLE Input"
+        ));
+        assert!(contains_ignore_ascii_case(
+            "CABLE Input (VB-Audio Virtual Cable)",
+            "cable input"
+        ));
+        assert!(contains_ignore_ascii_case(
+            "Speakers (Realtek High Definition Audio)",
+            "Realtek"
+        ));
+        assert!(!contains_ignore_ascii_case(
+            "CABLE Input (VB-Audio Virtual Cable)",
+            "CABLE Output"
+        ));
+    }
 }
