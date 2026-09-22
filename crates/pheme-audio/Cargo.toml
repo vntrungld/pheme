@@ -12,9 +12,13 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-# "v1_2_0" unlocks version-gated keys such as `keys::AUDIO_RATE` (added in
-# libpipewire 0.3.32); the machine this targets runs 1.6.8, well past that.
-pipewire = { version = "0.10", features = ["v1_2_0"] }
+# "v0_3_32" is the minimum feature that unlocks `keys::AUDIO_RATE`, which is
+# the only key we use that's version-gated at all (`AUDIO_CHANNELS` and
+# `NODE_LATENCY` are not). Do not raise this casually: higher gates such as
+# "v1_2_0" transitively enable "spa/v1_2_0", which compiles against libspa
+# symbols only present in much newer headers, silently raising the real
+# minimum buildable libpipewire far past what this crate actually needs.
+pipewire = { version = "0.10", features = ["v0_3_32"] }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

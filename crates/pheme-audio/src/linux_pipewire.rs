@@ -118,8 +118,21 @@ impl AudioCapture for PipewireCapture {
                 Err(e)
             }
             Err(_) => {
+                // `Cmd::Stop` only becomes observable once the thread reaches
+                // `cmd_rx.attach(..)`, which is after the main loop, context, core,
+                // stream and listener have all been constructed. If construction itself
+                // is what's hanging (rather than merely being slow), that message may
+                // never be picked up, so `thread.join()` here could block forever —
+                // exactly the unbounded wait `start`'s contract promises not to be. We
+                // ask the thread to stop and then deliberately do not join it: dropping
+                // the `JoinHandle` detaches it, so it runs to completion (or hangs) on
+                // its own instead of `start` hanging with it.
                 let _ = cmd_tx.send(Cmd::Stop);
-                let _ = thread.join();
+                warn!(
+                    "Pheme Speaker thread did not report readiness within 1 s; abandoning it \
+                     detached rather than blocking `start` further"
+                );
+                drop(thread);
                 Err(Error::Backend(
                     "the PipeWire thread did not report readiness within 1 s".into(),
                 ))

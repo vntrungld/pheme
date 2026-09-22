@@ -31,7 +31,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Err(_) => break,
                 }
             }
-            peak = peak.max(frame.iter().map(|s| i32::from(s.abs())).max().unwrap_or(0));
+            peak = peak.max(
+                frame
+                    .iter()
+                    .map(|s| i32::from(s.unsigned_abs()))
+                    .max()
+                    .unwrap_or(0),
+            );
         }
         if last_report.elapsed() >= Duration::from_secs(1) {
             println!(
