@@ -336,8 +336,11 @@ device just because the peer went away.
 
 ### Server playback
 
-A `pw::Stream` in `Direction::Output`, `media.class = "Audio/Playback"`,
-same format, `node.latency = "240/48000"`. With no target it follows the
+A `pw::Stream` in `Direction::Output`, `media.class = "Stream/Output/Audio"`,
+same format, `node.latency = "240/48000"`. (An earlier draft of this spec said
+`Audio/Playback`, which is not a PipeWire media class at all; it made
+`libspa-audioconvert` segfault as soon as the stream reached real hardware.
+The format must also carry explicit channel positions.) With no target it follows the
 default sink. With `audio.playback_device` set, the backend passes the
 value to PipeWire as `target.object`, which matches a node name or
 serial; an unknown value falls back to the default sink. Matching a
