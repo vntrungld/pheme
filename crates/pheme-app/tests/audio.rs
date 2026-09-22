@@ -62,10 +62,20 @@ struct Pair {
 }
 
 impl Pair {
+    /// Matches the join pattern in `tests/integration.rs`: a panic or an error returned
+    /// by `run_client`/`run_server` during teardown must fail the test, not vanish.
     async fn shutdown(self) {
-        let _ = self.shutdown_tx.send(true);
-        let _ = tokio::time::timeout(Duration::from_secs(5), self.client).await;
-        let _ = tokio::time::timeout(Duration::from_secs(5), self.server).await;
+        self.shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), self.client)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), self.server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 }
 
@@ -213,8 +223,17 @@ async fn audio_flows_client_to_server() {
     pair.shutdown().await;
 }
 
+/// This test covers resumption only, not suppression itself: an all-zero frame
+/// resamples to sub-threshold output whether it was transmitted or suppressed, so a
+/// build with silence suppression disabled entirely would pass this test unchanged.
+/// Suppression is already pinned by `pack.rs`'s `a_long_silence_is_suppressed` and by
+/// `pheme-app/src/audio.rs`'s `a_long_silence_is_counted_as_suppressed`, which exercises
+/// the real `AudioOut` pump and asserts nothing is sent. An end-to-end assertion here
+/// would need a transport-level counter (`OutCounters`) that `ClientDeps` deliberately
+/// does not expose; the manual test matrix's row A5 covers this on real hardware via
+/// `--stats`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn silence_stops_the_traffic_and_resuming_restores_it() {
+async fn audio_resumes_after_a_long_silence() {
     let pair = spawn_pair(false);
     wait_connected(&pair.input_cap).await;
     assert!(wait_until(|| pair.speaker.started(), Duration::from_secs(5)).await);
