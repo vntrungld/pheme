@@ -110,8 +110,17 @@ pub fn detect_capture(device: Option<&str>) -> Result<Box<dyn AudioCapture>> {
 /// Picks the playback backend for this OS. `device` names a specific device; `None`
 /// means the platform default.
 pub fn detect_playback(device: Option<&str>) -> Result<Box<dyn AudioPlayback>> {
-    let _ = device;
-    Err(Error::Unsupported(
-        "no audio playback backend for this platform".into(),
-    ))
+    #[cfg(target_os = "linux")]
+    {
+        Ok(Box::new(linux_pipewire::PipewirePlayback::new(
+            device.map(str::to_string),
+        )))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = device;
+        Err(Error::Unsupported(
+            "no audio playback backend for this platform".into(),
+        ))
+    }
 }
