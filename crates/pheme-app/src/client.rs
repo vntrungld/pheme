@@ -26,6 +26,10 @@ pub struct ClientDeps {
     pub stats: bool,
     /// Where the client's outgoing audio comes from.
     pub audio: CaptureSource,
+    /// Counters the packer thread publishes. `None` allocates a private set, which is
+    /// what production does; a test passes its own so it can assert that silence
+    /// suppression really stops the traffic rather than merely sending quiet frames.
+    pub audio_counters: Option<Arc<OutCounters>>,
 }
 
 fn apply(inject: &mut dyn InputInject, a: InjectAction) {
@@ -87,8 +91,9 @@ pub async fn run_client(
         server_addr,
         stats,
         audio,
+        audio_counters,
     } = deps;
-    let counters = Arc::new(OutCounters::default());
+    let counters = audio_counters.unwrap_or_default();
     let mut audio = AudioOut::spawn(audio, counters.clone());
     let mut backoff = Backoff::new();
     loop {
@@ -276,6 +281,7 @@ pub async fn main(cfg: Config, host: Option<&str>, stats: bool) -> anyhow::Resul
             server_addr,
             stats,
             audio: CaptureSource::Detect(cfg.audio.capture_device.clone()),
+            audio_counters: None,
         },
         shutdown_rx,
     )

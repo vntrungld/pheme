@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::{AudioCapture, AudioPlayback, Error, Result};
+use crate::{AudioCapture, AudioPlayback, Error, Result, CHANNELS, FRAME_SAMPLES, RATE};
 
 struct CaptureState {
     sink: Option<rtrb::Producer<i16>>,
@@ -120,6 +120,17 @@ struct PlaybackState {
     started: bool,
     fail_start: bool,
     rate: u32,
+    /// Samples per channel the modelled device clock has earned but not yet consumed.
+    /// Only the fractional remainder is carried over: a device that finds the ring
+    /// short plays silence for the rest of its period rather than banking the deficit
+    /// and swallowing a burst later.
+    credit: f64,
+}
+
+/// Samples per channel a device running at `rate` consumes in one 5 ms wire frame's
+/// worth of time. 240 at 48 kHz, 220.5 at 44.1 kHz.
+fn period_samples(rate: u32) -> f64 {
+    f64::from(rate) * FRAME_SAMPLES as f64 / f64::from(RATE)
 }
 
 pub struct MockPlayback {
@@ -139,6 +150,7 @@ impl MockPlayback {
             started: false,
             fail_start: false,
             rate,
+            credit: 0.0,
         }));
         (
             MockPlayback {
@@ -150,14 +162,51 @@ impl MockPlayback {
 }
 
 impl MockPlaybackHandle {
-    /// Consumes everything waiting in the ring, as a device callback would, and appends
-    /// it to the recording. Returns how many samples were taken.
+    /// Consumes everything waiting in the ring and appends it to the recording. Returns
+    /// how many samples were taken.
+    ///
+    /// **No device clock**: this empties the ring however full it is, so a test that
+    /// drives it in a loop lets the playback worker pull frames as fast as it can
+    /// resample them. That is not what a sound card does, and a pipeline driven this
+    /// way runs in permanent underrun with the jitter buffer discarding nearly
+    /// everything that arrives. Use it only where a test wants to read back whatever
+    /// has been produced so far; anything testing the audio path wants `drain_frames`.
     pub fn drain(&self) -> usize {
         let mut st = self.state.lock().unwrap();
         let mut taken = Vec::new();
         if let Some(source) = st.source.as_mut() {
             while let Ok(s) = source.pop() {
                 taken.push(s);
+            }
+        }
+        let n = taken.len();
+        st.recorded.extend_from_slice(&taken);
+        n
+    }
+
+    /// Consumes at most `frames` wire frames' worth of device time, as a real device
+    /// callback would, and appends what it got to the recording. Returns how many
+    /// samples were taken.
+    ///
+    /// The allowance is counted at the device's own rate — 240 samples per channel per
+    /// frame at 48 kHz, 220.5 at 44.1 kHz — with the fraction carried across calls, so
+    /// a test that calls this once per 5 ms consumes audio at exactly the rate the
+    /// device would. Anything the ring could not supply is silence the device played,
+    /// not credit to spend on the next call.
+    pub fn drain_frames(&self, frames: usize) -> usize {
+        let mut st = self.state.lock().unwrap();
+        st.credit += frames as f64 * period_samples(st.rate);
+        let whole = st.credit.floor();
+        st.credit -= whole;
+        let mut allowed = whole as usize * CHANNELS;
+        let mut taken = Vec::new();
+        if let Some(source) = st.source.as_mut() {
+            while allowed > 0 {
+                match source.pop() {
+                    Ok(s) => taken.push(s),
+                    Err(_) => break,
+                }
+                allowed -= 1;
             }
         }
         let n = taken.len();
@@ -275,6 +324,49 @@ mod tests {
         producer.push(10).unwrap();
         handle.drain();
         assert_eq!(handle.recorded(), vec![7, 8, 9, 10]);
+    }
+
+    #[test]
+    fn a_paced_drain_takes_one_device_period_at_a_time() {
+        let (mut play, handle) = MockPlayback::new(48_000);
+        let (mut producer, consumer) = rtrb::RingBuffer::<i16>::new(crate::FRAME_INTERLEAVED * 4);
+        play.start(consumer).unwrap();
+        for i in 0..crate::FRAME_INTERLEAVED * 3 {
+            producer.push(i as i16).unwrap();
+        }
+        assert_eq!(handle.drain_frames(1), crate::FRAME_INTERLEAVED);
+        assert_eq!(handle.drain_frames(2), crate::FRAME_INTERLEAVED * 2);
+        assert_eq!(handle.drain_frames(1), 0, "the ring is empty now");
+    }
+
+    #[test]
+    fn a_paced_drain_at_44_1_khz_carries_the_fractional_sample() {
+        let (mut play, handle) = MockPlayback::new(44_100);
+        let (mut producer, consumer) = rtrb::RingBuffer::<i16>::new(crate::FRAME_INTERLEAVED * 4);
+        play.start(consumer).unwrap();
+        for _ in 0..crate::FRAME_INTERLEAVED * 3 {
+            producer.push(1).unwrap();
+        }
+        // 220.5 samples per channel per period: 220, then 221, then 220 again.
+        assert_eq!(handle.drain_frames(1), 220 * CHANNELS);
+        assert_eq!(handle.drain_frames(1), 221 * CHANNELS);
+        assert_eq!(handle.drain_frames(1), 220 * CHANNELS);
+    }
+
+    #[test]
+    fn a_paced_drain_does_not_bank_what_the_ring_could_not_supply() {
+        let (mut play, handle) = MockPlayback::new(48_000);
+        let (mut producer, consumer) = rtrb::RingBuffer::<i16>::new(crate::FRAME_INTERLEAVED * 4);
+        play.start(consumer).unwrap();
+        assert_eq!(handle.drain_frames(1), 0, "an empty ring plays silence");
+        for _ in 0..crate::FRAME_INTERLEAVED * 3 {
+            producer.push(1).unwrap();
+        }
+        assert_eq!(
+            handle.drain_frames(1),
+            crate::FRAME_INTERLEAVED,
+            "the missed period is gone, not owed"
+        );
     }
 
     #[test]

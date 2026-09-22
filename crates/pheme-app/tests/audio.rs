@@ -1,9 +1,11 @@
 //! Audio from the client to the server over a real QUIC connection, with mock devices
 //! on both ends.
 
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use pheme_app::audio::{CaptureSource, PlaybackSource};
+use pheme_app::audio::{CaptureSource, InStats, OutCounters, PlaybackSource};
 use pheme_app::client::{run_client, ClientDeps};
 use pheme_app::server::{run_server, ServerDeps};
 use pheme_audio::mock::{MockCapture, MockCaptureHandle, MockPlayback, MockPlaybackHandle};
@@ -59,6 +61,8 @@ struct Pair {
     inj: MockInjectLog,
     mic: MockCaptureHandle,
     speaker: MockPlaybackHandle,
+    sent: Arc<OutCounters>,
+    heard: Arc<InStats>,
 }
 
 impl Pair {
@@ -102,6 +106,8 @@ fn spawn_pair(fail_capture: bool) -> Pair {
         mic.fail_next_start();
     }
     let (speaker_backend, speaker) = MockPlayback::new(48_000);
+    let sent = Arc::new(OutCounters::default());
+    let heard = Arc::new(InStats::default());
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let server = tokio::spawn(run_server(
@@ -117,6 +123,7 @@ fn spawn_pair(fail_capture: bool) -> Pair {
             hotkeys: Hotkeys::default(),
             stats: false,
             audio: PlaybackSource::Backend(Box::new(speaker_backend)),
+            audio_stats: Some(heard.clone()),
         },
         shutdown_rx.clone(),
     ));
@@ -128,6 +135,7 @@ fn spawn_pair(fail_capture: bool) -> Pair {
             server_addr,
             stats: false,
             audio: CaptureSource::Backend(Box::new(mic_backend)),
+            audio_counters: Some(sent.clone()),
         },
         shutdown_rx,
     ));
@@ -139,6 +147,8 @@ fn spawn_pair(fail_capture: bool) -> Pair {
         inj,
         mic,
         speaker,
+        sent,
+        heard,
     }
 }
 
@@ -166,14 +176,46 @@ async fn wait_connected(cap: &MockInputHandle) {
     );
 }
 
-/// The device callback: pulls whatever the worker has produced.
+/// Runs the pipeline for `count` iterations of one 5 ms frame each: the client's device
+/// produces `f(i)` and the server's device consumes exactly one period, which is what
+/// both of them do in real life.
+///
+/// Two things matter here. The server's device drains on its own clock — `drain()`
+/// would empty the ring however full it is, which lets the playback worker run away
+/// from the sender and puts the whole pipeline in permanent underrun, so every test
+/// would pass on two frames of audio plus concealment. And the client's device never
+/// stops producing, not even through silence: letting it idle while the server's device
+/// keeps consuming walks the jitter buffer's read cursor past the sender's sequence
+/// numbers, and everything that arrives afterwards is `late`. That is a property of a
+/// harness that stops the client's clock, not of the pipeline.
+async fn run_frames(pair: &Pair, count: usize, mut f: impl FnMut(usize) -> Vec<i16>) {
+    run_frames_watching_depth(pair, count, &mut f).await;
+}
+
+/// `run_frames`, returning the `audio_depth_ms` the server published on each iteration.
+async fn run_frames_watching_depth(
+    pair: &Pair,
+    count: usize,
+    f: &mut impl FnMut(usize) -> Vec<i16>,
+) -> Vec<u64> {
+    let mut depths = Vec::with_capacity(count);
+    for i in 0..count {
+        pair.mic.push(&f(i));
+        pair.speaker.drain_frames(1);
+        depths.push(pair.heard.depth_ms.load(Ordering::Relaxed));
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    depths
+}
+
+/// The server's device alone, for the tail of a test where the client has stopped.
 async fn drain_for(speaker: &MockPlaybackHandle, how_long: Duration) {
     let t = Instant::now();
     while t.elapsed() < how_long {
-        speaker.drain();
+        speaker.drain_frames(1);
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    speaker.drain();
+    speaker.drain_frames(1);
 }
 
 /// How many samples in `rec` clear a "clearly not silence" threshold. A peak-only check
@@ -192,13 +234,55 @@ async fn audio_flows_client_to_server() {
         "the server's playback device never opened"
     );
 
-    // 300 ms of tone, fed at roughly real time so the pipeline behaves as it would live.
-    for i in 0..60 {
-        pair.mic.push(&sine_frame(i));
-        pair.speaker.drain();
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    // 1.5 s of tone at one 5 ms frame per iteration, so the pipeline runs at the rate it
+    // would live: the client emits 200 frames a second and the server's device consumes
+    // 200 frames a second.
+    let depths = run_frames_watching_depth(&pair, 300, &mut sine_frame).await;
+    // Read the counters while the stream is still running. After the tone stops the
+    // jitter buffer runs dry and conceals, which is correct behaviour but would count
+    // as loss and mask a pipeline that was dropping frames all along.
+    let (late, underruns, lost) = (
+        pair.heard.late.load(Ordering::Relaxed),
+        pair.heard.underruns.load(Ordering::Relaxed),
+        pair.heard.lost.load(Ordering::Relaxed),
+    );
     drain_for(&pair.speaker, Duration::from_millis(300)).await;
+
+    // Zero is what a quiet machine produces, but the pacing is wall-clock: a scheduling
+    // stall moves one side of the loop and not the other, and a handful of frames slip.
+    // This budget is two orders of magnitude tighter than the behaviour it replaced,
+    // where a mock with no device clock let the server discard 95 % of the stream while
+    // every assertion in this file still passed.
+    let budget = 300 / 10;
+    assert!(
+        late <= budget,
+        "{late} frames arrived after their slot had passed"
+    );
+    assert!(
+        underruns <= budget,
+        "the playback buffer ran dry {underruns} times"
+    );
+    assert!(
+        lost <= budget,
+        "{lost} frames never reached the jitter buffer"
+    );
+
+    // `audio_depth_ms` is the depth sampled just after a pop, so the 2-frame target
+    // reads as an alternation of 5 and 10 ms — a median of 10 on an idle machine, not
+    // the flat 10-15 the spec's definition of done names, which is the target rather
+    // than the depth. Before the playback mock had a device clock this counter was
+    // pinned at 0 for the whole run. Skip the first 50 iterations, while the buffer is
+    // still prefilling, and assert the lower bound only: a scheduling stall parks the
+    // buffer deeper and only the drift controller's 0.1 % correction brings it back,
+    // which takes about five seconds per frame — far longer than this test runs.
+    let mut steady = depths[50..].to_vec();
+    steady.sort_unstable();
+    let median = steady[steady.len() / 2];
+    assert!(
+        median >= 5,
+        "median jitter depth {median} ms: the buffer is running empty, so the playback \
+         worker is outrunning the sender"
+    );
 
     let rec = pair.speaker.recorded();
     let peak = rec.iter().map(|s| i32::from(s.abs())).max().unwrap_or(0);
@@ -206,66 +290,84 @@ async fn audio_flows_client_to_server() {
         (peak - 10_000).abs() < 1_500,
         "the tone arrived at the wrong level: peak {peak} of an expected 10000"
     );
+    // The device consumed one frame per iteration for 300 iterations, so anything much
+    // below that means the worker could not keep it fed.
     assert!(
-        rec.len() > 30 * FRAME_INTERLEAVED,
-        "only {} samples were played",
-        rec.len()
+        rec.len() > 280 * FRAME_INTERLEAVED,
+        "only {} samples were played, expected about {}",
+        rec.len(),
+        300 * FRAME_INTERLEAVED
     );
-    // Well beyond one stray sample: the recording also includes the warm-up and
-    // trailing silence either side of the tone, so this is a fraction of `rec.len()`,
-    // not most of it.
+    // Nearly all of the recording is the tone: a 440 Hz sine spends most of its period
+    // above a tenth of full scale. A pipeline that delivered a couple of frames and
+    // concealed the rest would not reach this.
     assert!(
-        loud_samples(&rec) > 1_000,
+        loud_samples(&rec) > 100_000,
         "too few loud samples to be the tone: {} of {}",
         loud_samples(&rec),
         rec.len()
     );
+    // Every frame the client sent reached the buffer and was played.
+    assert!(
+        pair.sent.sent.load(Ordering::Relaxed) >= 290,
+        "the client only sent {} frames",
+        pair.sent.sent.load(Ordering::Relaxed)
+    );
     pair.shutdown().await;
 }
 
-/// This test covers resumption only, not suppression itself: an all-zero frame
-/// resamples to sub-threshold output whether it was transmitted or suppressed, so a
-/// build with silence suppression disabled entirely would pass this test unchanged.
-/// Suppression is already pinned by `pack.rs`'s `a_long_silence_is_suppressed` and by
-/// `pheme-app/src/audio.rs`'s `a_long_silence_is_counted_as_suppressed`, which exercises
-/// the real `AudioOut` pump and asserts nothing is sent. An end-to-end assertion here
-/// would need a transport-level counter (`OutCounters`) that `ClientDeps` deliberately
-/// does not expose; the manual test matrix's row A5 covers this on real hardware via
-/// `--stats`.
+/// Silence suppression end to end: with the server's device draining on its own clock
+/// the jitter buffer tracks the stream, so the client's frame counter standing still
+/// through the quiet window is a real observation of "no traffic", not an artefact of a
+/// pipeline that was discarding frames either way.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn audio_resumes_after_a_long_silence() {
+async fn silence_stops_the_traffic_and_resuming_restores_it() {
     let pair = spawn_pair(false);
     wait_connected(&pair.input_cap).await;
     assert!(wait_until(|| pair.speaker.started(), Duration::from_secs(5)).await);
 
-    for i in 0..20 {
-        pair.mic.push(&sine_frame(i));
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    drain_for(&pair.speaker, Duration::from_millis(100)).await;
-    let after_tone = pair.speaker.recorded().len();
+    // 500 ms of tone.
+    run_frames(&pair, 100, sine_frame).await;
     assert!(
-        loud_samples(&pair.speaker.recorded()) > 3_000,
-        "too few loud samples in the first burst"
+        loud_samples(&pair.speaker.recorded()) > 30_000,
+        "too few loud samples in the first burst: {}",
+        loud_samples(&pair.speaker.recorded())
     );
 
-    // 400 ms of digital silence: past the 200 ms suppression window.
-    for _ in 0..80 {
-        pair.mic.push(&vec![0i16; FRAME_INTERLEAVED]);
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    drain_for(&pair.speaker, Duration::from_millis(200)).await;
+    // 300 ms of digital silence: past the 200 ms window, so the client is now quiet.
+    run_frames(&pair, 60, |_| vec![0i16; FRAME_INTERLEAVED]).await;
+    let quiet_start = pair.sent.sent.load(Ordering::Relaxed);
+
+    // A further 500 ms of silence must put nothing at all on the wire.
+    run_frames(&pair, 100, |_| vec![0i16; FRAME_INTERLEAVED]).await;
+    assert_eq!(
+        pair.sent.sent.load(Ordering::Relaxed),
+        quiet_start,
+        "the client kept sending through the silence window"
+    );
+    assert!(
+        pair.sent.suppressed.load(Ordering::Relaxed) >= 100,
+        "only {} frames were suppressed",
+        pair.sent.suppressed.load(Ordering::Relaxed)
+    );
+    assert_eq!(
+        pair.heard.depth_ms.load(Ordering::Relaxed),
+        0,
+        "the server's jitter buffer still holds frames, so audio was still arriving"
+    );
 
     // Resuming must produce audible output again.
     let before_resume = pair.speaker.recorded().len();
-    for i in 100..140 {
-        pair.mic.push(&sine_frame(i));
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    drain_for(&pair.speaker, Duration::from_millis(300)).await;
+    run_frames(&pair, 100, |i| sine_frame(i + 500)).await;
+    // A short silent tail so the last frames in flight reach the device.
+    run_frames(&pair, 20, |_| vec![0i16; FRAME_INTERLEAVED]).await;
 
+    assert!(
+        pair.sent.sent.load(Ordering::Relaxed) > quiet_start + 90,
+        "the client sent only {} frames after resuming",
+        pair.sent.sent.load(Ordering::Relaxed) - quiet_start
+    );
     let rec = pair.speaker.recorded();
-    assert!(after_tone > 0, "no audio before the silence");
     let resumed = &rec[before_resume.min(rec.len())..];
     let peak = resumed
         .iter()
@@ -277,7 +379,7 @@ async fn audio_resumes_after_a_long_silence() {
         "audio did not come back after the pause: peak {peak}"
     );
     assert!(
-        loud_samples(resumed) > 5_000,
+        loud_samples(resumed) > 30_000,
         "too few loud samples after resuming: {} of {}",
         loud_samples(resumed),
         resumed.len()

@@ -26,6 +26,11 @@ pub struct ServerDeps {
     pub stats: bool,
     /// Where audio received from the client is played.
     pub audio: PlaybackSource,
+    /// Counters the playback worker publishes. `None` allocates a private set, which is
+    /// what production does; a test passes its own so it can assert on loss, lateness
+    /// and buffer depth, which is the only way to tell a working audio path from one
+    /// that discards most of what arrives and still sounds roughly right.
+    pub audio_stats: Option<Arc<InStats>>,
 }
 
 /// The currently connected client, as seen by the router thread.
@@ -111,8 +116,9 @@ pub async fn run_server(
         hotkeys,
         stats,
         audio,
+        audio_stats,
     } = deps;
-    let audio_stats = Arc::new(InStats::default());
+    let audio_stats = audio_stats.unwrap_or_default();
     let audio_in = AudioIn::spawn(audio, audio_stats.clone());
     let (ev_tx, ev_rx) = crossbeam_channel::bounded::<CaptureEvent>(4096);
     capture.start(ev_tx).context("starting input capture")?;
@@ -425,6 +431,7 @@ pub async fn main(cfg: Config, pair: bool, stats: bool) -> anyhow::Result<()> {
             hotkeys: cfg.hotkeys()?,
             stats,
             audio: PlaybackSource::Detect(cfg.audio.playback_device.clone()),
+            audio_stats: None,
         },
         shutdown_rx,
     )

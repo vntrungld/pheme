@@ -70,6 +70,7 @@ fn spawn_pair() -> Pair {
             hotkeys: Hotkeys::default(),
             stats: false,
             audio: pheme_app::audio::PlaybackSource::Disabled,
+            audio_stats: None,
         },
         shutdown_rx.clone(),
     ));
@@ -81,6 +82,7 @@ fn spawn_pair() -> Pair {
             server_addr,
             stats: false,
             audio: pheme_app::audio::CaptureSource::Disabled,
+            audio_counters: None,
         },
         shutdown_rx,
     ));
@@ -151,6 +153,7 @@ async fn server_and_client_exchange_input_over_quic() {
             },
             stats: false,
             audio: pheme_app::audio::PlaybackSource::Disabled,
+            audio_stats: None,
         },
         shutdown_rx.clone(),
     ));
@@ -162,6 +165,7 @@ async fn server_and_client_exchange_input_over_quic() {
             server_addr,
             stats: false,
             audio: pheme_app::audio::CaptureSource::Disabled,
+            audio_counters: None,
         },
         shutdown_rx.clone(),
     ));
@@ -290,6 +294,7 @@ async fn client_reconnects_after_server_restart() {
             server_addr,
             stats: false,
             audio: pheme_app::audio::CaptureSource::Disabled,
+            audio_counters: None,
         },
         shutdown_rx.clone(),
     ));
@@ -309,6 +314,7 @@ async fn client_reconnects_after_server_restart() {
                 hotkeys: Hotkeys::default(),
                 stats: false,
                 audio: pheme_app::audio::PlaybackSource::Disabled,
+                audio_stats: None,
             },
             stop,
         ));
@@ -392,6 +398,7 @@ async fn server_releases_grab_when_client_vanishes_silently() {
             hotkeys: Hotkeys::default(),
             stats: false,
             audio: pheme_app::audio::PlaybackSource::Disabled,
+            audio_stats: None,
         },
         shutdown_rx.clone(),
     ));
@@ -403,6 +410,7 @@ async fn server_releases_grab_when_client_vanishes_silently() {
             server_addr,
             stats: false,
             audio: pheme_app::audio::CaptureSource::Disabled,
+            audio_counters: None,
         },
         shutdown_rx.clone(),
     ));
