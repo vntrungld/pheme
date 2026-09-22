@@ -62,3 +62,32 @@ Run before every release, for **each** row of the matrix. Record the result
     numbering); the server logs `events`, `control` and `datagrams` sent. On a wired
     LAN `rtt_us` stays below 1000 and `lost` stays at 0 during 1 minute of continuous
     movement.
+
+## Audio (client → server)
+
+Audio only ever flows client to server, so every row below is run in both
+role combinations: Windows client → Linux server, and Linux client → Windows
+server. The Windows capture and playback backends compile and pass lint and
+unit tests, but this matrix is the only thing that has ever run them against
+real hardware — treat every Windows result as unverified until you've watched
+it pass yourself, and note the exact failure (log line, silence, crash) if a
+row does not.
+
+Run both sides with `--stats` for A2 and A5; the client logs `audio_sent` and
+`audio_suppressed`, the server logs `audio_depth_ms` and `audio_underruns`
+(see the client/server `--stats` output above for the rest of the line).
+
+| # | Check | Pass |
+|---|---|---|
+| A1 | Select "Pheme Speaker" (Linux) or leave the default output (Windows) on the client and play music | Audible on the server's speakers, no crackle, no stutter |
+| A2 | Leave it playing for ten minutes with `--stats` | `audio_underruns` stays 0 after the first seconds, `audio_depth_ms` steady between 10 and 15 |
+| A3 | Unplug the network for 3 s, then plug it back in | Audio resumes on its own; no restart needed |
+| A4 | On a Windows client, change the default output device mid-stream | Audio continues on the new device within a few seconds |
+| A5 | Pause playback for 30 s, then resume | No audio traffic while paused (`audio_sent` drops to 0, `audio_suppressed` rises); sound is back within 100 ms of resuming |
+| A6 | Stop the server while the client keeps running | The client still offers "Pheme Speaker", logs no errors, and does not hang |
+| A7 | Play a click track on the client and record both machines' speakers with a phone | The offset between the two clicks is under 40 ms |
+| A8 | Kill and restart the PipeWire daemon on a Linux machine mid-stream (`systemctl --user restart pipewire`) | Audio comes back within about 5 s without restarting pheme |
+| A9 | On the Windows side of the pair (Windows client capturing, or Windows server playing back), start the connection and begin playing audio immediately — do not wait before checking. Time from the connection coming up to audio first being audible on the server | Audible within about 2 s. If it takes much longer, or nothing ever plays despite the build and `--stats` looking healthy, suspect a regression in `start()` never actually completing — this failure mode has shipped before while compiling and linting clean |
+
+If A2 shows `audio_depth_ms` climbing steadily over ten minutes, the drift controller is
+not holding — report the trend, do not just restart.
