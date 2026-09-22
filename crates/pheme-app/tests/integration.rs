@@ -69,6 +69,7 @@ fn spawn_pair() -> Pair {
             }],
             hotkeys: Hotkeys::default(),
             stats: false,
+            audio: pheme_app::audio::PlaybackSource::Disabled,
         },
         shutdown_rx.clone(),
     ));
@@ -149,6 +150,7 @@ async fn server_and_client_exchange_input_over_quic() {
                 lock: Some(KeyCode(0x47)),
             },
             stats: false,
+            audio: pheme_app::audio::PlaybackSource::Disabled,
         },
         shutdown_rx.clone(),
     ));
@@ -306,6 +308,7 @@ async fn client_reconnects_after_server_restart() {
                 }],
                 hotkeys: Hotkeys::default(),
                 stats: false,
+                audio: pheme_app::audio::PlaybackSource::Disabled,
             },
             stop,
         ));
@@ -388,6 +391,7 @@ async fn server_releases_grab_when_client_vanishes_silently() {
             }],
             hotkeys: Hotkeys::default(),
             stats: false,
+            audio: pheme_app::audio::PlaybackSource::Disabled,
         },
         shutdown_rx.clone(),
     ));

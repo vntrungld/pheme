@@ -5,14 +5,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context};
+use pheme_audio::frame::Frame;
 use pheme_core::{Action, CaptureEvent, ClientPlacement, Hotkeys, Layout, ServerCore};
 use pheme_input::{CaptureMode, InputCapture};
 use pheme_net::pairing::{generate_code, run_server_pairing};
 use pheme_net::{Endpoint, Identity, Incoming, Peer, PeerSender, TrustStore};
-use pheme_proto::{AudioParams, Msg, PROTOCOL_VERSION};
+use pheme_proto::{AudioParams, AudioStream, Msg, PROTOCOL_VERSION};
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
+use crate::audio::{AudioIn, InStats, PlaybackSource};
 use crate::config::{config_dir, Config};
 
 pub struct ServerDeps {
@@ -22,6 +24,8 @@ pub struct ServerDeps {
     pub placements: Vec<ClientPlacement>,
     pub hotkeys: Hotkeys,
     pub stats: bool,
+    /// Where audio received from the client is played.
+    pub audio: PlaybackSource,
 }
 
 /// The currently connected client, as seen by the router thread.
@@ -44,6 +48,7 @@ struct Shared {
     capture: Mutex<Box<dyn InputCapture>>,
     link: Mutex<Option<Link>>,
     counters: Counters,
+    audio: AudioIn,
 }
 
 impl Shared {
@@ -105,7 +110,10 @@ pub async fn run_server(
         placements,
         hotkeys,
         stats,
+        audio,
     } = deps;
+    let audio_stats = Arc::new(InStats::default());
+    let audio_in = AudioIn::spawn(audio, audio_stats.clone());
     let (ev_tx, ev_rx) = crossbeam_channel::bounded::<CaptureEvent>(4096);
     capture.start(ev_tx).context("starting input capture")?;
     let screens = capture.screens();
@@ -122,6 +130,7 @@ pub async fn run_server(
         capture: Mutex::new(capture),
         link: Mutex::new(None),
         counters: Counters::default(),
+        audio: audio_in,
     });
 
     // Router thread: blocking receive from the capture backend, no async hop for datagrams.
@@ -146,9 +155,11 @@ pub async fn run_server(
 
     if stats {
         let s = shared.clone();
+        let astats = audio_stats.clone();
         let mut stats_shutdown = shutdown.clone();
         tokio::spawn(async move {
             let mut last = (0u64, 0u64, 0u64);
+            let mut alast = (0u64, 0u64, 0u64, 0u64, 0u64);
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(1)) => {}
@@ -160,14 +171,28 @@ pub async fn run_server(
                     s.counters.datagrams_sent.load(Ordering::Relaxed),
                 );
                 let connected = s.link.lock().unwrap().is_some();
+                let anow = (
+                    astats.lost.load(Ordering::Relaxed),
+                    astats.underruns.load(Ordering::Relaxed),
+                    astats.late.load(Ordering::Relaxed),
+                    astats.resets.load(Ordering::Relaxed),
+                    astats.dropped.load(Ordering::Relaxed),
+                );
                 info!(
                     events = now.0 - last.0,
                     control = now.1 - last.1,
                     datagrams = now.2 - last.2,
                     connected,
+                    audio_depth_ms = astats.depth_ms.load(Ordering::Relaxed),
+                    audio_lost = anow.0 - alast.0,
+                    audio_underruns = anow.1 - alast.1,
+                    audio_late = anow.2 - alast.2,
+                    audio_resets = anow.3 - alast.3,
+                    audio_dropped = anow.4 - alast.4,
                     "stats/s"
                 );
                 last = now;
+                alast = anow;
             }
         });
     }
@@ -315,6 +340,16 @@ async fn handle_peer(
             msg = rx.recv() => match msg {
                 Some(Msg::Ping(n)) => { let _ = peer.sender().send_control(&Msg::Pong(n)).await; }
                 Some(Msg::Bye { reason }) => { info!(%reason, "client said bye"); break Ok(()); }
+                Some(Msg::Audio {
+                    stream: AudioStream::Playback,
+                    seq,
+                    ts_us,
+                    samples,
+                }) => shared.audio.push(Frame {
+                    seq,
+                    ts_us,
+                    bytes: samples,
+                }),
                 Some(other) => tracing::debug!(?other, "ignoring message from client"),
                 None => break Ok(()),
             },
@@ -389,6 +424,7 @@ pub async fn main(cfg: Config, pair: bool, stats: bool) -> anyhow::Result<()> {
             placements: cfg.placements()?,
             hotkeys: cfg.hotkeys()?,
             stats,
+            audio: PlaybackSource::Detect(cfg.audio.playback_device.clone()),
         },
         shutdown_rx,
     )

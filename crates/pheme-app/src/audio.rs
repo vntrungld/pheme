@@ -9,10 +9,16 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use crossbeam_channel::{Receiver, Sender, TryRecvError};
+use pheme_audio::drift::DriftController;
+use pheme_audio::frame::Frame;
+use pheme_audio::jitter::{JitterBuffer, JitterStats, Pop};
 use pheme_audio::pack::Packer;
-use pheme_audio::{AudioCapture, FRAME_INTERLEAVED, FRAME_US};
+use pheme_audio::{AudioCapture, AudioPlayback, CHANNELS, FRAME_INTERLEAVED, FRAME_SAMPLES};
+use pheme_audio::{FRAME_US, RATE};
 use pheme_net::PeerSender;
 use pheme_proto::{AudioStream, Msg};
+use rubato::Resampler;
 use tracing::{info, warn};
 
 /// How long a failed backend waits before it is rebuilt.
@@ -214,6 +220,249 @@ fn pump_out(
     }
 }
 
+/// Playback ring, in wire frames' worth of samples. It is sized for the worst plausible
+/// device rate; the worker keeps the actual fill near one frame regardless.
+const PLAYBACK_RING_SAMPLES: usize = FRAME_INTERLEAVED * 16;
+/// Frames the receive task may queue for the worker before dropping them.
+const FRAME_QUEUE: usize = 256;
+
+/// Where the playback backend comes from. Tests inject their own.
+pub enum PlaybackSource {
+    Detect(Option<String>),
+    /// Started once and never rebuilt — for tests.
+    Backend(Box<dyn AudioPlayback>),
+    Disabled,
+}
+
+/// Cumulative counters; the stats line reports the difference per interval.
+#[derive(Default)]
+pub struct InStats {
+    /// Last observed jitter-buffer depth, in milliseconds. Not cumulative.
+    pub depth_ms: AtomicU64,
+    pub lost: AtomicU64,
+    pub late: AtomicU64,
+    pub underruns: AtomicU64,
+    pub resets: AtomicU64,
+    /// Frames the receive task had to drop because the worker was not keeping up.
+    pub dropped: AtomicU64,
+}
+
+/// Owns the server's playback backend and the worker that feeds it.
+pub struct AudioIn {
+    frames: Option<Sender<Frame>>,
+    stats: Arc<InStats>,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl AudioIn {
+    pub fn spawn(source: PlaybackSource, stats: Arc<InStats>) -> AudioIn {
+        let stop = Arc::new(AtomicBool::new(false));
+        if matches!(source, PlaybackSource::Disabled) {
+            return AudioIn {
+                frames: None,
+                stats,
+                stop,
+                thread: None,
+            };
+        }
+        let (tx, rx) = crossbeam_channel::bounded::<Frame>(FRAME_QUEUE);
+        let thread = {
+            let stop = stop.clone();
+            let stats = stats.clone();
+            match std::thread::Builder::new()
+                .name("pheme-audio-in".into())
+                .spawn(move || in_thread(source, rx, stop, stats))
+            {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    warn!("could not start the audio playback thread: {e}");
+                    None
+                }
+            }
+        };
+        AudioIn {
+            frames: Some(tx),
+            stats,
+            stop,
+            thread,
+        }
+    }
+
+    /// Hands a received frame to the worker. Never blocks: a full queue means the worker
+    /// is not keeping up, and a dropped frame is better than a stalled receive task.
+    pub fn push(&self, f: Frame) {
+        match self.frames.as_ref() {
+            Some(tx) if tx.try_send(f).is_ok() => {}
+            _ => {
+                self.stats.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub fn stop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        self.frames = None; // disconnects the worker's receiver
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+impl Drop for AudioIn {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn in_thread(
+    source: PlaybackSource,
+    rx: Receiver<Frame>,
+    stop: Arc<AtomicBool>,
+    stats: Arc<InStats>,
+) {
+    let (device, mut injected, rebuild) = match source {
+        PlaybackSource::Detect(d) => (d, None, true),
+        PlaybackSource::Backend(b) => (None, Some(b), false),
+        PlaybackSource::Disabled => return,
+    };
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
+        let built = match injected.take() {
+            Some(b) => Ok(b),
+            None => pheme_audio::detect_playback(device.as_deref()),
+        };
+        let mut backend = match built {
+            Ok(b) => b,
+            Err(pheme_audio::Error::Unsupported(why)) => {
+                info!("audio playback is not available here: {why}");
+                return;
+            }
+            Err(e) => {
+                warn!("audio playback unavailable: {e}");
+                if !rebuild || !nap(RETRY, &stop) {
+                    return;
+                }
+                continue;
+            }
+        };
+        let (producer, consumer) = rtrb::RingBuffer::<i16>::new(PLAYBACK_RING_SAMPLES);
+        if let Err(e) = backend.start(consumer) {
+            warn!("audio playback failed to start: {e}");
+            if !rebuild || !nap(RETRY, &stop) {
+                return;
+            }
+            continue;
+        }
+        let rate = backend.rate();
+        info!(device = %backend.device_name(), rate, "audio playback started");
+        match pump_in(backend.as_ref(), producer, &rx, &stop, &stats, rate) {
+            PumpEnd::Stopped => {
+                backend.stop();
+                return;
+            }
+            PumpEnd::Failed(why) => {
+                warn!("audio playback stopped: {why}");
+                backend.stop();
+            }
+        }
+        if stop.load(Ordering::SeqCst) || !rebuild {
+            return;
+        }
+        if !nap(RETRY, &stop) {
+            return;
+        }
+    }
+}
+
+enum PumpEnd {
+    /// A stop was requested, or the sender was dropped: do not rebuild.
+    Stopped,
+    /// The device or the resampler failed: rebuild after the retry delay.
+    Failed(String),
+}
+
+fn pump_in(
+    backend: &dyn AudioPlayback,
+    mut producer: rtrb::Producer<i16>,
+    rx: &Receiver<Frame>,
+    stop: &AtomicBool,
+    stats: &InStats,
+    rate: u32,
+) -> PumpEnd {
+    let base = f64::from(rate) / f64::from(RATE);
+    let params = rubato::SincInterpolationParameters {
+        sinc_len: 64,
+        f_cutoff: 0.95,
+        interpolation: rubato::SincInterpolationType::Cubic,
+        oversampling_factor: 128,
+        window: rubato::WindowFunction::BlackmanHarris2,
+    };
+    // 1.1 is the widest ratio change the resampler will accept later; the drift
+    // controller never asks for more than 0.1 %.
+    let mut resampler =
+        match rubato::SincFixedIn::<f32>::new(base, 1.1, params, FRAME_SAMPLES, CHANNELS) {
+            Ok(r) => r,
+            Err(e) => return PumpEnd::Failed(format!("building the playback resampler: {e}")),
+        };
+    let mut input: Vec<Vec<f32>> = vec![vec![0.0; FRAME_SAMPLES]; CHANNELS];
+    let mut output = resampler.output_buffer_allocate(true);
+    let mut jitter = JitterBuffer::new();
+    let mut drift = DriftController::new(base);
+    let frame_out = (FRAME_SAMPLES as f64 * base).ceil() as usize * CHANNELS;
+    let keep = 2 * frame_out;
+
+    while !stop.load(Ordering::SeqCst) {
+        if !backend.healthy() {
+            return PumpEnd::Failed("the playback device stopped".into());
+        }
+        loop {
+            match rx.try_recv() {
+                Ok(f) => jitter.push(f),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return PumpEnd::Stopped,
+            }
+        }
+        while PLAYBACK_RING_SAMPLES - producer.slots() < keep && producer.slots() >= frame_out {
+            let st = jitter.stats();
+            let ratio = drift.tick(st.depth, st.target);
+            let _ = resampler.set_resample_ratio(ratio, true);
+            let samples = match jitter.pop() {
+                Pop::Data(s) | Pop::Conceal(s) => s,
+                Pop::Idle => vec![0i16; FRAME_INTERLEAVED],
+            };
+            for (i, pair) in samples.chunks_exact(CHANNELS).enumerate() {
+                for (c, plane) in input.iter_mut().enumerate() {
+                    plane[i] = f32::from(pair[c]) / 32_768.0;
+                }
+            }
+            let produced = match resampler.process_into_buffer(&input, &mut output, None) {
+                Ok((_, out)) => out,
+                Err(e) => return PumpEnd::Failed(format!("resampling: {e}")),
+            };
+            for i in 0..produced {
+                for plane in output.iter() {
+                    let v = (plane[i] * 32_768.0).round().clamp(-32_768.0, 32_767.0) as i16;
+                    let _ = producer.push(v);
+                }
+            }
+        }
+        publish(stats, jitter.stats());
+        std::thread::sleep(TICK);
+    }
+    PumpEnd::Stopped
+}
+
+fn publish(stats: &InStats, s: JitterStats) {
+    stats.depth_ms.store(s.depth as u64 * 5, Ordering::Relaxed);
+    stats.lost.store(s.lost, Ordering::Relaxed);
+    stats.late.store(s.late, Ordering::Relaxed);
+    stats.underruns.store(s.underruns, Ordering::Relaxed);
+    stats.resets.store(s.resets, Ordering::Relaxed);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,5 +552,108 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         assert!(!handle.started());
         out.stop(); // must not hang
+    }
+
+    use pheme_audio::mock::MockPlayback;
+
+    /// One frame of a 440 Hz sine at about a third of full scale, continuing from frame
+    /// index `i` so consecutive frames join smoothly.
+    fn sine_frame(i: usize) -> Vec<i16> {
+        let mut out = Vec::with_capacity(FRAME_INTERLEAVED);
+        for n in 0..pheme_audio::FRAME_SAMPLES {
+            let t = (i * pheme_audio::FRAME_SAMPLES + n) as f32 / 48_000.0;
+            let v = (10_000.0 * (2.0 * std::f32::consts::PI * 440.0 * t).sin()) as i16;
+            out.push(v);
+            out.push(v);
+        }
+        out
+    }
+
+    #[test]
+    fn disabled_playback_drops_what_it_is_given() {
+        let stats = Arc::new(InStats::default());
+        let mut audio = AudioIn::spawn(PlaybackSource::Disabled, stats.clone());
+        audio.push(Frame {
+            seq: 0,
+            ts_us: 0,
+            bytes: vec![0; pheme_audio::FRAME_BYTES],
+        });
+        audio.stop();
+        assert_eq!(stats.dropped.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn frames_reach_the_playback_device() {
+        let (play, handle) = MockPlayback::new(48_000);
+        let stats = Arc::new(InStats::default());
+        let mut audio = AudioIn::spawn(PlaybackSource::Backend(Box::new(play)), stats.clone());
+        assert!(wait_until(|| handle.started(), Duration::from_secs(2)));
+
+        let mut packer = Packer::new();
+        for i in 0..100 {
+            let f = packer
+                .push(&sine_frame(i), i as u64 * FRAME_US)
+                .expect("a sine is never silent");
+            audio.push(f);
+            std::thread::sleep(Duration::from_millis(5));
+            handle.drain();
+        }
+        for _ in 0..40 {
+            std::thread::sleep(Duration::from_millis(5));
+            handle.drain();
+        }
+        audio.stop();
+
+        let rec = handle.recorded();
+        let peak = rec.iter().map(|s| i32::from(s.abs())).max().unwrap_or(0);
+        assert!(
+            (peak - 10_000).abs() < 1_500,
+            "played peak {peak}, expected about 10000 — the pipeline changed the level"
+        );
+        assert!(
+            rec.len() > 50 * FRAME_INTERLEAVED,
+            "only {} samples reached the device",
+            rec.len()
+        );
+        assert_eq!(stats.dropped.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn a_device_at_another_rate_is_resampled() {
+        let (play, handle) = MockPlayback::new(44_100);
+        let stats = Arc::new(InStats::default());
+        let mut audio = AudioIn::spawn(PlaybackSource::Backend(Box::new(play)), stats);
+        assert!(wait_until(|| handle.started(), Duration::from_secs(2)));
+
+        let mut packer = Packer::new();
+        for i in 0..60 {
+            let f = packer.push(&sine_frame(i), i as u64 * FRAME_US).unwrap();
+            audio.push(f);
+            std::thread::sleep(Duration::from_millis(5));
+            handle.drain();
+        }
+        for _ in 0..40 {
+            std::thread::sleep(Duration::from_millis(5));
+            handle.drain();
+        }
+        audio.stop();
+
+        let rec = handle.recorded();
+        let peak = rec.iter().map(|s| i32::from(s.abs())).max().unwrap_or(0);
+        assert!(
+            (peak - 10_000).abs() < 1_500,
+            "resampling to 44.1 kHz changed the level: peak {peak}"
+        );
+    }
+
+    #[test]
+    fn an_injected_playback_backend_that_fails_gives_up_quietly() {
+        let (play, handle) = MockPlayback::new(48_000);
+        handle.fail_next_start();
+        let stats = Arc::new(InStats::default());
+        let mut audio = AudioIn::spawn(PlaybackSource::Backend(Box::new(play)), stats);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!handle.started());
+        audio.stop(); // must not hang
     }
 }
