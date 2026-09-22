@@ -160,45 +160,48 @@ pub fn open_render_device(name: Option<&str>) -> Result<IMMDevice> {
         let enumerator: IMMDeviceEnumerator =
             CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
                 .map_err(|e| Error::Device(format!("creating the device enumerator: {e}")))?;
-        match name.map(str::trim).filter(|w| !w.is_empty()) {
-            None => {}
-            Some(wanted) => {
-                let collection = enumerator
-                    .EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)
-                    .map_err(|e| Error::Device(format!("enumerating render endpoints: {e}")))?;
-                let count = collection
-                    .GetCount()
-                    .map_err(|e| Error::Device(format!("counting render endpoints: {e}")))?;
-                let mut partial: Vec<(IMMDevice, String)> = Vec::new();
-                for i in 0..count {
-                    let Ok(dev) = collection.Item(i) else {
-                        continue;
-                    };
-                    let found = friendly_name(&dev);
-                    if found.eq_ignore_ascii_case(wanted) {
-                        return Ok(dev);
-                    }
-                    if contains_ignore_ascii_case(&found, wanted) {
-                        partial.push((dev, found));
-                    }
+        // A name that is empty or only spaces is treated as "not configured": every
+        // endpoint contains the empty string, so matching on it would be ambiguous by
+        // construction.
+        if let Some(wanted) = name.map(str::trim).filter(|w| !w.is_empty()) {
+            let collection = enumerator
+                .EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)
+                .map_err(|e| Error::Device(format!("enumerating render endpoints: {e}")))?;
+            let count = collection
+                .GetCount()
+                .map_err(|e| Error::Device(format!("counting render endpoints: {e}")))?;
+            let mut partial: Vec<(IMMDevice, String)> = Vec::new();
+            for i in 0..count {
+                let Ok(dev) = collection.Item(i) else {
+                    continue;
+                };
+                let found = friendly_name(&dev);
+                if found.eq_ignore_ascii_case(wanted) {
+                    return Ok(dev);
                 }
-                match partial.len() {
-                    1 => {
-                        let (dev, found) = partial.remove(0);
-                        debug!(device = wanted, matched = %found, "matched an audio device by substring");
-                        return Ok(dev);
-                    }
-                    0 => warn!(device = wanted, "no such audio device; using the default"),
-                    _ => {
-                        let candidates: Vec<&str> =
-                            partial.iter().map(|(_, n)| n.as_str()).collect();
-                        warn!(
-                            device = wanted,
-                            candidates = %candidates.join("; "),
-                            "several audio devices match; using the default. Write more of \
-                             one of the candidate names to pick it"
-                        );
-                    }
+                if contains_ignore_ascii_case(&found, wanted) {
+                    partial.push((dev, found));
+                }
+            }
+            match partial.len() {
+                1 => {
+                    let (dev, found) = partial.remove(0);
+                    debug!(
+                        device = wanted,
+                        matched = %found,
+                        "matched an audio device by substring"
+                    );
+                    return Ok(dev);
+                }
+                0 => warn!(device = wanted, "no such audio device; using the default"),
+                _ => {
+                    let candidates: Vec<&str> = partial.iter().map(|(_, n)| n.as_str()).collect();
+                    warn!(
+                        device = wanted,
+                        candidates = %candidates.join("; "),
+                        "several audio devices match; using the default. Write more of \
+                         one of the candidate names to pick it"
+                    );
                 }
             }
         }
