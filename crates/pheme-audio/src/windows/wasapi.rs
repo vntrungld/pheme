@@ -1,8 +1,9 @@
 //! WASAPI loopback capture and shared-mode render.
 //!
 //! Both directions run a dedicated thread that initialises COM on entry and uninitialises
-//! it on exit, and both report readiness through a `std::sync::mpsc` channel so `start`
-//! is synchronous.
+//! it on exit, and both report readiness through a `std::sync::mpsc` channel the moment
+//! their device starts — not once the session that follows ends — so `start` is
+//! synchronous with a bound, rather than blocking for as long as the device keeps running.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -11,7 +12,7 @@ use std::time::Duration;
 
 use tracing::{debug, warn};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::Media::Audio::{
     eConsole, eRender, IAudioCaptureClient, IAudioClient, IAudioRenderClient, IMMDevice,
     IMMDeviceEnumerator, MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT,
@@ -79,6 +80,9 @@ pub unsafe fn parse_format(p: *const WAVEFORMATEX) -> Result<FormatInfo> {
         return Err(Error::Device("the device reported no mix format".into()));
     }
     let w = &*p;
+    if w.nChannels == 0 {
+        return Err(Error::Device("the device reported zero channels".into()));
+    }
     const EXTENSIBLE: u16 = 0xFFFE;
     let (bits, float) = if w.wFormatTag == EXTENSIBLE {
         let ext = &*(p as *const WAVEFORMATEXTENSIBLE);
@@ -222,7 +226,8 @@ impl ToWire {
         silent: bool,
         sink: &mut rtrb::Producer<i16>,
     ) -> u64 {
-        let ch = self.fmt.channels.max(1);
+        // `parse_format` rejects zero channels, so `self.fmt.channels` is always >= 1.
+        let ch = self.fmt.channels;
         for f in 0..frames {
             for (c, plane) in self.planar.iter_mut().enumerate() {
                 let src_ch = if ch == 1 { 0 } else { c.min(ch - 1) };
@@ -407,7 +412,11 @@ fn capture_thread(
     };
     // SAFETY: a process-wide timer resolution request, released before the thread ends.
     unsafe { timeBeginPeriod(1) };
-    let mut first = true;
+    // Set by `capture_session` the moment `client.Start()` succeeds, i.e. the moment
+    // `ready` has already been (or is about to be) sent an `Ok`. Once true, a session
+    // ending is a reopen-worthy failure rather than a startup failure that must be
+    // reported back to `start()`.
+    let mut signaled = false;
     let mut dropped_total = 0u64;
     while !stop.load(Ordering::SeqCst) {
         match capture_session(
@@ -416,10 +425,12 @@ fn capture_thread(
             &stop,
             &name,
             &mut dropped_total,
+            &ready,
+            &mut signaled,
         ) {
             Ok(()) => {}
             Err(e) => {
-                if first {
+                if !signaled {
                     let _ = ready.send(Err(e));
                     // SAFETY: balances the timeBeginPeriod above.
                     unsafe { timeEndPeriod(1) };
@@ -429,10 +440,6 @@ fn capture_thread(
                 std::thread::sleep(Duration::from_millis(200));
             }
         }
-        if first {
-            let _ = ready.send(Ok(()));
-            first = false;
-        }
     }
     // SAFETY: balances the timeBeginPeriod above.
     unsafe { timeEndPeriod(1) };
@@ -441,12 +448,20 @@ fn capture_thread(
 
 /// One device's worth of capture. Returns when the device is invalidated, the default
 /// endpoint changes, or `stop` is set.
+///
+/// Sends `Ok(())` on `ready` and sets `*signaled = true` the instant `client.Start()`
+/// succeeds, so `start()` is unblocked as soon as the device is actually running rather
+/// than once this (normally long-lived) session eventually ends. A send after the
+/// receiver has already been dropped — a reopened session signalling again — is a no-op
+/// error `mpsc::Sender::send` reports and this discards.
 fn capture_session(
     device: Option<&str>,
     sink: &mut rtrb::Producer<i16>,
     stop: &AtomicBool,
     name: &Mutex<String>,
     dropped_total: &mut u64,
+    ready: &mpsc::Sender<Result<()>>,
+    signaled: &mut bool,
 ) -> Result<()> {
     // SAFETY: a standard WASAPI loopback session; all raw pointers stay in this block
     // and every buffer obtained with GetBuffer is released before the next call.
@@ -484,6 +499,10 @@ fn capture_session(
         client
             .Start()
             .map_err(|e| Error::Device(format!("starting loopback capture: {e}")))?;
+        // The device is now actually running: unblock `start()` here rather than only
+        // once this session (normally long-lived) eventually ends.
+        *signaled = true;
+        let _ = ready.send(Ok(()));
 
         let mut last_check = std::time::Instant::now();
         let result = loop {
@@ -652,7 +671,11 @@ fn render_thread(
             return;
         }
     };
-    let mut first = true;
+    // Set by `render_session` the moment `client.Start()` succeeds, i.e. the moment
+    // `ready` has already been (or is about to be) sent an `Ok`. Once true, a session
+    // ending is a reopen-worthy failure rather than a startup failure that must be
+    // reported back to `start()`.
+    let mut signaled = false;
     let mut underruns = 0u64;
     while !stop.load(Ordering::SeqCst) {
         match render_session(
@@ -662,10 +685,12 @@ fn render_thread(
             &name,
             &rate,
             &mut underruns,
+            &ready,
+            &mut signaled,
         ) {
             Ok(()) => {}
             Err(e) => {
-                if first {
+                if !signaled {
                     let _ = ready.send(Err(e));
                     return;
                 }
@@ -673,14 +698,16 @@ fn render_thread(
                 std::thread::sleep(Duration::from_millis(200));
             }
         }
-        if first {
-            let _ = ready.send(Ok(()));
-            first = false;
-        }
     }
     debug!(underruns, "WASAPI render thread finished");
 }
 
+/// Sends `Ok(())` on `ready` and sets `*signaled = true` the instant `client.Start()`
+/// succeeds, so `start()` is unblocked as soon as the device is actually running rather
+/// than once this (normally long-lived) session eventually ends. A send after the
+/// receiver has already been dropped — a reopened session signalling again — is a no-op
+/// error `mpsc::Sender::send` reports and this discards.
+#[allow(clippy::too_many_arguments)]
 fn render_session(
     device: Option<&str>,
     source: &mut rtrb::Consumer<i16>,
@@ -688,6 +715,8 @@ fn render_session(
     name: &Mutex<String>,
     rate: &AtomicU32,
     underruns: &mut u64,
+    ready: &mpsc::Sender<Result<()>>,
+    signaled: &mut bool,
 ) -> Result<()> {
     // SAFETY: a standard shared-mode, event-driven render session. Every GetBuffer is
     // matched by a ReleaseBuffer, and the event handle is closed on every exit path.
@@ -723,7 +752,9 @@ fn render_session(
 
         let event: HANDLE = CreateEventW(None, false, false, None)
             .map_err(|e| Error::Device(format!("creating the render event: {e}")))?;
-        let result = render_loop(&client, event, source, stop, fmt, underruns);
+        let result = render_loop(
+            &client, event, source, stop, fmt, underruns, ready, signaled,
+        );
         let _ = client.Stop();
         // SAFETY: `event` was created by `CreateEventW` just above and is not used
         // again after this call, on every exit path from this function.
@@ -733,8 +764,11 @@ fn render_session(
 }
 
 /// # Safety
-/// `client` must be initialised in event-driven shared mode and `event` must be the
-/// handle passed to `SetEventHandle`.
+/// `client` must already be initialised in event-driven shared mode (this function
+/// calls `Start`, not `Initialize`), and `event` must be a live, auto-reset event
+/// handle owned by the caller for the whole call — this function passes it to
+/// `SetEventHandle` itself but does not create or close it.
+#[allow(clippy::too_many_arguments)]
 unsafe fn render_loop(
     client: &IAudioClient,
     event: HANDLE,
@@ -742,6 +776,8 @@ unsafe fn render_loop(
     stop: &AtomicBool,
     fmt: FormatInfo,
     underruns: &mut u64,
+    ready: &mpsc::Sender<Result<()>>,
+    signaled: &mut bool,
 ) -> Result<()> {
     client
         .SetEventHandle(event)
@@ -752,16 +788,45 @@ unsafe fn render_loop(
     let buffer_frames = client
         .GetBufferSize()
         .map_err(|e| Error::Device(format!("GetBufferSize: {e}")))?;
+
+    let bytes_per_sample = if fmt.float { 4 } else { 2 };
+    // `parse_format` rejects zero channels, so `fmt.channels` is always >= 1.
+    let ch = fmt.channels;
+
+    // GetBuffer's contents are undefined until written, so without this the engine
+    // would play one period of whatever memory happened to be there before the first
+    // event lands. Pre-fill the whole buffer with silence before Start so that never
+    // happens.
+    let prefill = render
+        .GetBuffer(buffer_frames)
+        .map_err(|e| Error::Device(format!("prefill GetBuffer: {e}")))?;
+    std::ptr::write_bytes(prefill, 0, buffer_frames as usize * ch * bytes_per_sample);
+    render
+        .ReleaseBuffer(buffer_frames, 0)
+        .map_err(|e| Error::Device(format!("prefill ReleaseBuffer: {e}")))?;
+
     client
         .Start()
         .map_err(|e| Error::Device(format!("starting render: {e}")))?;
+    // The device is now actually running, with a full silent period already queued:
+    // unblock `start()` here rather than only once this session (normally long-lived)
+    // eventually ends.
+    *signaled = true;
+    let _ = ready.send(Ok(()));
 
-    let bytes_per_sample = if fmt.float { 4 } else { 2 };
-    let ch = fmt.channels.max(1);
     while !stop.load(Ordering::SeqCst) {
-        // A 200 ms wait rather than INFINITE so `stop` is noticed promptly.
-        if WaitForSingleObject(event, 200) != WAIT_OBJECT_0 {
+        // A 200 ms wait rather than INFINITE so `stop` is noticed promptly. WAIT_TIMEOUT
+        // just means no period elapsed yet; anything else (WAIT_FAILED for an invalid
+        // handle, WAIT_ABANDONED) is treated as a session failure so it reopens instead
+        // of spinning this loop hot without ever waiting.
+        let waited = WaitForSingleObject(event, 200);
+        if waited == WAIT_TIMEOUT {
             continue;
+        }
+        if waited != WAIT_OBJECT_0 {
+            return Err(Error::Device(format!(
+                "WaitForSingleObject on the render event failed: {waited:?}"
+            )));
         }
         let padding = match client.GetCurrentPadding() {
             Ok(p) => p,
