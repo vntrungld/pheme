@@ -124,7 +124,13 @@ pub fn detect_playback(device: Option<&str>) -> Result<Box<dyn AudioPlayback>> {
             device.map(str::to_string),
         )))
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    {
+        Ok(Box::new(windows::wasapi::WasapiPlayback::new(
+            device.map(str::to_string),
+        )))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         let _ = device;
         Err(Error::Unsupported(

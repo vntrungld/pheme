@@ -4,18 +4,20 @@
 //! it on exit, and both report readiness through a `std::sync::mpsc` channel so `start`
 //! is synchronous.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use tracing::{debug, warn};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio::{
-    eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDevice, IMMDeviceEnumerator,
-    MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_E_DEVICE_INVALIDATED,
-    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, DEVICE_STATE_ACTIVE, WAVEFORMATEX,
-    WAVEFORMATEXTENSIBLE, WAVE_FORMAT_PCM,
+    eConsole, eRender, IAudioCaptureClient, IAudioClient, IAudioRenderClient, IMMDevice,
+    IMMDeviceEnumerator, MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT,
+    AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+    AUDCLNT_STREAMFLAGS_LOOPBACK, DEVICE_STATE_ACTIVE, WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
+    WAVE_FORMAT_PCM,
 };
 use windows::Win32::Media::Multimedia::WAVE_FORMAT_IEEE_FLOAT;
 use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
@@ -23,8 +25,9 @@ use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
     COINIT_MULTITHREADED, STGM_READ,
 };
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
-use crate::{AudioCapture, Error, Result, CHANNELS, RATE};
+use crate::{AudioCapture, AudioPlayback, Error, Result, CHANNELS, RATE};
 
 /// Device buffer, in 100 ns units. 20 ms absorbs any slip in the 2.5 ms poll.
 const BUFFER_100NS: i64 = 200_000;
@@ -283,9 +286,10 @@ fn push_sample(sink: &mut rtrb::Producer<i16>, v: f32) -> u64 {
     u64::from(sink.push(s).is_err())
 }
 
-/// What `WasapiCapture` keeps once its device thread is up. Split out from the struct
-/// itself so a `start` that fails or times out simply never populates it, and `healthy`
-/// and `stop` have nothing to do when there is no running thread.
+/// What `WasapiCapture` and `WasapiPlayback` keep once their device thread is up. Split
+/// out from the struct itself so a `start` that fails or times out simply never
+/// populates it, and `healthy` and `stop` have nothing to do when there is no running
+/// thread.
 struct Running {
     stop: Arc<AtomicBool>,
     thread: JoinHandle<()>,
@@ -528,4 +532,277 @@ fn capture_session(
         let _ = client.Stop();
         result
     }
+}
+
+/// Plays the worker's samples on the server's speakers.
+///
+/// The ring it drains is already at the device's rate — the playback worker resamples —
+/// so this backend only converts stereo i16 into the device's sample format and channel
+/// count.
+pub struct WasapiPlayback {
+    device: Option<String>,
+    name: Arc<Mutex<String>>,
+    rate: Arc<AtomicU32>,
+    running: Option<Running>,
+}
+
+impl WasapiPlayback {
+    pub fn new(device: Option<String>) -> WasapiPlayback {
+        WasapiPlayback {
+            device,
+            name: Arc::new(Mutex::new("not started".into())),
+            rate: Arc::new(AtomicU32::new(RATE)),
+            running: None,
+        }
+    }
+}
+
+impl AudioPlayback for WasapiPlayback {
+    fn start(&mut self, source: rtrb::Consumer<i16>) -> Result<()> {
+        if self.running.is_some() {
+            return Ok(());
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
+        let device = self.device.clone();
+        let name = self.name.clone();
+        let rate = self.rate.clone();
+        let alive = Arc::new(AtomicBool::new(true));
+        let thread_alive = alive.clone();
+        let thread_stop = stop.clone();
+        let thread = std::thread::Builder::new()
+            .name("pheme-wasapi-play".into())
+            .spawn(move || {
+                render_thread(device, source, thread_stop, name, rate, ready_tx);
+                thread_alive.store(false, Ordering::SeqCst);
+            })
+            .map_err(|e| Error::Backend(format!("spawning the WASAPI thread: {e}")))?;
+        match ready_rx.recv_timeout(START_TIMEOUT) {
+            Ok(Ok(())) => {
+                self.running = Some(Running {
+                    stop,
+                    thread,
+                    alive,
+                });
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                let _ = thread.join();
+                Err(e)
+            }
+            Err(_) => {
+                // As in `WasapiCapture::start`: the thread may be stuck inside a
+                // blocking WASAPI/COM call, so joining here could block `start`
+                // forever. Ask it to stop and detach it instead of joining, and leave
+                // `self.running` as `None` so `healthy()` correctly reports false for
+                // an abandoned start.
+                stop.store(true, Ordering::SeqCst);
+                warn!(
+                    "WASAPI render thread did not report readiness within 2 s; abandoning it \
+                     detached rather than blocking `start` further"
+                );
+                drop(thread);
+                Err(Error::Backend(
+                    "the WASAPI render thread did not open a device within 2 s".into(),
+                ))
+            }
+        }
+    }
+
+    fn rate(&self) -> u32 {
+        self.rate.load(Ordering::SeqCst)
+    }
+
+    fn device_name(&self) -> String {
+        self.name.lock().unwrap().clone()
+    }
+
+    fn healthy(&self) -> bool {
+        self.running
+            .as_ref()
+            .is_some_and(|r| r.alive.load(Ordering::SeqCst))
+    }
+
+    fn stop(&mut self) {
+        if let Some(r) = self.running.take() {
+            r.stop.store(true, Ordering::SeqCst);
+            let _ = r.thread.join();
+        }
+    }
+}
+
+impl Drop for WasapiPlayback {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn render_thread(
+    device: Option<String>,
+    mut source: rtrb::Consumer<i16>,
+    stop: Arc<AtomicBool>,
+    name: Arc<Mutex<String>>,
+    rate: Arc<AtomicU32>,
+    ready: mpsc::Sender<Result<()>>,
+) {
+    let _com = match ComGuard::new() {
+        Ok(g) => g,
+        Err(e) => {
+            let _ = ready.send(Err(e));
+            return;
+        }
+    };
+    let mut first = true;
+    let mut underruns = 0u64;
+    while !stop.load(Ordering::SeqCst) {
+        match render_session(
+            device.as_deref(),
+            &mut source,
+            &stop,
+            &name,
+            &rate,
+            &mut underruns,
+        ) {
+            Ok(()) => {}
+            Err(e) => {
+                if first {
+                    let _ = ready.send(Err(e));
+                    return;
+                }
+                warn!("WASAPI render session ended: {e}; reopening");
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+        if first {
+            let _ = ready.send(Ok(()));
+            first = false;
+        }
+    }
+    debug!(underruns, "WASAPI render thread finished");
+}
+
+fn render_session(
+    device: Option<&str>,
+    source: &mut rtrb::Consumer<i16>,
+    stop: &AtomicBool,
+    name: &Mutex<String>,
+    rate: &AtomicU32,
+    underruns: &mut u64,
+) -> Result<()> {
+    // SAFETY: a standard shared-mode, event-driven render session. Every GetBuffer is
+    // matched by a ReleaseBuffer, and the event handle is closed on every exit path.
+    unsafe {
+        let dev = open_render_device(device)?;
+        *name.lock().unwrap() = friendly_name(&dev);
+        let client: IAudioClient = dev
+            .Activate(CLSCTX_ALL, None)
+            .map_err(|e| Error::Device(format!("activating the audio client: {e}")))?;
+        let mix = client
+            .GetMixFormat()
+            .map_err(|e| Error::Device(format!("reading the mix format: {e}")))?;
+        // `mix` is freed exactly once below, after its last use by either call, so that
+        // an unsupported format (an `Err` from `parse_format`) does not leak the
+        // allocation `GetMixFormat` made. `mix` is the device's own mix format, so
+        // `Initialize` accepting it does not depend on whether `parse_format` liked it.
+        let fmt = parse_format(mix);
+        // 0 asks for the device's default period, which is 10 ms in shared mode. A
+        // shorter buffer needs IAudioClient3, which is out of scope.
+        let init = client.Initialize(
+            AUDCLNT_SHAREMODE_SHARED,
+            AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+            0,
+            0,
+            mix,
+            None,
+        );
+        CoTaskMemFree(Some(mix as *const _));
+        let fmt = fmt?;
+        init.map_err(|e| Error::Device(format!("initialising render: {e}")))?;
+        rate.store(fmt.rate, Ordering::SeqCst);
+        debug!(?fmt, "WASAPI render format");
+
+        let event: HANDLE = CreateEventW(None, false, false, None)
+            .map_err(|e| Error::Device(format!("creating the render event: {e}")))?;
+        let result = render_loop(&client, event, source, stop, fmt, underruns);
+        let _ = client.Stop();
+        // SAFETY: `event` was created by `CreateEventW` just above and is not used
+        // again after this call, on every exit path from this function.
+        let _ = CloseHandle(event);
+        result
+    }
+}
+
+/// # Safety
+/// `client` must be initialised in event-driven shared mode and `event` must be the
+/// handle passed to `SetEventHandle`.
+unsafe fn render_loop(
+    client: &IAudioClient,
+    event: HANDLE,
+    source: &mut rtrb::Consumer<i16>,
+    stop: &AtomicBool,
+    fmt: FormatInfo,
+    underruns: &mut u64,
+) -> Result<()> {
+    client
+        .SetEventHandle(event)
+        .map_err(|e| Error::Device(format!("SetEventHandle: {e}")))?;
+    let render: IAudioRenderClient = client
+        .GetService()
+        .map_err(|e| Error::Device(format!("getting the render service: {e}")))?;
+    let buffer_frames = client
+        .GetBufferSize()
+        .map_err(|e| Error::Device(format!("GetBufferSize: {e}")))?;
+    client
+        .Start()
+        .map_err(|e| Error::Device(format!("starting render: {e}")))?;
+
+    let bytes_per_sample = if fmt.float { 4 } else { 2 };
+    let ch = fmt.channels.max(1);
+    while !stop.load(Ordering::SeqCst) {
+        // A 200 ms wait rather than INFINITE so `stop` is noticed promptly.
+        if WaitForSingleObject(event, 200) != WAIT_OBJECT_0 {
+            continue;
+        }
+        let padding = match client.GetCurrentPadding() {
+            Ok(p) => p,
+            Err(e) if e.code() == AUDCLNT_E_DEVICE_INVALIDATED => {
+                return Err(Error::Device("the render device was invalidated".into()))
+            }
+            Err(e) => return Err(Error::Device(format!("GetCurrentPadding: {e}"))),
+        };
+        let frames = buffer_frames.saturating_sub(padding);
+        if frames == 0 {
+            continue;
+        }
+        let data = match render.GetBuffer(frames) {
+            Ok(p) => p,
+            Err(e) if e.code() == AUDCLNT_E_DEVICE_INVALIDATED => {
+                return Err(Error::Device("the render device was invalidated".into()))
+            }
+            Err(e) => return Err(Error::Device(format!("render GetBuffer: {e}"))),
+        };
+        for f in 0..frames as usize {
+            // One stereo pair per device frame; a device with more channels gets
+            // silence in the rest, a mono device gets the left channel only.
+            let mut pair = [0i16; CHANNELS];
+            for p in pair.iter_mut() {
+                match source.pop() {
+                    Ok(s) => *p = s,
+                    Err(_) => *underruns += 1,
+                }
+            }
+            for c in 0..ch {
+                let v = pair.get(c).copied().unwrap_or(0);
+                let slot = data.add((f * ch + c) * bytes_per_sample);
+                if fmt.float {
+                    let x = f32::from(v) / 32_768.0;
+                    std::ptr::copy_nonoverlapping(x.to_le_bytes().as_ptr(), slot, 4);
+                } else {
+                    std::ptr::copy_nonoverlapping(v.to_le_bytes().as_ptr(), slot, 2);
+                }
+            }
+        }
+        let _ = render.ReleaseBuffer(frames, 0);
+    }
+    Ok(())
 }
