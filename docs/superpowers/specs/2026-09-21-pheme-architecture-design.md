@@ -129,7 +129,7 @@ name in the config).
 
 | | Linux (PipeWire) | Windows |
 |---|---|---|
-| Client speaker → server | `Pheme Speaker` node (`Audio/Sink`) | WASAPI loopback on the default output (user picks any device; audio still plays locally if the device has speakers). Optional: set `audio.capture_device` (e.g. `CABLE-A Output` with two cables) to make the client fully silent |
+| Client speaker → server | `Pheme Speaker` node (`Audio/Sink`) | WASAPI loopback on the default output (user picks any device; audio still plays locally if the device has speakers). Optional: set `audio.capture_device` to the cable's playback half (`CABLE Input`) to make the client fully silent — loopback attaches to a render endpoint, so naming the recording half matches nothing |
 | Server mic → client | `Pheme Mic` node (`Audio/Source`) | Render into `CABLE Input` (VB-CABLE, free); apps use `CABLE Output` as the mic |
 
 When the connection drops, the virtual devices stay (Speaker swallows

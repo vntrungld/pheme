@@ -389,9 +389,12 @@ AUDCLNT_STREAMFLAGS_LOOPBACK, ...)` with a 20 ms buffer, then
   without disturbing the session. The thread also re-reads the default
   endpoint every 2 s to catch silent switches.
 - `audio.capture_device` selects a specific render endpoint by friendly
-  name instead of the default. This is how a user with two VB-CABLE
-  devices makes the client completely silent locally; the default path
-  keeps the audio audible on the client as well.
+  name instead of the default. Because loopback capture attaches to a
+  **render** endpoint, the value names the playback half of the cable —
+  `CABLE Input` — not its recording half; naming `CABLE Output` matches
+  nothing and silently falls back to the default. This is how a user
+  makes the client completely silent locally; the default path keeps the
+  audio audible on the client as well.
 
 ### Server playback — render
 
@@ -416,7 +419,7 @@ New file `crates/pheme-app/src/audio.rs`.
 ```toml
 [audio]
 playback_device = "Speakers (Realtek)"   # optional, server side
-capture_device  = "CABLE-A Output"       # optional, Windows client only
+capture_device  = "CABLE Input"          # optional, Windows client only
 ```
 
 ```rust
