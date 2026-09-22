@@ -65,6 +65,21 @@ impl Default for HotkeysCfg {
     }
 }
 
+/// Optional device overrides. Audio itself is always on: the user controls it by
+/// choosing devices in the OS, which is why there is no enable flag here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct AudioCfg {
+    /// Server side: where received audio is played. `None` means the system default.
+    /// On Linux this is matched as a PipeWire `target.object`, i.e. a node name (see
+    /// `pactl list sinks short`); on Windows it is the endpoint's friendly name.
+    pub playback_device: Option<String>,
+    /// Client side, Windows only: which output endpoint to record with loopback.
+    /// `None` means the default output. Ignored on Linux, where applications select
+    /// the "Pheme Speaker" sink instead.
+    pub capture_device: Option<String>,
+}
+
 fn default_name() -> String {
     hostname().unwrap_or_else(|| "pheme".into())
 }
@@ -99,6 +114,8 @@ pub struct Config {
     #[serde(default)]
     pub hotkeys: HotkeysCfg,
     #[serde(default)]
+    pub audio: AudioCfg,
+    #[serde(default)]
     pub clients: Vec<ClientCfg>,
 }
 
@@ -110,6 +127,7 @@ impl Default for Config {
             listen: default_listen(),
             connect: None,
             hotkeys: HotkeysCfg::default(),
+            audio: AudioCfg::default(),
             clients: Vec::new(),
         }
     }
@@ -296,5 +314,48 @@ side = "top"
         );
         let c: Config = toml::from_str("role = \"client\"").unwrap();
         assert!(c.connect_addr(None).is_err(), "no host anywhere");
+    }
+
+    #[test]
+    fn an_absent_audio_section_means_defaults() {
+        let cfg: Config = toml::from_str("role = \"server\"").unwrap();
+        assert_eq!(cfg.audio, AudioCfg::default());
+        assert_eq!(cfg.audio.playback_device, None);
+        assert_eq!(cfg.audio.capture_device, None);
+    }
+
+    #[test]
+    fn audio_devices_are_read_from_the_config() {
+        let cfg: Config = toml::from_str(
+            r#"
+            role = "server"
+
+            [audio]
+            playback_device = "Speakers (Realtek)"
+            capture_device = "CABLE-A Output"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.audio.playback_device.as_deref(),
+            Some("Speakers (Realtek)")
+        );
+        assert_eq!(cfg.audio.capture_device.as_deref(), Some("CABLE-A Output"));
+    }
+
+    #[test]
+    fn a_partial_audio_section_is_valid() {
+        let cfg: Config = toml::from_str("[audio]\nplayback_device = \"x\"\n").unwrap();
+        assert_eq!(cfg.audio.playback_device.as_deref(), Some("x"));
+        assert_eq!(cfg.audio.capture_device, None);
+    }
+
+    #[test]
+    fn an_unknown_audio_key_is_rejected() {
+        let e = toml::from_str::<Config>("[audio]\nenabled = true\n").unwrap_err();
+        assert!(
+            e.to_string().contains("enabled"),
+            "audio is always on; there is no enable flag: {e}"
+        );
     }
 }
