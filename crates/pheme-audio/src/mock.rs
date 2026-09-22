@@ -214,6 +214,16 @@ impl MockPlaybackHandle {
         n
     }
 
+    /// Samples waiting in the ring for the device to consume.
+    ///
+    /// A test that wants to advance in lock step with the playback worker, rather than
+    /// on a wall clock, watches this: the worker tops the ring back up a whole frame at
+    /// a time, so the count strictly increases when it has popped one.
+    pub fn queued(&self) -> usize {
+        let st = self.state.lock().unwrap();
+        st.source.as_ref().map_or(0, |s| s.slots())
+    }
+
     /// Everything drained so far.
     pub fn recorded(&self) -> Vec<i16> {
         self.state.lock().unwrap().recorded.clone()

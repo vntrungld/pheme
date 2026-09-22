@@ -624,6 +624,24 @@ mod tests {
 
     use pheme_audio::mock::{MockPlayback, MockPlaybackHandle};
 
+    /// The tone's amplitude, measured robustly.
+    ///
+    /// Not the peak. The sinc resampler overshoots by up to about 16 % of the step whenever
+    /// the jitter buffer splices two frames that do not join smoothly — the end of the
+    /// stream, or a concealed frame after a lost one — and that ringing is correct
+    /// behaviour, inaudible next to the splice that caused it. A 440 Hz sine spends about
+    /// 9 % of its samples within 1 % of full scale, so the 99th percentile of |s| is the
+    /// amplitude, and a handful of ringing samples does not move it. A pipeline that
+    /// changed the level moves it by exactly the change.
+    fn tone_level(rec: &[i16]) -> i32 {
+        if rec.is_empty() {
+            return 0;
+        }
+        let mut mags: Vec<i32> = rec.iter().map(|s| i32::from(s.unsigned_abs())).collect();
+        mags.sort_unstable();
+        mags[(mags.len() * 99 / 100).min(mags.len() - 1)]
+    }
+
     /// One frame of a 440 Hz sine at about a third of full scale, continuing from frame
     /// index `i` so consecutive frames join smoothly.
     fn sine_frame(i: usize) -> Vec<i16> {
@@ -650,16 +668,27 @@ mod tests {
         assert_eq!(stats.dropped.load(Ordering::Relaxed), 1);
     }
 
-    /// Feeds `count` frames of a 440 Hz sine into `audio` at one 5 ms frame per
-    /// iteration while the device consumes exactly one 5 ms period per iteration, which
-    /// is what both of them do in real life. Returns the `depth_ms` seen on each
+    /// Feeds `count` frames of a 440 Hz sine into `audio`, one frame per device period,
+    /// in lock step with the playback worker. Returns the `depth_ms` seen on each
     /// iteration.
     ///
-    /// `MockPlaybackHandle::drain` would empty the ring however full it is, which lets
-    /// the worker run away from the sender: the jitter buffer's read cursor then
-    /// overtakes everything that arrives and the whole test passes on two frames of
-    /// audio plus concealment copies of them.
-    fn play_paced(audio: &AudioIn, handle: &MockPlaybackHandle, count: usize) -> Vec<u64> {
+    /// Two things this does not do. It does not use
+    /// `MockPlaybackHandle::drain`, which empties the ring however full it is and so
+    /// lets the worker run away from the sender: the jitter buffer's read cursor
+    /// overtakes everything that arrives and the test passes on two frames of audio
+    /// plus concealment copies of them. And it does not sleep. Pacing on a wall clock
+    /// looks realistic but is not reproducible — a thread the OS deschedules for a few
+    /// tens of milliseconds moves one side of the loop and not the other, and the two
+    /// stay apart afterwards because only the drift controller can close the gap, at
+    /// 0.1 %. Waiting for the worker to top the ring back up instead costs a stall
+    /// nothing but time, and keeps pops and pushes exactly one to one.
+    fn play_paced(
+        audio: &AudioIn,
+        handle: &MockPlaybackHandle,
+        rate: u32,
+        count: usize,
+    ) -> Vec<u64> {
+        let target = ring_target(rate);
         let mut packer = Packer::new();
         let mut depths = Vec::with_capacity(count);
         for i in 0..count {
@@ -669,42 +698,36 @@ mod tests {
             audio.push(f);
             handle.drain_frames(1);
             depths.push(audio.stats.depth_ms.load(Ordering::Relaxed));
-            std::thread::sleep(Duration::from_millis(5));
+            assert!(
+                wait_until(|| handle.queued() >= target, Duration::from_secs(5)),
+                "the playback worker never refilled the ring after frame {i}"
+            );
         }
         depths
     }
 
-    /// The frames the server may mishandle out of `count` before the test fails.
-    ///
-    /// Zero is what a quiet machine produces, but the pacing here is wall-clock: a
-    /// scheduling stall moves one side of the loop and not the other, and a handful of
-    /// frames slip. This budget is two orders of magnitude tighter than the behaviour it
-    /// replaced, where a mock with no device clock let the server discard 95 % of the
-    /// stream and every assertion in this file still passed.
-    fn slip_budget(count: usize) -> u64 {
-        count as u64 / 10
+    /// The ring fill the playback worker maintains: two output frames at the device's
+    /// rate. This mirrors `keep` in `pump_in`, and waiting for the ring to come back to
+    /// it after each device period is what keeps the test in lock step with the worker.
+    fn ring_target(rate: u32) -> usize {
+        (FRAME_SAMPLES as f64 * f64::from(rate) / f64::from(RATE)).ceil() as usize * CHANNELS * 2
     }
 
-    /// The jitter buffer must actually be holding audio, not running on empty.
+    /// The jitter buffer must be holding about its target, not running on empty.
     ///
-    /// `audio_depth_ms` is the depth sampled just after a pop, so the 2-frame target
-    /// reads as an alternation of 5 and 10 ms — a median of 10 on an idle machine, mean
-    /// about 9.4. Before the playback mock had a device clock this counter was pinned at
-    /// 0 for the whole run, which is what this pins down.
-    ///
-    /// Only the lower bound is asserted. A scheduling stall of a few tens of
-    /// milliseconds parks the buffer one to fifteen frames deeper, and the only thing
-    /// that brings it back is the drift controller's 0.1 % correction — about five
-    /// seconds per frame, far longer than this test runs. That is real behaviour, and
-    /// the ten-minute manual row A2 is what checks it.
+    /// `audio_depth_ms` is the depth sampled just after a pop, so a 2-frame target
+    /// reads as 5 or 10 rather than a flat 10 — the spec's 10-15 ms names the target,
+    /// not the depth. Before the playback mock had a device clock this counter was
+    /// pinned at 0 for the whole run, which is what the lower bound pins down; the
+    /// upper bound catches a buffer that is quietly filling up instead. The first 50
+    /// iterations are skipped while the buffer prefills.
     fn assert_the_buffer_holds_audio(depths: &[u64]) {
-        let mut steady = depths[50..].to_vec();
-        steady.sort_unstable();
-        let median = steady[steady.len() / 2];
+        let steady = &depths[50..];
         assert!(
-            median >= 5,
-            "median jitter depth {median} ms: the buffer is running empty, so the \
-             playback worker is outrunning the sender"
+            steady.iter().all(|d| (5..=15).contains(d)),
+            "jitter depth left the 5-15 ms band: min {:?} max {:?}",
+            steady.iter().min(),
+            steady.iter().max()
         );
     }
 
@@ -715,7 +738,7 @@ mod tests {
         let mut audio = AudioIn::spawn(PlaybackSource::Backend(Box::new(play)), stats.clone());
         assert!(wait_until(|| handle.started(), Duration::from_secs(2)));
 
-        let depths = play_paced(&audio, &handle, 200);
+        let depths = play_paced(&audio, &handle, 48_000, 200);
         // Read the counters before the tail: once the sender stops, the buffer runs dry
         // and conceals, which is correct but would mask frames lost mid-stream.
         let late = stats.late.load(Ordering::Relaxed);
@@ -727,23 +750,16 @@ mod tests {
         }
         audio.stop();
 
-        let budget = slip_budget(200);
-        assert!(
-            late <= budget,
-            "{late} frames arrived after their slot had passed"
-        );
-        assert!(
-            lost <= budget,
-            "{lost} frames never reached the jitter buffer"
-        );
-        assert!(underruns <= budget, "the buffer ran dry {underruns} times");
+        assert_eq!(late, 0, "frames arrived after their slot had passed");
+        assert_eq!(lost, 0, "frames never reached the jitter buffer");
+        assert_eq!(underruns, 0, "the playback buffer ran dry mid-stream");
         assert_the_buffer_holds_audio(&depths);
 
         let rec = handle.recorded();
-        let peak = rec.iter().map(|s| i32::from(s.abs())).max().unwrap_or(0);
+        let level = tone_level(&rec);
         assert!(
-            (peak - 10_000).abs() < 1_500,
-            "played peak {peak}, expected about 10000 — the pipeline changed the level"
+            (level - 10_000).abs() < 1_500,
+            "played level {level}, expected about 10000 — the pipeline changed the level"
         );
         // The device consumed one frame per iteration, so anything much below 200 means
         // the worker could not keep it fed.
@@ -763,7 +779,7 @@ mod tests {
         let mut audio = AudioIn::spawn(PlaybackSource::Backend(Box::new(play)), stats.clone());
         assert!(wait_until(|| handle.started(), Duration::from_secs(2)));
 
-        let depths = play_paced(&audio, &handle, 200);
+        let depths = play_paced(&audio, &handle, 44_100, 200);
         let late = stats.late.load(Ordering::Relaxed);
         let lost = stats.lost.load(Ordering::Relaxed);
         let underruns = stats.underruns.load(Ordering::Relaxed);
@@ -773,23 +789,16 @@ mod tests {
         }
         audio.stop();
 
-        let budget = slip_budget(200);
-        assert!(
-            late <= budget,
-            "{late} frames arrived after their slot had passed"
-        );
-        assert!(
-            lost <= budget,
-            "{lost} frames never reached the jitter buffer"
-        );
-        assert!(underruns <= budget, "the buffer ran dry {underruns} times");
+        assert_eq!(late, 0, "frames arrived after their slot had passed");
+        assert_eq!(lost, 0, "frames never reached the jitter buffer");
+        assert_eq!(underruns, 0, "the playback buffer ran dry mid-stream");
         assert_the_buffer_holds_audio(&depths);
 
         let rec = handle.recorded();
-        let peak = rec.iter().map(|s| i32::from(s.abs())).max().unwrap_or(0);
+        let level = tone_level(&rec);
         assert!(
-            (peak - 10_000).abs() < 1_500,
-            "resampling to 44.1 kHz changed the level: peak {peak}"
+            (level - 10_000).abs() < 1_500,
+            "resampling to 44.1 kHz changed the level: {level}"
         );
         // 220.5 device samples per channel per 5 ms period, 200 periods.
         assert!(

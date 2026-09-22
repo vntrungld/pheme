@@ -218,6 +218,24 @@ async fn drain_for(speaker: &MockPlaybackHandle, how_long: Duration) {
     speaker.drain_frames(1);
 }
 
+/// The tone's amplitude, measured robustly.
+///
+/// Not the peak. The sinc resampler overshoots by up to about 16 % of the step whenever
+/// the jitter buffer splices two frames that do not join smoothly — the end of the
+/// stream, or a concealed frame after a lost one — and that ringing is correct
+/// behaviour, inaudible next to the splice that caused it. A 440 Hz sine spends about
+/// 9 % of its samples within 1 % of full scale, so the 99th percentile of |s| is the
+/// amplitude, and a handful of ringing samples does not move it. A pipeline that
+/// changed the level moves it by exactly the change.
+fn tone_level(rec: &[i16]) -> i32 {
+    if rec.is_empty() {
+        return 0;
+    }
+    let mut mags: Vec<i32> = rec.iter().map(|s| i32::from(s.unsigned_abs())).collect();
+    mags.sort_unstable();
+    mags[(mags.len() * 99 / 100).min(mags.len() - 1)]
+}
+
 /// How many samples in `rec` clear a "clearly not silence" threshold. A peak-only check
 /// would be satisfied by silence plus a single stray sample, so the tests also check
 /// that a substantial run of samples carries the tone, not just its highest point.
@@ -285,10 +303,10 @@ async fn audio_flows_client_to_server() {
     );
 
     let rec = pair.speaker.recorded();
-    let peak = rec.iter().map(|s| i32::from(s.abs())).max().unwrap_or(0);
+    let level = tone_level(&rec);
     assert!(
-        (peak - 10_000).abs() < 1_500,
-        "the tone arrived at the wrong level: peak {peak} of an expected 10000"
+        (level - 10_000).abs() < 1_500,
+        "the tone arrived at the wrong level: {level} of an expected 10000"
     );
     // The device consumed one frame per iteration for 300 iterations, so anything much
     // below that means the worker could not keep it fed.
@@ -369,14 +387,10 @@ async fn silence_stops_the_traffic_and_resuming_restores_it() {
     );
     let rec = pair.speaker.recorded();
     let resumed = &rec[before_resume.min(rec.len())..];
-    let peak = resumed
-        .iter()
-        .map(|s| i32::from(s.abs()))
-        .max()
-        .unwrap_or(0);
+    let level = tone_level(resumed);
     assert!(
-        (peak - 10_000).abs() < 1_500,
-        "audio did not come back after the pause: peak {peak}"
+        (level - 10_000).abs() < 1_500,
+        "audio did not come back after the pause: level {level}"
     );
     assert!(
         loud_samples(resumed) > 30_000,
