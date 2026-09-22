@@ -1,6 +1,8 @@
 //! Client runtime: QUIC peer → core → injection, with automatic reconnect.
 
 use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context};
@@ -8,10 +10,11 @@ use pheme_core::{ClientCore, InjectAction};
 use pheme_input::InputInject;
 use pheme_net::pairing::client_pair;
 use pheme_net::{Endpoint, Identity, NetError, Peer, TrustStore};
-use pheme_proto::{Msg, Os, PROTOCOL_VERSION};
+use pheme_proto::{AudioParams, Msg, Os, PROTOCOL_VERSION};
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
+use crate::audio::{AudioOut, CaptureSource, OutCounters};
 use crate::backoff::Backoff;
 use crate::config::{config_dir, Config};
 
@@ -21,6 +24,8 @@ pub struct ClientDeps {
     pub endpoint: Endpoint,
     pub server_addr: SocketAddr,
     pub stats: bool,
+    /// Where the client's outgoing audio comes from.
+    pub audio: CaptureSource,
 }
 
 fn apply(inject: &mut dyn InputInject, a: InjectAction) {
@@ -81,7 +86,10 @@ pub async fn run_client(
         endpoint,
         server_addr,
         stats,
+        audio,
     } = deps;
+    let counters = Arc::new(OutCounters::default());
+    let mut audio = AudioOut::spawn(audio, counters.clone());
     let mut backoff = Backoff::new();
     loop {
         if *shutdown.borrow() {
@@ -94,7 +102,17 @@ pub async fn run_client(
         match connect {
             Ok(peer) => {
                 let started = Instant::now();
-                match session(peer, &name, inject.as_mut(), stats, &mut shutdown).await {
+                match session(
+                    peer,
+                    &name,
+                    inject.as_mut(),
+                    stats,
+                    &audio,
+                    &counters,
+                    &mut shutdown,
+                )
+                .await
+                {
                     Ok(()) => info!("disconnected from server"),
                     Err(e) => warn!("session ended: {e}"),
                 }
@@ -115,6 +133,7 @@ pub async fn run_client(
             _ = shutdown.changed() => break,
         }
     }
+    audio.stop();
     endpoint.close();
     Ok(())
 }
@@ -124,6 +143,8 @@ async fn session(
     name: &str,
     inject: &mut dyn InputInject,
     stats: bool,
+    audio: &AudioOut,
+    counters: &OutCounters,
     shutdown: &mut watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let screens = inject.screens();
@@ -150,9 +171,18 @@ async fn session(
         Some(Msg::HelloAck {
             version,
             name: server_name,
-            ..
+            audio: audio_params,
         }) if version == PROTOCOL_VERSION => {
             info!(server = %server_name, addr = %peer.remote_addr(), "connected");
+            if audio_params == AudioParams::DEFAULT {
+                audio.set_peer(Some(peer.sender()));
+            } else {
+                error!(
+                    ?audio_params,
+                    "the server wants an audio format pheme does not speak; \
+                     running this session without audio"
+                );
+            }
         }
         Some(Msg::Bye { reason }) => bail!("server refused: {reason}"),
         other => bail!("unexpected handshake reply: {other:?}"),
@@ -194,7 +224,17 @@ async fn session(
                 ping_seq += 1;
                 let _ = sender.send_control(&Msg::Ping(ping_seq)).await;
                 if stats && last_stats.elapsed() >= Duration::from_secs(1) {
-                    info!(rtt_us = peer.rtt().as_micros(), received, lost, active = core.active(), "stats/s");
+                    let sent = counters.sent.swap(0, Ordering::Relaxed);
+                    let suppressed = counters.suppressed.swap(0, Ordering::Relaxed);
+                    info!(
+                        rtt_us = peer.rtt().as_micros(),
+                        received,
+                        lost,
+                        audio_sent = sent,
+                        audio_suppressed = suppressed,
+                        active = core.active(),
+                        "stats/s"
+                    );
                     received = 0;
                     lost = 0;
                     last_stats = Instant::now();
@@ -205,6 +245,7 @@ async fn session(
     for a in core.on_disconnect() {
         apply(inject, a);
     }
+    audio.set_peer(None);
     peer.close("session ended");
     result
 }
@@ -234,6 +275,7 @@ pub async fn main(cfg: Config, host: Option<&str>, stats: bool) -> anyhow::Resul
             endpoint,
             server_addr,
             stats,
+            audio: CaptureSource::Detect(cfg.audio.capture_device.clone()),
         },
         shutdown_rx,
     )

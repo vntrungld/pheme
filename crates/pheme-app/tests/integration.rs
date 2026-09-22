@@ -79,6 +79,7 @@ fn spawn_pair() -> Pair {
             endpoint: client_ep,
             server_addr,
             stats: false,
+            audio: pheme_app::audio::CaptureSource::Disabled,
         },
         shutdown_rx,
     ));
@@ -158,6 +159,7 @@ async fn server_and_client_exchange_input_over_quic() {
             endpoint: client_ep,
             server_addr,
             stats: false,
+            audio: pheme_app::audio::CaptureSource::Disabled,
         },
         shutdown_rx.clone(),
     ));
@@ -285,6 +287,7 @@ async fn client_reconnects_after_server_restart() {
             endpoint: client_ep,
             server_addr,
             stats: false,
+            audio: pheme_app::audio::CaptureSource::Disabled,
         },
         shutdown_rx.clone(),
     ));
@@ -395,6 +398,7 @@ async fn server_releases_grab_when_client_vanishes_silently() {
             endpoint: client_ep,
             server_addr,
             stats: false,
+            audio: pheme_app::audio::CaptureSource::Disabled,
         },
         shutdown_rx.clone(),
     ));

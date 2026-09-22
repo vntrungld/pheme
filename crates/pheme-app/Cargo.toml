@@ -14,6 +14,8 @@ pheme-proto = { workspace = true }
 pheme-core = { workspace = true }
 pheme-input = { workspace = true }
 pheme-net = { workspace = true }
+pheme-audio = { workspace = true }
+rtrb = { workspace = true }
 tokio = { workspace = true }
 crossbeam-channel = { workspace = true }
 clap = { workspace = true }
