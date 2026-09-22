@@ -49,7 +49,9 @@ pub trait AudioCapture: Send {
     ///
     /// **Synchronous**: returns only once the device is running, or with the error that
     /// stopped it. The device callback must never block — when `sink` is full the
-    /// backend drops samples and counts the overrun.
+    /// backend drops the *newest* samples and counts the overrun. Newest, not oldest:
+    /// `rtrb::Producer::push` fails on a full ring, so the sample in hand is the one
+    /// that goes, and nothing already accepted is ever rewritten.
     fn start(&mut self, sink: rtrb::Producer<i16>) -> Result<()>;
     /// The device actually in use, for logs. Valid only after `start` succeeded.
     fn device_name(&self) -> String;

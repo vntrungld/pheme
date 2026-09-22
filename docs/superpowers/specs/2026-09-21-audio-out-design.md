@@ -57,9 +57,15 @@ Sub-project 2 uses `AudioStream::Playback` only (client → server).
   synchronises on it.
 - Audio travels in QUIC datagrams (`Msg::is_datagram()` already returns
   true for it). Lost frames are concealed, never retransmitted.
-- `AudioParams` is already exchanged in `Hello`/`HelloAck`. If the peer
-  reports anything other than 48000 / 2 / 240, log an error once and run
-  the session without audio; keyboard and mouse are unaffected.
+- `AudioParams` travels in `HelloAck` only. `Msg::Hello` has no `audio`
+  field, so the exchange is one-way: the client checks what the server
+  announces and, if it is anything other than 48000 / 2 / 240, logs an
+  error once and runs the session without audio; keyboard and mouse are
+  unaffected. The server cannot check what the client will send, and
+  simply plays whatever arrives. Nothing today can produce a mismatch —
+  both ends compile the same constants — but sub-project 3 adds a second
+  stream in the other direction and must decide deliberately whether to
+  add `audio` to `Hello` or to keep the asymmetry.
 
 ### Silence suppression
 
@@ -70,9 +76,21 @@ Audio is sent only while there is something to hear.
   silence from an idle OS mixer is exactly zero.
 - After 40 consecutive silent frames (200 ms), the client stops sending.
   `seq` keeps counting.
-- The first non-silent frame resumes sending immediately. The server sees
-  a gap larger than its reset threshold and re-prefills, which costs
-  10 ms at the exact moment audio starts — inaudible.
+- The first non-silent frame resumes sending immediately, and the server
+  picks it straight up without re-prefilling. `seq` counts audio time,
+  including suppressed frames, and the jitter buffer's read cursor
+  advances once per popped frame at the playback device's rate — the
+  same rate. After any length of pause the two are still within a frame
+  or two of each other, far inside the 200-frame reset gap, so the
+  resumed frame lands in its slot and plays with no gap at all. This is
+  better than an earlier draft of this spec described (it claimed a
+  reset and a 10 ms re-prefill), and it is load-bearing: it is why a
+  paused stream costs nothing to resume, and sub-project 3's mic
+  direction gets the same property for free only as long as both clocks
+  keep running. A client whose capture device stops producing frames
+  entirely — rather than producing silent ones — would let the server's
+  cursor walk past the sender's numbering, and everything that arrived
+  afterwards would count as `late` until the gap passed 200 frames.
 
 ## 3. `pheme-audio`
 
@@ -106,10 +124,12 @@ pub const FRAME_US: u64 = 5_000;
 pub trait AudioCapture: Send {
     /// Opens the device and starts writing interleaved i16 samples into `sink`.
     /// The device callback must never block: when `sink` is full the backend
-    /// drops the oldest samples and increments its overrun counter.
+    /// drops the newest samples and increments its overrun counter.
     fn start(&mut self, sink: rtrb::Producer<i16>) -> Result<(), Error>;
     /// Human-readable name of the device actually in use, for logs.
     fn device_name(&self) -> String;
+    /// False once the device thread has died. Defaults to true.
+    fn healthy(&self) -> bool;
     /// Idempotent. Must join the device thread before returning.
     fn stop(&mut self);
 }
@@ -123,6 +143,9 @@ pub trait AudioPlayback: Send {
     /// The playback worker uses it as the base resample ratio.
     fn rate(&self) -> u32;
     fn device_name(&self) -> String;
+    /// False once the device thread has died. Defaults to true.
+    fn healthy(&self) -> bool;
+    /// Idempotent. Must join the device thread before returning.
     fn stop(&mut self);
 }
 
@@ -143,6 +166,19 @@ the config; `None` means the platform default.
 Both traits follow the `pheme-input` contract: `start` is synchronous and
 returns only once the device is running or has failed, and `stop` joins
 the device thread before returning.
+
+`healthy` is the whole failure-detection contract after a successful
+`start`: nothing else tells `pheme-app` that a device has gone. A
+backend picks one recovery mechanism and sticks to it — reopen a new
+device internally and stay healthy, as WASAPI does for
+`AUDCLNT_E_DEVICE_INVALIDATED`, or end its thread and report false, as
+PipeWire does when the daemon goes away, and let the supervisor rebuild
+it. What a backend must never do is survive a change the rest of the
+pipeline was configured against — `rate()` above all — while still
+reporting true, because nothing downstream will ever hear about it.
+The full ring drops the *newest* samples, not the oldest:
+`rtrb::Producer::push` fails when the ring is full and the sample in
+hand is what goes.
 
 ### `frame.rs`
 
@@ -263,7 +299,11 @@ impl DriftController {
 - The ±0.1 % clamp is inaudible and drains one excess frame in about five
   seconds. `tick` takes no clock, so tests are deterministic.
 
-The ratio is handed to `rubato::SincFixedIn::set_resample_ratio_relative`.
+The ratio is handed to `rubato::SincFixedIn::set_resample_ratio(ratio,
+true)` — the absolute form, because `tick` returns
+`base_ratio * (1.0 + adj)`, which is exactly what the formula above
+computes. The `true` asks rubato to ramp to the new ratio rather than
+step to it.
 Resampler settings: `sinc_len = 64`, cubic interpolation, `f_cutoff` 0.95,
 oversampling 128 — about 0.7 ms of added delay and negligible CPU at
 48 kHz stereo.
@@ -272,9 +312,19 @@ oversampling 128 — about 0.7 ms of added delay and negligible CPU at
 
 `MockCapture` pushes a caller-supplied sample sequence into the sink at a
 caller-driven pace (a handle method, not a timer, so tests are
-deterministic). `MockPlayback` drains the source into a recorded `Vec<i16>`
-on demand and reports a configurable `rate()`. Both expose a handle for
+deterministic). `MockPlayback` drains the source into a recorded
+`Vec<i16>` and reports a configurable `rate()`. Both expose a handle for
 assertions, mirroring `pheme_input::mock`.
+
+`MockPlayback` has two drains, and the difference matters. `drain()`
+empties the ring however full it is; `drain_frames(n)` takes at most `n`
+wire frames' worth of *device* time, counted at the configured rate with
+the fraction carried across calls, which is what a sound card does.
+Anything testing the audio path uses `drain_frames`: with the unbounded
+drain the playback worker is free to pull frames as fast as it can
+resample them, the jitter buffer's read cursor overtakes everything that
+arrives, and the whole pipeline runs in permanent underrun while the
+tests still pass on a couple of frames and their concealment copies.
 
 ### Unit tests (CI, no sound card)
 
@@ -354,10 +404,22 @@ silence on underrun.
 
 ### Failure handling
 
-If the PipeWire daemon is missing, `detect_*` returns
-`Error::Unsupported("PipeWire is not available")`. If the daemon restarts
-mid-session the stream errors; the backend reports it and `pheme-app`
-rebuilds the whole backend on its five-second retry cycle.
+`detect_*` does not probe: on Linux it always returns a PipeWire backend
+and the failure surfaces as `Error::Device` from `start`. This is
+deliberate. `Error::Unsupported` means "never retry", and a PipeWire
+daemon that is not running when pheme starts but appears a minute later
+must still be picked up, so a machine with no PipeWire retries every
+five seconds forever. To keep that from filling the log with one warning
+every five seconds for the life of the process, the supervisors log the
+first failure of a kind at `warn!` and identical repeats at `debug!`,
+restoring the volume after a successful start. `Unsupported` remains for
+platforms that genuinely have no backend at all.
+
+If the daemon restarts mid-session, the core connection breaks (`-EPIPE`)
+and the stream goes `Unconnected`; both are caught, the PipeWire thread
+ends, `healthy()` goes false, and `pheme-app` rebuilds the whole backend
+on its five-second retry cycle. Measured on PipeWire 1.6.8: `healthy()`
+false about 2 ms after the restart, audio back 5.02 s later.
 
 ## 5. Windows backend — WASAPI (`windows/wasapi.rs`)
 
@@ -380,8 +442,11 @@ AUDCLNT_STREAMFLAGS_LOOPBACK, ...)` with a 20 ms buffer, then
   converts float32 → i16 with saturation. A device running at another
   rate is resampled to 48 kHz with `rubato` before entering the ring, so
   everything downstream stays at 48 kHz.
-- A mono device is duplicated to stereo; more than two channels are
-  downmixed to the first two.
+- A mono device is duplicated to stereo; a device with more than two
+  channels is truncated to its first two, not downmixed. Nothing is
+  summed, so audio panned entirely to a rear or centre channel is not
+  heard. Downmixing needs the channel mask, which this backend does not
+  read.
 - `AUDCLNT_BUFFERFLAGS_SILENT` is honoured by writing zeros, which the
   packer's exact-zero test then suppresses.
 - `AUDCLNT_E_DEVICE_INVALIDATED` (the user changed the default output or
@@ -441,7 +506,7 @@ enable flag by design.
 device callback --> rtrb ring (100 ms) --> packer thread --> PeerSender::send_datagram
 ```
 
-The packer thread wakes every 2.5 ms, and while at least
+The packer thread wakes every 2 ms, and while at least
 `FRAME_INTERLEAVED` samples are available it pops one frame, timestamps it
 from a monotonic frame counter (`seq * FRAME_US`, not wall time), runs
 `Packer::push`, and on `Some(frame)` sends `Msg::Audio` as a datagram.
@@ -455,7 +520,7 @@ is created once at startup and lives for the whole process.
 ### Server side (network → playback)
 
 ```
-net task --> crossbeam bounded(256) --> worker thread --> rubato --> rtrb (4 frames) --> device callback
+net task --> crossbeam bounded(256) --> worker thread --> rubato --> rtrb (16 frames) --> device callback
 ```
 
 - The tokio task that already drains `Peer::take_incoming()` matches
@@ -466,9 +531,12 @@ net task --> crossbeam bounded(256) --> worker thread --> rubato --> rtrb (4 fra
   resampler. Each iteration drains the channel into the buffer, then
   **while the ring holds fewer than 2 frames**: `pop()` → resample at
   `drift.tick(depth, target)` → push. It sleeps 2 ms between iterations.
-  The ring's capacity is 4 frames, but the worker deliberately keeps it
-  around one frame deep: a ring kept full would add its whole capacity to
-  the end-to-end latency for no benefit.
+  The ring's capacity is 16 wire frames' worth of samples, but the worker
+  deliberately keeps only about 1.5 frames in it on average: a ring kept
+  full would add its whole capacity to the end-to-end latency for no
+  benefit. The capacity is headroom, not latency — it is sized for the
+  worst plausible device rate, where one wire frame resamples to far more
+  than 480 samples, so the top-up loop always has room for a whole frame.
   It is not a real-time thread: the device callback always has a ring to
   drain from.
 - `Pop::Idle` writes a frame of silence so the ring never starves.
@@ -518,20 +586,38 @@ Every stage that holds audio, measured one way:
 | Stage | Linux → Linux | With Windows on either end |
 |---|---|---|
 | Capture device buffer / poll | 5 ms (`node.latency 240/48000`) | 2.5–5 ms (2.5 ms loopback poll) |
-| Packer thread wake-up | ≤ 2.5 ms | ≤ 2.5 ms |
+| Packer thread wake-up | ≤ 2 ms (`TICK`) | ≤ 2 ms |
 | Network (wired LAN) | ~0.5 ms | ~0.5 ms |
+| Playback worker wake-up | ≤ 2 ms (`TICK`) | ≤ 2 ms |
 | Jitter buffer target | 10 ms | 10 ms |
 | Resampler (sinc_len 64) | 0.7 ms | 0.7 ms |
-| Playback ring (kept ~1 frame) | ~5 ms | ~5 ms |
+| Playback ring (1–2 frames, ~1.5 average) | ~7.5 ms | ~7.5 ms |
 | Playback device buffer | 5 ms | 10 ms (WASAPI shared mode) |
-| **Total** | **~29 ms** | **~33 ms** |
+| **Total** | **~33 ms** | **~38 ms** |
+
+Two stages were previously wrong. The playback worker's own 2 ms sleep
+was missing from the table altogether — a frame that arrives just after
+the worker goes back to sleep waits for the next wake, exactly as it
+does on the capture side. And the playback ring was counted at one
+frame, but the worker tops it up to two, so it holds between one and two
+frames and averages about 1.5: 7.5 ms, not 5.
 
 The architecture document's 20–25 ms estimate assumed a 5 ms device
 buffer on both ends, which only holds on PipeWire. Shared-mode WASAPI
 costs roughly 10 ms that we cannot remove without `IAudioClient3`. The
-definition of done therefore uses 40 ms, which leaves headroom for the
-adaptive jitter target to reach 15–20 ms on a noisy link before the
-figure is missed.
+definition of done uses 40 ms, and the honest figures above leave 7 ms
+of headroom on the Linux pair and 2 ms with Windows — enough for the
+adaptive jitter target to rise a single frame, not the 15–20 ms an
+earlier draft of this section claimed.
+
+One driver behaviour would break it outright: `IAudioClient::GetBufferSize`
+returns **two** periods rather than one on some shared-mode drivers, and
+the engine then runs about 1.5 periods deep instead of one, adding
+roughly 5 ms and putting the Windows path near 43 ms — past the
+definition of done. Nothing in the code can tell which a given machine
+does, so row A7 is what settles it; if A7 misses, the fix is
+`IAudioClient3` low-latency mode, which this sub-project left out of
+scope.
 
 ## 8. Definition of done
 
@@ -539,7 +625,10 @@ figure is missed.
   Windows → Linux and Linux → Windows directions.
 - Measured end-to-end latency below 40 ms (test A7 below).
 - Ten minutes of continuous playback with `audio_underruns = 0` and
-  `audio_depth_ms` steady between 10 and 15.
+  `audio_depth_ms` level rather than climbing. The counter samples the
+  buffer just after a pop, so the 2-frame target reads as an alternation
+  of 5 and 10 on a clean link; 10–15 describes the *target*, which is
+  what rises a frame at a time on a lossy one.
 - Disconnecting and reconnecting the network resumes audio without a
   restart.
 - An audio backend failure leaves keyboard and mouse fully working.
@@ -565,6 +654,11 @@ Windows server.
 | A6 | Stop the server: the client still offers "Pheme Speaker", logs no errors and does not hang |
 | A7 | Latency: play a click track on the client, record both speakers with a phone, measure the offset — under 40 ms |
 
+`docs/testing.md` holds the live copy and has since grown rows A8
+(PipeWire daemon restart), A9 (audio audible within about 2 s of the
+connection coming up) and A10 (changing the Windows *server*'s default
+output mid-stream).
+
 ## 10. Known risks
 
 - **`pipewire-rs` needs bindgen.** Builds fail on systems without
@@ -581,6 +675,8 @@ Windows server.
 - **PipeWire daemon restarts** kill the stream mid-session; covered by the
   five-second retry cycle, but the virtual sink disappears briefly and
   applications may fall back to another device. Accepted for v1.
+  Measured on PipeWire 1.6.8: the backends report ill health about 2 ms
+  after the restart and are rebuilt 5.02 s later.
 - **Bandwidth.** Uncompressed stereo is 1.54 Mbit/s, trivial on wired LAN
   but noticeable on a weak Wi-Fi link shared with other traffic. Silence
   suppression removes it while nothing is playing. A codec stays out of
