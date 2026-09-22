@@ -7,6 +7,7 @@
 pub mod drift;
 pub mod frame;
 pub mod jitter;
+pub mod mock;
 pub mod pack;
 
 /// Sample rate on the wire, in hertz.
@@ -36,3 +37,64 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Reads audio out of the machine: the virtual sink on Linux, loopback of the default
+/// output on Windows.
+pub trait AudioCapture: Send {
+    /// Opens the device and starts writing interleaved i16 samples into `sink`.
+    ///
+    /// **Synchronous**: returns only once the device is running, or with the error that
+    /// stopped it. The device callback must never block — when `sink` is full the
+    /// backend drops samples and counts the overrun.
+    fn start(&mut self, sink: rtrb::Producer<i16>) -> Result<()>;
+    /// The device actually in use, for logs. Valid only after `start` succeeded.
+    fn device_name(&self) -> String;
+    /// False once the backend's device thread has died — a PipeWire daemon restart, a
+    /// device that cannot be reopened. The supervisor polls this and rebuilds the
+    /// backend, which is the only way a failure after a successful `start` is noticed.
+    /// Backends with no thread to lose keep the default.
+    fn healthy(&self) -> bool {
+        true
+    }
+    /// Idempotent. Joins the device thread before returning.
+    fn stop(&mut self);
+}
+
+/// Plays audio out of the machine's speakers.
+pub trait AudioPlayback: Send {
+    /// Opens the device and starts draining interleaved i16 samples from `source`.
+    ///
+    /// **Synchronous**, same contract as `AudioCapture::start`. On underrun the backend
+    /// writes silence rather than blocking.
+    fn start(&mut self, source: rtrb::Consumer<i16>) -> Result<()>;
+    /// The device's own sample rate, valid only after `start` succeeded. The playback
+    /// worker uses `rate() / RATE` as the base resample ratio.
+    fn rate(&self) -> u32;
+    /// The device actually in use, for logs. Valid only after `start` succeeded.
+    fn device_name(&self) -> String;
+    /// False once the backend's device thread has died. Same contract as
+    /// `AudioCapture::healthy`.
+    fn healthy(&self) -> bool {
+        true
+    }
+    /// Idempotent. Joins the device thread before returning.
+    fn stop(&mut self);
+}
+
+/// Picks the capture backend for this OS. `device` names a specific device; `None` means
+/// the platform default.
+pub fn detect_capture(device: Option<&str>) -> Result<Box<dyn AudioCapture>> {
+    let _ = device;
+    Err(Error::Unsupported(
+        "no audio capture backend for this platform".into(),
+    ))
+}
+
+/// Picks the playback backend for this OS. `device` names a specific device; `None`
+/// means the platform default.
+pub fn detect_playback(device: Option<&str>) -> Result<Box<dyn AudioPlayback>> {
+    let _ = device;
+    Err(Error::Unsupported(
+        "no audio playback backend for this platform".into(),
+    ))
+}
