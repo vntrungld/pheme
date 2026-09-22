@@ -5,6 +5,7 @@
 //! 240 samples per channel per frame (5 ms, 960 bytes on the wire).
 
 pub mod frame;
+pub mod jitter;
 pub mod pack;
 
 /// Sample rate on the wire, in hertz.
