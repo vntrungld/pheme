@@ -290,6 +290,7 @@ async fn handle_peer(
         name,
         os,
         screens,
+        audio: _,
     }) = hello
     else {
         peer.close("expected Hello");

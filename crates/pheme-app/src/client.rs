@@ -161,6 +161,7 @@ async fn session(
             name: name.to_string(),
             os: Os::current(),
             screens: screens.clone(),
+            audio: AudioParams::DEFAULT,
         })
         .await?;
     let ack = tokio::select! {

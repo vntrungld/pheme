@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Os {
@@ -114,6 +114,10 @@ pub enum Msg {
         name: String,
         os: Os,
         screens: Vec<ScreenInfo>,
+        /// What this peer speaks. `HelloAck` carries the server's; this carries the
+        /// client's, so each end can refuse a format it does not understand instead of
+        /// transmitting into one.
+        audio: AudioParams,
     },
     HelloAck {
         version: u16,
@@ -122,6 +126,15 @@ pub enum Msg {
     },
     Bye {
         reason: String,
+    },
+    /// Client → server: whether anything on the client is recording from its virtual
+    /// microphone. Sent once after the handshake and again on every change.
+    ///
+    /// Control stream, not a datagram: a lost or reordered demand signal would leave the
+    /// microphone stranded open or stranded shut, and it is sent a handful of times per
+    /// session.
+    MicWanted {
+        wanted: bool,
     },
     Ping(u64),
     Pong(u64),
@@ -224,6 +237,7 @@ mod tests {
                 h: 1440,
                 primary: true,
             }],
+            audio: AudioParams::DEFAULT,
         });
         roundtrip(Msg::HelloAck {
             version: 1,
@@ -353,5 +367,61 @@ mod tests {
     #[test]
     fn decode_garbage_is_an_error() {
         assert!(decode(&[0xFF, 0xFF, 0xFF]).is_err());
+    }
+
+    #[test]
+    fn mic_wanted_round_trips_and_is_not_a_datagram() {
+        let m = Msg::MicWanted { wanted: true };
+        let mut buf = Vec::new();
+        encode(&m, &mut buf);
+        assert_eq!(decode(&buf).unwrap(), m);
+        assert!(
+            !m.is_datagram(),
+            "a lost demand signal would strand the microphone open or shut"
+        );
+    }
+
+    #[test]
+    fn hello_carries_the_audio_parameters() {
+        let m = Msg::Hello {
+            version: PROTOCOL_VERSION,
+            name: "laptop".into(),
+            os: Os::Linux,
+            screens: Vec::new(),
+            audio: AudioParams::DEFAULT,
+        };
+        let mut buf = Vec::new();
+        encode(&m, &mut buf);
+        match decode(&buf).unwrap() {
+            Msg::Hello { audio, .. } => assert_eq!(audio, AudioParams::DEFAULT),
+            other => panic!("expected Hello, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_protocol_version_is_two() {
+        // Bumped when Hello gained `audio`. Note that a version-1 Hello now fails to
+        // decode before its `version` field can be read, so a mismatched peer reports a
+        // malformed handshake rather than a version mismatch.
+        assert_eq!(PROTOCOL_VERSION, 2);
+    }
+
+    #[test]
+    fn a_mic_audio_frame_round_trips_like_a_playback_one() {
+        let m = Msg::Audio {
+            stream: AudioStream::Mic,
+            seq: 7,
+            ts_us: 35_000,
+            samples: vec![0u8; 960],
+        };
+        let mut buf = Vec::new();
+        encode(&m, &mut buf);
+        assert_eq!(decode(&buf).unwrap(), m);
+        assert!(m.is_datagram());
+        assert!(
+            buf.len() <= 1200,
+            "a frame must fit the datagram budget: {} bytes",
+            buf.len()
+        );
     }
 }

@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use pheme_net::{Endpoint, Identity, Incoming, NetError, TrustStore};
-use pheme_proto::{Msg, Os};
+use pheme_proto::{AudioParams, Msg, Os, PROTOCOL_VERSION};
 
 struct Side {
     id: Identity,
@@ -28,10 +28,11 @@ fn trust_each_other(a: &Side, b: &Side) {
 
 fn hello(name: &str) -> Msg {
     Msg::Hello {
-        version: 1,
+        version: PROTOCOL_VERSION,
         name: name.into(),
         os: Os::Linux,
         screens: vec![],
+        audio: AudioParams::DEFAULT,
     }
 }
 
