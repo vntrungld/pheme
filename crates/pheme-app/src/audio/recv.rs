@@ -363,7 +363,7 @@ fn publish(stats: &InStats, s: JitterStats) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audio::wait_until;
+    use crate::audio::{wait_until, SETTLE};
     use pheme_audio::mock::{MockPlayback, MockPlaybackHandle};
     use pheme_audio::pack::Packer;
     use pheme_audio::FRAME_US;
@@ -444,7 +444,7 @@ mod tests {
             handle.drain_frames(1);
             depths.push(audio.stats.depth_ms.load(Ordering::Relaxed));
             assert!(
-                wait_until(|| handle.queued() >= target, Duration::from_secs(5)),
+                wait_until(|| handle.queued() >= target, SETTLE),
                 "the playback worker never refilled the ring after frame {i}"
             );
         }
@@ -489,7 +489,7 @@ mod tests {
         let (play, handle) = MockPlayback::new(48_000);
         let stats = Arc::new(InStats::default());
         let mut audio = RecvSide::spawn(PlaybackSource::Backend(Box::new(play)), stats.clone());
-        assert!(wait_until(|| handle.started(), Duration::from_secs(2)));
+        assert!(wait_until(|| handle.started(), SETTLE));
 
         let depths = play_paced(&audio, &handle, 48_000, 200);
         // Read the counters before the tail: once the sender stops, the buffer runs dry
@@ -541,7 +541,7 @@ mod tests {
         let (play, handle) = MockPlayback::new(44_100);
         let stats = Arc::new(InStats::default());
         let mut audio = RecvSide::spawn(PlaybackSource::Backend(Box::new(play)), stats.clone());
-        assert!(wait_until(|| handle.started(), Duration::from_secs(2)));
+        assert!(wait_until(|| handle.started(), SETTLE));
 
         let depths = play_paced(&audio, &handle, 44_100, 200);
         let late = stats.late.load(Ordering::Relaxed);
@@ -611,7 +611,7 @@ mod tests {
         let (play, handle) = MockPlayback::new(48_000);
         let stats = Arc::new(InStats::default());
         let mut audio = RecvSide::spawn(PlaybackSource::Backend(Box::new(play)), stats.clone());
-        assert!(wait_until(|| handle.started(), Duration::from_secs(2)));
+        assert!(wait_until(|| handle.started(), SETTLE));
 
         let mut packer = Packer::new();
         for i in 0..200 {
@@ -620,10 +620,7 @@ mod tests {
                 .expect("a sine is never silent");
             audio.push(f);
             handle.drain_frames(1);
-            assert!(wait_until(
-                || handle.queued() >= FRAME_INTERLEAVED,
-                Duration::from_secs(5)
-            ));
+            assert!(wait_until(|| handle.queued() >= FRAME_INTERLEAVED, SETTLE));
         }
         audio.stop();
 
@@ -678,10 +675,10 @@ mod tests {
             stats,
             FAST_LINGER,
         );
-        assert!(wait_until(|| handle.started(), Duration::from_secs(2)));
+        assert!(wait_until(|| handle.started(), SETTLE));
         let w = audio.wanted();
         assert!(
-            wait_until(|| *w.borrow(), Duration::from_secs(2)),
+            wait_until(|| *w.borrow(), SETTLE),
             "Unknown must mean open, or a backend that cannot detect consumers silently \
              kills the feature"
         );
@@ -699,7 +696,7 @@ mod tests {
             FAST_LINGER,
         );
         let w = audio.wanted();
-        assert!(wait_until(|| *w.borrow(), Duration::from_secs(2)));
+        assert!(wait_until(|| *w.borrow(), SETTLE));
 
         handle.set_demand(Demand::Idle);
         std::thread::sleep(Duration::from_millis(40));
@@ -708,7 +705,7 @@ mod tests {
             "the gate must not close on the first idle poll: applications probe devices"
         );
         assert!(
-            wait_until(|| !*w.borrow(), Duration::from_secs(2)),
+            wait_until(|| !*w.borrow(), SETTLE),
             "but it must close once the linger has passed"
         );
         audio.stop();
@@ -725,7 +722,7 @@ mod tests {
             Duration::from_millis(400),
         );
         let w = audio.wanted();
-        assert!(wait_until(|| *w.borrow(), Duration::from_secs(2)));
+        assert!(wait_until(|| *w.borrow(), SETTLE));
 
         for _ in 0..5 {
             handle.set_demand(Demand::Idle);
@@ -746,7 +743,7 @@ mod tests {
             stats.clone(),
             FAST_LINGER,
         );
-        assert!(wait_until(|| handle.started(), Duration::from_secs(2)));
+        assert!(wait_until(|| handle.started(), SETTLE));
 
         let mut packer = Packer::new();
         for i in 0..20 {
@@ -757,15 +754,12 @@ mod tests {
         }
         assert!(wait_until(
             || stats.depth_ms.load(Ordering::Relaxed) > 0,
-            Duration::from_secs(2)
+            SETTLE
         ));
         let before = stats.resets.load(Ordering::Relaxed);
         audio.reset();
         assert!(
-            wait_until(
-                || stats.resets.load(Ordering::Relaxed) > before,
-                Duration::from_secs(2)
-            ),
+            wait_until(|| stats.resets.load(Ordering::Relaxed) > before, SETTLE),
             "the worker must act on the reset"
         );
         audio.stop();

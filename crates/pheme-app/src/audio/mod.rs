@@ -96,6 +96,17 @@ pub(crate) fn nap(total: Duration, stop: &AtomicBool) -> bool {
     !stop.load(Ordering::SeqCst)
 }
 
+/// How long a test waits for a background worker to reach a state.
+///
+/// Generous on purpose. These tests wait on worker threads that tick every `TICK`, and
+/// the budget has to survive a saturated machine — a parallel suite plus another build,
+/// or a CI runner with two cores. A test whose condition is met promptly still finishes
+/// promptly; the budget only costs wall-clock on the runs that were going to fail.
+/// Measured before this was raised: `a_reset_empties_the_buffer` failed 2 times in 12
+/// full-suite runs under external load, and never in 30 isolated ones.
+#[cfg(test)]
+pub(crate) const SETTLE: Duration = Duration::from_secs(10);
+
 /// Polls `f` until it returns true or `timeout` elapses, sleeping briefly between tries.
 /// Shared by `send.rs`'s and `recv.rs`'s tests, which both wait on a supervisor thread.
 #[cfg(test)]

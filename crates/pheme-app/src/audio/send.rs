@@ -273,7 +273,7 @@ fn pump_out(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audio::wait_until;
+    use crate::audio::{wait_until, SETTLE};
     use pheme_audio::mock::MockCapture;
     use std::time::Duration;
 
@@ -324,7 +324,7 @@ mod tests {
             AudioStream::Playback,
             counters.clone(),
         );
-        assert!(wait_until(|| handle.started(), Duration::from_secs(2)));
+        assert!(wait_until(|| handle.started(), SETTLE));
 
         // Twenty bursts of 100 frames. The ring holds 200 frames, so anything that does
         // not drain continuously overruns.
@@ -347,7 +347,7 @@ mod tests {
             AudioStream::Playback,
             counters.clone(),
         );
-        assert!(wait_until(|| handle.started(), Duration::from_secs(2)));
+        assert!(wait_until(|| handle.started(), SETTLE));
 
         for _ in 0..200 {
             handle.push(&silence());
@@ -356,7 +356,7 @@ mod tests {
         assert!(
             wait_until(
                 || counters.suppressed.load(Ordering::Relaxed) >= 100,
-                Duration::from_secs(2)
+                SETTLE
             ),
             "expected most of 200 silent frames to be suppressed, got {}",
             counters.suppressed.load(Ordering::Relaxed)
@@ -393,17 +393,17 @@ mod tests {
             AudioStream::Mic,
             counters,
         );
-        assert!(wait_until(|| handle.started(), Duration::from_secs(2)));
+        assert!(wait_until(|| handle.started(), SETTLE));
 
         audio.set_wanted(false);
         assert!(
-            wait_until(|| !handle.started(), Duration::from_secs(2)),
+            wait_until(|| !handle.started(), SETTLE),
             "the device must actually close, not merely stop sending: an open microphone \
              keeps its indicator lit"
         );
 
         audio.set_wanted(true);
-        assert!(wait_until(|| handle.started(), Duration::from_secs(2)));
+        assert!(wait_until(|| handle.started(), SETTLE));
         assert_eq!(handle.start_count(), 2, "it was really reopened");
         audio.stop();
     }
@@ -418,7 +418,7 @@ mod tests {
             AudioStream::Playback,
             counters,
         );
-        assert!(wait_until(|| handle.started(), Duration::from_secs(2)));
+        assert!(wait_until(|| handle.started(), SETTLE));
         std::thread::sleep(Duration::from_millis(50));
         assert!(handle.started());
         assert_eq!(handle.start_count(), 1);
@@ -437,18 +437,18 @@ mod tests {
             AudioStream::Mic,
             counters,
         );
-        assert!(wait_until(|| handle.started(), Duration::from_secs(2)));
+        assert!(wait_until(|| handle.started(), SETTLE));
         for _ in 0..20 {
             audio.set_wanted(false);
             audio.set_wanted(true);
         }
         assert!(
-            wait_until(|| handle.started(), Duration::from_secs(3)),
+            wait_until(|| handle.started(), SETTLE),
             "the gate ended on `true`, so the device must end open"
         );
         audio.set_wanted(false);
         assert!(
-            wait_until(|| !handle.started(), Duration::from_secs(3)),
+            wait_until(|| !handle.started(), SETTLE),
             "the gate ended on `false`, so the device must end closed"
         );
         audio.stop();
@@ -467,7 +467,7 @@ mod tests {
             counters,
         );
         assert!(
-            wait_until(|| handle.started(), Duration::from_secs(8)),
+            wait_until(|| handle.started(), SETTLE),
             "the retry cycle must bring the microphone up after a failed start"
         );
         audio.stop();
