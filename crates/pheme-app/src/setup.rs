@@ -24,11 +24,11 @@ pub fn run() -> anyhow::Result<()> {
         println!("Run the following as root (or re-run `sudo pheme setup`):");
         println!();
         println!("  cat > {} <<'EOF'\n{}EOF", rule_path.display(), UDEV_RULE);
-        println!("  udevadm control --reload && udevadm trigger --name-match=uinput");
         println!(
             "  modprobe uinput && echo uinput > {}",
             modules_path.display()
         );
+        println!("  udevadm control --reload && udevadm trigger --name-match=uinput");
         println!("  usermod -aG input {user}");
         println!();
         println!("Then log out and back in so the group change applies.");
@@ -38,6 +38,12 @@ pub fn run() -> anyhow::Result<()> {
         .with_context(|| format!("writing {}", rule_path.display()))?;
     println!("Wrote {}", rule_path.display());
     let mut ok = true;
+    // Load the module before touching udev. `udevadm trigger --name-match=uinput`
+    // resolves the name through sysfs, so on a machine where uinput has never been
+    // loaded there is no /sys/devices/virtual/misc/uinput to match and the trigger
+    // fails with "Failed to open the device 'uinput': Invalid argument" — which is
+    // exactly the machine this command exists to set up.
+    ok &= run_step("modprobe uinput", Command::new("modprobe").arg("uinput"));
     ok &= run_step(
         "udevadm control --reload",
         Command::new("udevadm").args(["control", "--reload"]),
@@ -46,7 +52,6 @@ pub fn run() -> anyhow::Result<()> {
         "udevadm trigger --name-match=uinput",
         Command::new("udevadm").args(["trigger", "--name-match=uinput"]),
     );
-    ok &= run_step("modprobe uinput", Command::new("modprobe").arg("uinput"));
     match std::fs::write(modules_path, MODULES_LOAD) {
         Ok(()) => println!("Wrote {} (uinput loads at boot)", modules_path.display()),
         Err(e) => {
