@@ -1,13 +1,13 @@
 //! WASAPI loopback capture and shared-mode render.
 //!
 //! Both directions run a dedicated thread that initialises COM on entry and uninitialises
-//! it on exit, and both report readiness through a `std::sync::mpsc` channel the moment
-//! their device starts — not once the session that follows ends — so `start` is
-//! synchronous with a bound, rather than blocking for as long as the device keeps running.
+//! it on exit, and both report readiness through `Ready` the moment their device starts —
+//! not once the session that follows ends — so `start` is synchronous with a bound,
+//! rather than blocking for as long as the device keeps running. The bounded wait, the
+//! liveness tracking and the idempotent stop all live in `crate::device::DeviceThread`.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
-use std::thread::JoinHandle;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tracing::{debug, warn};
@@ -28,6 +28,7 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
+use crate::device::{DeviceThread, Ready};
 use crate::{AudioCapture, AudioPlayback, Error, Result, CHANNELS, RATE};
 
 /// Device buffer, in 100 ns units. 20 ms absorbs any slip in the 2.5 ms poll.
@@ -336,35 +337,11 @@ fn push_sample(sink: &mut rtrb::Producer<i16>, v: f32) -> u64 {
     u64::from(sink.push(s).is_err())
 }
 
-/// What `WasapiCapture` and `WasapiPlayback` keep once their device thread is up. Split
-/// out from the struct itself so a `start` that fails or times out simply never
-/// populates it, and `healthy` and `stop` have nothing to do when there is no running
-/// thread.
-struct Running {
-    stop: Arc<AtomicBool>,
-    thread: JoinHandle<()>,
-    /// Cleared by `AliveGuard` when the device thread's stack is torn down, so the
-    /// supervisor can rebuild.
-    alive: Arc<AtomicBool>,
-}
-
-/// Clears a backend's `alive` flag when the device thread's stack unwinds or returns.
-///
-/// A guard rather than a statement after the call, so a panic inside a device thread
-/// also flips `healthy()` to false. Matches `linux_pipewire::AliveGuard`.
-struct AliveGuard(Arc<AtomicBool>);
-
-impl Drop for AliveGuard {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
-    }
-}
-
 /// Records what the default (or configured) output endpoint is playing.
 pub struct WasapiCapture {
     device: Option<String>,
     name: Arc<Mutex<String>>,
-    running: Option<Running>,
+    thread: DeviceThread,
 }
 
 impl WasapiCapture {
@@ -372,62 +349,23 @@ impl WasapiCapture {
         WasapiCapture {
             device,
             name: Arc::new(Mutex::new("not started".into())),
-            running: None,
+            thread: DeviceThread::new(),
         }
     }
 }
 
 impl AudioCapture for WasapiCapture {
     fn start(&mut self, sink: rtrb::Producer<i16>) -> Result<()> {
-        if self.running.is_some() {
-            return Ok(());
-        }
         let stop = Arc::new(AtomicBool::new(false));
-        let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
+        let thread_stop = stop.clone();
         let device = self.device.clone();
         let name = self.name.clone();
-        let alive = Arc::new(AtomicBool::new(true));
-        let thread_alive = alive.clone();
-        let thread_stop = stop.clone();
-        let thread = std::thread::Builder::new()
-            .name("pheme-wasapi-cap".into())
-            .spawn(move || {
-                let _alive = AliveGuard(thread_alive);
-                capture_thread(device, sink, thread_stop, name, ready_tx);
-            })
-            .map_err(|e| Error::Backend(format!("spawning the WASAPI thread: {e}")))?;
-        match ready_rx.recv_timeout(START_TIMEOUT) {
-            Ok(Ok(())) => {
-                self.running = Some(Running {
-                    stop,
-                    thread,
-                    alive,
-                });
-                Ok(())
-            }
-            Ok(Err(e)) => {
-                let _ = thread.join();
-                Err(e)
-            }
-            Err(_) => {
-                // The thread may be stuck inside a blocking WASAPI/COM call (a
-                // misbehaving driver never returning from `IAudioClient::Initialize`,
-                // say), so joining here could block `start` forever — exactly the
-                // unbounded wait its contract forbids. Ask it to stop and then
-                // deliberately do not join: dropping the `JoinHandle` detaches the
-                // thread, so it runs to completion (or hangs) on its own instead of
-                // `start` hanging with it.
-                stop.store(true, Ordering::SeqCst);
-                warn!(
-                    "WASAPI capture thread did not report readiness within 2 s; abandoning it \
-                     detached rather than blocking `start` further"
-                );
-                drop(thread);
-                Err(Error::Backend(
-                    "the WASAPI capture thread did not open a device within 2 s".into(),
-                ))
-            }
-        }
+        self.thread.start(
+            "pheme-wasapi-cap",
+            START_TIMEOUT,
+            move || stop.store(true, Ordering::SeqCst),
+            move |ready| capture_thread(device, sink, thread_stop, name, ready),
+        )
     }
 
     fn device_name(&self) -> String {
@@ -435,16 +373,11 @@ impl AudioCapture for WasapiCapture {
     }
 
     fn healthy(&self) -> bool {
-        self.running
-            .as_ref()
-            .is_some_and(|r| r.alive.load(Ordering::SeqCst))
+        self.thread.healthy()
     }
 
     fn stop(&mut self) {
-        if let Some(r) = self.running.take() {
-            r.stop.store(true, Ordering::SeqCst);
-            let _ = r.thread.join();
-        }
+        self.thread.stop();
     }
 }
 
@@ -459,12 +392,12 @@ fn capture_thread(
     mut sink: rtrb::Producer<i16>,
     stop: Arc<AtomicBool>,
     name: Arc<Mutex<String>>,
-    ready: mpsc::Sender<Result<()>>,
+    ready: Ready,
 ) {
     let _com = match ComGuard::new() {
         Ok(g) => g,
         Err(e) => {
-            let _ = ready.send(Err(e));
+            ready.fail(e);
             return;
         }
     };
@@ -489,7 +422,7 @@ fn capture_thread(
             Ok(()) => {}
             Err(e) => {
                 if !signaled {
-                    let _ = ready.send(Err(e));
+                    ready.fail(e);
                     // SAFETY: balances the timeBeginPeriod above.
                     unsafe { timeEndPeriod(1) };
                     return;
@@ -507,18 +440,17 @@ fn capture_thread(
 /// One device's worth of capture. Returns when the device is invalidated, the default
 /// endpoint changes, or `stop` is set.
 ///
-/// Sends `Ok(())` on `ready` and sets `*signaled = true` the instant `client.Start()`
-/// succeeds, so `start()` is unblocked as soon as the device is actually running rather
-/// than once this (normally long-lived) session eventually ends. A send after the
-/// receiver has already been dropped — a reopened session signalling again — is a no-op
-/// error `mpsc::Sender::send` reports and this discards.
+/// Calls `ready.ok()` and sets `*signaled = true` the instant `client.Start()` succeeds,
+/// so `start()` is unblocked as soon as the device is actually running rather than once
+/// this (normally long-lived) session eventually ends. A call after `start()` has already
+/// returned — a reopened session signalling again — is a harmless no-op.
 fn capture_session(
     device: Option<&str>,
     sink: &mut rtrb::Producer<i16>,
     stop: &AtomicBool,
     name: &Mutex<String>,
     dropped_total: &mut u64,
-    ready: &mpsc::Sender<Result<()>>,
+    ready: &Ready,
     signaled: &mut bool,
 ) -> Result<()> {
     // SAFETY: a standard WASAPI loopback session; all raw pointers stay in this block
@@ -560,7 +492,7 @@ fn capture_session(
         // The device is now actually running: unblock `start()` here rather than only
         // once this session (normally long-lived) eventually ends.
         *signaled = true;
-        let _ = ready.send(Ok(()));
+        ready.ok();
 
         let mut last_check = std::time::Instant::now();
         let result = loop {
@@ -620,7 +552,7 @@ pub struct WasapiPlayback {
     device: Option<String>,
     name: Arc<Mutex<String>>,
     rate: Arc<AtomicU32>,
-    running: Option<Running>,
+    thread: DeviceThread,
 }
 
 impl WasapiPlayback {
@@ -629,61 +561,24 @@ impl WasapiPlayback {
             device,
             name: Arc::new(Mutex::new("not started".into())),
             rate: Arc::new(AtomicU32::new(RATE)),
-            running: None,
+            thread: DeviceThread::new(),
         }
     }
 }
 
 impl AudioPlayback for WasapiPlayback {
     fn start(&mut self, source: rtrb::Consumer<i16>) -> Result<()> {
-        if self.running.is_some() {
-            return Ok(());
-        }
         let stop = Arc::new(AtomicBool::new(false));
-        let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
+        let thread_stop = stop.clone();
         let device = self.device.clone();
         let name = self.name.clone();
         let rate = self.rate.clone();
-        let alive = Arc::new(AtomicBool::new(true));
-        let thread_alive = alive.clone();
-        let thread_stop = stop.clone();
-        let thread = std::thread::Builder::new()
-            .name("pheme-wasapi-play".into())
-            .spawn(move || {
-                let _alive = AliveGuard(thread_alive);
-                render_thread(device, source, thread_stop, name, rate, ready_tx);
-            })
-            .map_err(|e| Error::Backend(format!("spawning the WASAPI thread: {e}")))?;
-        match ready_rx.recv_timeout(START_TIMEOUT) {
-            Ok(Ok(())) => {
-                self.running = Some(Running {
-                    stop,
-                    thread,
-                    alive,
-                });
-                Ok(())
-            }
-            Ok(Err(e)) => {
-                let _ = thread.join();
-                Err(e)
-            }
-            Err(_) => {
-                // As in `WasapiCapture::start`: the thread may be stuck inside a
-                // blocking WASAPI/COM call, so joining here could block `start`
-                // forever. Ask it to stop and detach it instead of joining, and leave
-                // `self.running` as `None` so `healthy()` correctly reports false for
-                // an abandoned start.
-                stop.store(true, Ordering::SeqCst);
-                warn!(
-                    "WASAPI render thread did not report readiness within 2 s; abandoning it \
-                     detached rather than blocking `start` further"
-                );
-                drop(thread);
-                Err(Error::Backend(
-                    "the WASAPI render thread did not open a device within 2 s".into(),
-                ))
-            }
-        }
+        self.thread.start(
+            "pheme-wasapi-play",
+            START_TIMEOUT,
+            move || stop.store(true, Ordering::SeqCst),
+            move |ready| render_thread(device, source, thread_stop, name, rate, ready),
+        )
     }
 
     fn rate(&self) -> u32 {
@@ -695,16 +590,11 @@ impl AudioPlayback for WasapiPlayback {
     }
 
     fn healthy(&self) -> bool {
-        self.running
-            .as_ref()
-            .is_some_and(|r| r.alive.load(Ordering::SeqCst))
+        self.thread.healthy()
     }
 
     fn stop(&mut self) {
-        if let Some(r) = self.running.take() {
-            r.stop.store(true, Ordering::SeqCst);
-            let _ = r.thread.join();
-        }
+        self.thread.stop();
     }
 }
 
@@ -741,12 +631,12 @@ fn render_thread(
     stop: Arc<AtomicBool>,
     name: Arc<Mutex<String>>,
     rate: Arc<AtomicU32>,
-    ready: mpsc::Sender<Result<()>>,
+    ready: Ready,
 ) {
     let _com = match ComGuard::new() {
         Ok(g) => g,
         Err(e) => {
-            let _ = ready.send(Err(e));
+            ready.fail(e);
             return;
         }
     };
@@ -773,7 +663,7 @@ fn render_thread(
             Err(RenderEnd::Fatal(e)) => (e, false),
         };
         if !signaled {
-            let _ = ready.send(Err(e));
+            ready.fail(e);
             return;
         }
         if !reopen {
@@ -786,11 +676,10 @@ fn render_thread(
     debug!(underruns, "WASAPI render thread finished");
 }
 
-/// Sends `Ok(())` on `ready` and sets `*signaled = true` the instant `client.Start()`
-/// succeeds, so `start()` is unblocked as soon as the device is actually running rather
-/// than once this (normally long-lived) session eventually ends. A send after the
-/// receiver has already been dropped — a reopened session signalling again — is a no-op
-/// error `mpsc::Sender::send` reports and this discards.
+/// Calls `ready.ok()` and sets `*signaled = true` the instant `client.Start()` succeeds,
+/// so `start()` is unblocked as soon as the device is actually running rather than once
+/// this (normally long-lived) session eventually ends. A call after `start()` has already
+/// returned — a reopened session signalling again — is a harmless no-op.
 #[allow(clippy::too_many_arguments)]
 fn render_session(
     device: Option<&str>,
@@ -799,7 +688,7 @@ fn render_session(
     name: &Mutex<String>,
     rate: &AtomicU32,
     underruns: &mut u64,
-    ready: &mpsc::Sender<Result<()>>,
+    ready: &Ready,
     signaled: &mut bool,
 ) -> std::result::Result<(), RenderEnd> {
     // SAFETY: a standard shared-mode, event-driven render session. Every GetBuffer is
@@ -875,7 +764,7 @@ unsafe fn render_loop(
     stop: &AtomicBool,
     fmt: FormatInfo,
     underruns: &mut u64,
-    ready: &mpsc::Sender<Result<()>>,
+    ready: &Ready,
     signaled: &mut bool,
 ) -> Result<()> {
     client
@@ -911,7 +800,7 @@ unsafe fn render_loop(
     // unblock `start()` here rather than only once this session (normally long-lived)
     // eventually ends.
     *signaled = true;
-    let _ = ready.send(Ok(()));
+    ready.ok();
 
     while !stop.load(Ordering::SeqCst) {
         // A 200 ms wait rather than INFINITE so `stop` is noticed promptly. WAIT_TIMEOUT
