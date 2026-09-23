@@ -43,6 +43,12 @@ pub enum Pop {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct JitterStats {
     pub depth: usize,
+    /// Depth measured immediately before the last `pop` removed its frame.
+    ///
+    /// This is the number the latency budget counts: the audio waiting to be played.
+    /// `depth` is sampled after the removal and therefore reads one frame lower, which
+    /// is fine for watching the buffer's trend and useless as a lower bound.
+    pub depth_prepop: usize,
     pub target: usize,
     pub lost: u64,
     pub late: u64,
@@ -153,6 +159,7 @@ impl JitterBuffer {
     }
 
     pub fn pop(&mut self) -> Pop {
+        self.stats.depth_prepop = self.frames.len();
         if self.prefilling {
             if self.frames.len() < self.target {
                 self.stats.depth = self.frames.len();
@@ -241,6 +248,33 @@ impl JitterBuffer {
         self.clean_pops = 0;
         self.stats.resets += 1;
         self.stats.depth = 0;
+        self.stats.depth_prepop = 0;
+    }
+
+    /// Drops everything buffered and prefills again, on the caller's say-so rather than
+    /// on a sequence-number gap.
+    ///
+    /// The client calls this at the moment it asks the server to reopen its microphone.
+    /// While the microphone was shut, the sender's numbering stood still and this
+    /// buffer's read cursor kept advancing, so the resuming stream arrives *behind* the
+    /// cursor. If that distance is under `RESET_GAP` nothing resets on its own and every
+    /// arriving frame is counted late and discarded — up to 750 ms of silence at the
+    /// start of every recording, with every error counter reading zero. The client is
+    /// the one component that knows exactly when the stream is resuming, so it says so
+    /// instead of leaving the buffer to infer it.
+    ///
+    /// Counted in `resets`, because that is what it is: one per recording is honest.
+    ///
+    /// Unlike the gap-triggered `reset`, this also drops the adaptive target back to
+    /// `TARGET_MIN`. `reset`'s target is deliberately kept because it describes a link
+    /// that is still the same conversation; `restart` is a new recording, so a target
+    /// this buffer grew while concealing the previous recording's tail-off is not a
+    /// property of the link the new stream will face, and carrying it over would delay
+    /// the very first frames of the new stream behind a stale, inflated prefill target.
+    pub fn restart(&mut self) {
+        self.reset();
+        self.target = TARGET_MIN;
+        self.stats.target = TARGET_MIN;
     }
 }
 
@@ -512,5 +546,97 @@ mod tests {
         });
         assert_eq!(jb.stats().malformed, 1);
         assert_eq!(jb.stats().depth, 0);
+    }
+
+    #[test]
+    fn an_explicit_restart_drops_everything_and_prefills_again() {
+        // What the client does when it asks the server to reopen its microphone: the
+        // stream is about to resume from an unrelated sequence number, and anything still
+        // buffered belongs to the previous recording.
+        let mut jb = JitterBuffer::new();
+        jb.push(frame(10, 5));
+        jb.push(frame(11, 5));
+        assert_eq!(data(jb.pop()), 5);
+
+        jb.restart();
+        assert_eq!(jb.stats().depth, 0, "the backlog is gone");
+        assert_eq!(jb.pop(), Pop::Idle, "prefilling again");
+
+        // A sender starting from zero is picked up cleanly, with no run of late frames.
+        jb.push(frame(0, 9));
+        jb.push(frame(1, 9));
+        assert_eq!(data(jb.pop()), 9);
+        assert_eq!(data(jb.pop()), 9);
+        assert_eq!(
+            jb.stats().late,
+            0,
+            "a restart must not strand the new stream"
+        );
+    }
+
+    #[test]
+    fn a_restart_without_it_would_discard_the_resumed_stream_as_late() {
+        // The failure this exists to prevent: the read cursor advanced while the sender was
+        // closed, the sender restarts below it, and the gap is under RESET_GAP so nothing
+        // resets on its own. Every arriving frame is late and the listener hears silence.
+        let mut jb = JitterBuffer::new();
+        jb.push(frame(100, 5));
+        jb.push(frame(101, 5));
+        jb.pop();
+        jb.pop();
+        // Cursor walks forward while nothing arrives, as it does while the microphone is
+        // shut and the virtual source is still pulling.
+        for _ in 0..40 {
+            jb.pop();
+        }
+        jb.push(frame(0, 9));
+        jb.push(frame(1, 9));
+        assert!(
+            jb.stats().late > 0,
+            "this is the pathology restart() exists to avoid"
+        );
+
+        // With the restart in the right place, the same sequence plays.
+        let mut jb = JitterBuffer::new();
+        jb.push(frame(100, 5));
+        jb.push(frame(101, 5));
+        jb.pop();
+        jb.pop();
+        for _ in 0..40 {
+            jb.pop();
+        }
+        jb.restart();
+        jb.push(frame(0, 9));
+        jb.push(frame(1, 9));
+        assert_eq!(data(jb.pop()), 9);
+        assert_eq!(jb.stats().late, 0);
+    }
+
+    #[test]
+    fn the_reported_depth_is_measured_before_the_pop_removes_its_frame() {
+        // `depth_ms` in the stats line is meant to answer "how much audio is waiting", which
+        // is what the latency budget counts. Sampling after the pop reads a frame lower and
+        // leaves a lower bound of one frame with no headroom at all.
+        let mut jb = JitterBuffer::new();
+        jb.push(frame(0, 1));
+        jb.push(frame(1, 1));
+        jb.push(frame(2, 1));
+        assert!(matches!(jb.pop(), Pop::Data(_)));
+        let st = jb.stats();
+        assert_eq!(st.depth, 2, "two frames remain after the pop");
+        assert_eq!(
+            st.depth_prepop, 3,
+            "three frames were waiting when the pop happened"
+        );
+    }
+
+    #[test]
+    fn the_pre_pop_depth_is_zero_while_prefilling() {
+        let mut jb = JitterBuffer::new();
+        assert_eq!(jb.pop(), Pop::Idle);
+        assert_eq!(jb.stats().depth_prepop, 0);
+        jb.push(frame(0, 1));
+        assert_eq!(jb.pop(), Pop::Idle, "still below target");
+        assert_eq!(jb.stats().depth_prepop, 1);
     }
 }
