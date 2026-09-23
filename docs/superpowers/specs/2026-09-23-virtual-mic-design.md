@@ -397,9 +397,12 @@ existing `PipewirePlayback` and inherits its failure handling.
 The stream asks for 48 kHz / 2 channels / S16LE and lets the PipeWire
 graph convert. This machine's microphones are `s32le 2ch 48000`, so
 sample-format conversion is exercised immediately. **Mono → stereo
-upmixing through the graph is expected but not yet measured**, and many
-microphones are mono, so verifying it is a required step in the first
-task that builds this backend — not a note at the end of the spec.
+upmixing through the graph is measured, not assumed**: a test creates a
+genuinely one-channel source node, with `SPA_AUDIO_CHANNEL_MONO`
+declared as its position, and captures from it — the graph delivers the
+signal into both wire channels identically, so the backend needs no
+upmix code of its own. That was this spec's one open assumption and it
+is now closed by evidence rather than expectation.
 
 ## 6. Windows backend — server microphone only (`windows/wasapi.rs`)
 
@@ -568,10 +571,11 @@ Runnable with this machine as the Linux client and the QEMU VM
 
 ## 12. Known risks
 
-- **Mono → stereo upmixing through the PipeWire graph is assumed, not
-  measured.** Most microphones are mono, so if the graph will not do it
-  the backend must. Verified in the first task that builds the Linux mic
-  capture, not left to manual testing.
+- ~~**Mono → stereo upmixing through the PipeWire graph is assumed, not
+  measured.**~~ **Closed.** Measured in the task that built the Linux mic
+  capture, with a purpose-built one-channel source node: the graph
+  upmixes, and both wire channels carry the signal identically. No
+  backend code was needed.
 - **Windows `eCapture` has never been executed.** Sub-project 2 shipped
   Windows code that was cross-compiled and linted but never run, and
   three real defects survived to the VM session. The VM is the gate here
