@@ -13,7 +13,8 @@
 //! those pieces does not type-check; keeping them all as locals in one function sidesteps
 //! that entirely and matches how the upstream `pipewire` crate's own examples do it.
 
-use std::sync::Once;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Once};
 use std::time::Duration;
 
 use pipewire as pw;
@@ -26,7 +27,7 @@ use pw::stream::{StreamFlags, StreamState};
 use tracing::{debug, warn};
 
 use crate::device::{DeviceThread, Ready};
-use crate::{AudioCapture, AudioPlayback, Error, Result, CHANNELS, RATE};
+use crate::{AudioCapture, AudioPlayback, Demand, Error, Result, CHANNELS, RATE};
 
 /// How long `start` waits for the PipeWire thread to report success or failure.
 const START_TIMEOUT: Duration = Duration::from_secs(1);
@@ -485,4 +486,285 @@ fn play_run(
     mainloop.run();
     let _ = stream.disconnect();
     Ok(())
+}
+
+/// The client's virtual microphone: we write samples, applications record them.
+///
+/// The mirror of `PipewireCapture`. `Direction::Output` plus `media.class = Audio/Source`
+/// is what makes this a recording device other applications can select, rather than a
+/// playback stream.
+pub struct PipewireVirtualSource {
+    demand: Arc<AtomicU8>,
+    thread: DeviceThread,
+}
+
+/// `Demand` as an atomic, because the stream listener sets it from the PipeWire thread.
+const DEMAND_UNKNOWN: u8 = 0;
+const DEMAND_WANTED: u8 = 1;
+const DEMAND_IDLE: u8 = 2;
+
+impl Default for PipewireVirtualSource {
+    fn default() -> Self {
+        PipewireVirtualSource::new()
+    }
+}
+
+impl PipewireVirtualSource {
+    pub fn new() -> PipewireVirtualSource {
+        PipewireVirtualSource {
+            // Unknown until the node exists: until then we do not know, and not knowing
+            // means keep the far end's microphone open.
+            demand: Arc::new(AtomicU8::new(DEMAND_UNKNOWN)),
+            thread: DeviceThread::new(),
+        }
+    }
+}
+
+impl AudioPlayback for PipewireVirtualSource {
+    fn start(&mut self, source: rtrb::Consumer<i16>) -> Result<()> {
+        init();
+        let (cmd_tx, cmd_rx) = pw::channel::channel::<Cmd>();
+        let demand = self.demand.clone();
+        self.thread.start(
+            "pheme-pw-mic",
+            START_TIMEOUT,
+            move || {
+                let _ = cmd_tx.send(Cmd::Stop);
+            },
+            move |ready| virtual_source_thread(source, demand, ready, cmd_rx),
+        )
+    }
+
+    /// Always 48 kHz: we create this node, so its rate is ours to choose and the base
+    /// resample ratio is exactly 1.0.
+    fn rate(&self) -> u32 {
+        RATE
+    }
+
+    fn device_name(&self) -> String {
+        "Pheme Mic".into()
+    }
+
+    fn healthy(&self) -> bool {
+        self.thread.healthy()
+    }
+
+    /// Derived from the stream state, which tracks consumers exactly: a source with
+    /// nothing recording from it sits in `Paused` and moves to `Streaming` when an
+    /// application connects. Measured on PipeWire 1.6.8 before this was designed.
+    ///
+    /// A level meter counts as a consumer — an open sound-settings input page, or
+    /// `pavucontrol` — which is correct: something really is listening.
+    fn demand(&self) -> Demand {
+        match self.demand.load(Ordering::SeqCst) {
+            DEMAND_WANTED => Demand::Wanted,
+            DEMAND_IDLE => Demand::Idle,
+            _ => Demand::Unknown,
+        }
+    }
+
+    fn stop(&mut self) {
+        self.thread.stop();
+        // A node that no longer exists has no consumers, and saying "unknown" here would
+        // hold the far end's microphone open for a device that cannot deliver to anyone.
+        self.demand.store(DEMAND_IDLE, Ordering::SeqCst);
+    }
+}
+
+impl Drop for PipewireVirtualSource {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Everything the process callback touches. It runs on PipeWire's real-time thread, so
+/// it allocates nothing and takes no lock: `Consumer::pop` on an `rtrb` ring buffer is
+/// lock-free and never allocates, and an empty ring simply yields silence.
+struct VirtualSourceData {
+    source: rtrb::Consumer<i16>,
+}
+
+fn virtual_source_thread(
+    source: rtrb::Consumer<i16>,
+    demand: Arc<AtomicU8>,
+    ready: Ready,
+    cmd_rx: pw::channel::Receiver<Cmd>,
+) {
+    if let Err(e) = source_run(source, demand, &ready, cmd_rx) {
+        warn!("Pheme Mic could not start: {e}");
+        // `source_run` only returns `Err` before it has sent a readiness reply, so this
+        // is the one and only reply in the failure path.
+        ready.fail(e);
+    }
+}
+
+/// Builds the node, runs the main loop until told to stop, and tears the node down. Same
+/// shape as `run` and `play_run` above: everything that touches a PipeWire object lives
+/// as a local in this one function, because the 0.10 ownership model ties the attached
+/// channel receiver's lifetime to the `MainLoopRc` local that produced it.
+fn source_run(
+    source: rtrb::Consumer<i16>,
+    demand: Arc<AtomicU8>,
+    ready: &Ready,
+    cmd_rx: pw::channel::Receiver<Cmd>,
+) -> Result<()> {
+    let mainloop = pw::main_loop::MainLoopRc::new(None)
+        .map_err(|e| Error::Device(format!("creating the PipeWire main loop: {e}")))?;
+    let context = pw::context::ContextRc::new(&mainloop, None)
+        .map_err(|e| Error::Device(format!("creating the PipeWire context: {e}")))?;
+    let core = context
+        .connect_rc(None)
+        .map_err(|e| Error::Device(format!("connecting to PipeWire: {e}")))?;
+
+    // A stream listener only sees what happens to *our* node. When the daemon itself
+    // goes away the connection to it is what breaks, and the core reports that here.
+    // `error` is documented as fatal and non-recoverable, so there is nothing to do but
+    // end the loop and let the supervisor build a fresh backend against the new daemon.
+    let _core_listener = core
+        .add_listener_local()
+        .error({
+            let quit_loop = mainloop.clone();
+            move |id, seq, res, message| {
+                warn!(
+                    id,
+                    seq, res, message, "the PipeWire connection failed; ending the PipeWire thread"
+                );
+                quit_loop.quit();
+            }
+        })
+        .register();
+
+    let stream = pw::stream::StreamBox::new(
+        &core,
+        "pheme-mic",
+        pw::properties::properties! {
+            *pw::keys::MEDIA_TYPE => "Audio",
+            *pw::keys::MEDIA_CATEGORY => "Playback",
+            *pw::keys::MEDIA_CLASS => "Audio/Source",
+            *pw::keys::MEDIA_ROLE => "Communication",
+            *pw::keys::NODE_NAME => "pheme-mic",
+            *pw::keys::NODE_DESCRIPTION => "Pheme Mic",
+            *pw::keys::AUDIO_RATE => "48000",
+            *pw::keys::AUDIO_CHANNELS => "2",
+            *pw::keys::NODE_LATENCY => "240/48000",
+        },
+    )
+    .map_err(|e| Error::Device(format!("creating the Pheme Mic node: {e}")))?;
+
+    let _listener = stream
+        .add_local_listener_with_user_data(VirtualSourceData { source })
+        .process(|stream, data| {
+            let Some(mut buffer) = stream.dequeue_buffer() else {
+                return;
+            };
+            let datas = buffer.datas_mut();
+            let Some(d) = datas.first_mut() else {
+                return;
+            };
+            let stride = 2 * CHANNELS;
+            let Some(slice) = d.data() else {
+                return;
+            };
+            let frames = slice.len() / stride;
+            for f in 0..frames {
+                for c in 0..CHANNELS {
+                    // An empty ring plays silence rather than stalling the graph.
+                    let v = data.source.pop().unwrap_or(0);
+                    let at = f * stride + c * 2;
+                    slice[at..at + 2].copy_from_slice(&v.to_le_bytes());
+                }
+            }
+            let chunk = d.chunk_mut();
+            *chunk.offset_mut() = 0;
+            *chunk.stride_mut() = stride as i32;
+            *chunk.size_mut() = (frames * stride) as u32;
+        })
+        .state_changed({
+            let quit_loop = mainloop.clone();
+            let demand = demand.clone();
+            let mut streamed = false;
+            move |_, _, old, new| {
+                debug!(?old, ?new, "Pheme Mic state");
+                demand.store(
+                    if matches!(new, StreamState::Streaming) {
+                        DEMAND_WANTED
+                    } else {
+                        DEMAND_IDLE
+                    },
+                    Ordering::SeqCst,
+                );
+                if let Some(why) = stream_died(&mut streamed, &new) {
+                    warn!("Pheme Mic is gone: {why}; ending the PipeWire thread");
+                    quit_loop.quit();
+                }
+            }
+        })
+        .register()
+        .map_err(|e| Error::Device(format!("registering the stream listener: {e}")))?;
+
+    let bytes = format_pod()?;
+    let mut params = [Pod::from_bytes(&bytes)
+        .ok_or_else(|| Error::Backend("the audio format pod is malformed".into()))?];
+    stream
+        .connect(
+            Direction::Output,
+            None,
+            StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS,
+            &mut params,
+        )
+        .map_err(|e| Error::Device(format!("connecting the Pheme Mic node: {e}")))?;
+
+    let quit_loop = mainloop.clone();
+    let _receiver = cmd_rx.attach(mainloop.loop_(), move |cmd| match cmd {
+        Cmd::Stop => quit_loop.quit(),
+    });
+
+    // The node exists and is connected: tell `start` it can return. See `run`'s comment
+    // above for what happens if the caller has already given up.
+    ready.ok();
+
+    mainloop.run();
+    let _ = stream.disconnect();
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{AudioPlayback, Demand, FRAME_INTERLEAVED};
+
+    /// True when a PipeWire daemon is reachable. CI containers may not have one.
+    fn have_pipewire() -> bool {
+        std::env::var_os("PIPEWIRE_RUNTIME_DIR").is_some()
+            || std::env::var_os("XDG_RUNTIME_DIR")
+                .is_some_and(|d| std::path::Path::new(&d).join("pipewire-0").exists())
+    }
+
+    #[test]
+    fn the_virtual_source_starts_and_reports_no_consumers() {
+        if !have_pipewire() {
+            eprintln!("no PipeWire daemon; skipping");
+            return;
+        }
+        let (_producer, consumer) = rtrb::RingBuffer::<i16>::new(FRAME_INTERLEAVED * 16);
+        let mut src = PipewireVirtualSource::new();
+        src.start(consumer).expect("the node must be created");
+        assert!(src.healthy());
+        assert_eq!(src.rate(), RATE, "we own this node, so it runs at 48 kHz");
+        assert_eq!(src.device_name(), "Pheme Mic");
+
+        // Nothing is recording from a node that has just been created, and reporting
+        // otherwise would hold the far end's microphone open for no one.
+        let mut saw_idle = false;
+        for _ in 0..100 {
+            if src.demand() == Demand::Idle {
+                saw_idle = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(saw_idle, "an unconsumed source must settle on Idle");
+        src.stop();
+        assert!(!src.healthy());
+    }
 }
