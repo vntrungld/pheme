@@ -226,6 +226,7 @@ pub struct JitterStats {
     pub depth: usize, pub target: usize,
     pub lost: u64, pub late: u64, pub dup: u64,
     pub underruns: u64, pub resets: u64, pub malformed: u64,
+    pub overflows: u64,
 }
 
 impl JitterBuffer {
@@ -245,6 +246,7 @@ Behaviour:
 | `seq` <= last popped | dropped, `late += 1` |
 | `seq` already stored | dropped, `dup += 1` |
 | Payload length is not exactly 960 bytes | dropped, `malformed += 1` |
+| Buffered depth exceeds `MAX_DEPTH` (24 frames, 120 ms) | discard the backlog down to `target`, move the read cursor to the new front, `overflows += 1` |
 | A gap > 200 frames (1 s), ahead or behind | flush, `resets += 1`, re-prefill |
 | Pop while depth < target (startup or after reset) | `Idle` |
 | Pop with the next `seq` present | `Data`, `depth` recomputed |
@@ -263,6 +265,16 @@ suppression window, not the network. Counting them would inflate `lost`
 and — far worse — ratchet the adaptive target up to 40 ms every time the
 user pauses their music. Real packet loss during silence is ignored too,
 which costs nothing: the concealed content would have been silence.
+
+The ceiling exists because nothing else bounds the depth. The adaptive target and the
+drift controller together absorb a sender and a playback device whose clocks differ by up
+to 0.1 %, which is ten times the drift of a real crystal — but if the consumer is
+persistently slower than that, the buffer grows without limit, latency grows with it, and
+every error counter stays at zero, so nothing says why the audio is falling further and
+further behind. Testing against an emulated sound card, whose clock ran about 0.8 % slow,
+drove the depth past 800 ms with `lost`, `late`, `underruns`, `resets` and `dropped` all
+reading zero. Discarding the backlog trades that silent unbounded growth for one bounded
+skip of up to 110 ms and a counter an operator can see.
 
 Adaptive target: every underrun raises `target` by 1 frame, capped at 8
 (40 ms). 2000 consecutive pops (10 s) with no underrun lowers `target` by
@@ -555,7 +567,7 @@ return an error because of audio.
 With `--stats`, the client's per-second line gains `audio_sent` (frames)
 and `audio_suppressed` (frames skipped by silence suppression). The
 server's line gains `audio_depth_ms`, `audio_lost`, `audio_late`,
-`audio_underruns` and `audio_resets`, all read from `JitterStats` and
+`audio_underruns`, `audio_resets` and `audio_overflows`, all read from `JitterStats` and
 reset per interval except `audio_depth_ms`, which is the last observed
 depth.
 

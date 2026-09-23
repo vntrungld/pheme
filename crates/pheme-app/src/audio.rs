@@ -294,6 +294,10 @@ pub struct InStats {
     pub resets: AtomicU64,
     /// Frames the receive task had to drop because the worker was not keeping up.
     pub dropped: AtomicU64,
+    /// Times the jitter buffer hit its ceiling and discarded a backlog. Anything other
+    /// than zero means the playback device is consuming persistently slower than the
+    /// sender produces, by more than the drift controller is allowed to correct.
+    pub overflows: AtomicU64,
 }
 
 /// Owns the server's playback backend and the worker that feeds it.
@@ -512,6 +516,7 @@ fn publish(stats: &InStats, s: JitterStats) {
     stats.late.store(s.late, Ordering::Relaxed);
     stats.underruns.store(s.underruns, Ordering::Relaxed);
     stats.resets.store(s.resets, Ordering::Relaxed);
+    stats.overflows.store(s.overflows, Ordering::Relaxed);
 }
 
 #[cfg(test)]

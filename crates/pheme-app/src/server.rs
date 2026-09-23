@@ -165,7 +165,7 @@ pub async fn run_server(
         let mut stats_shutdown = shutdown.clone();
         tokio::spawn(async move {
             let mut last = (0u64, 0u64, 0u64);
-            let mut alast = (0u64, 0u64, 0u64, 0u64, 0u64);
+            let mut alast = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(1)) => {}
@@ -183,6 +183,7 @@ pub async fn run_server(
                     astats.late.load(Ordering::Relaxed),
                     astats.resets.load(Ordering::Relaxed),
                     astats.dropped.load(Ordering::Relaxed),
+                    astats.overflows.load(Ordering::Relaxed),
                 );
                 info!(
                     events = now.0 - last.0,
@@ -195,6 +196,7 @@ pub async fn run_server(
                     audio_late = anow.2 - alast.2,
                     audio_resets = anow.3 - alast.3,
                     audio_dropped = anow.4 - alast.4,
+                    audio_overflows = anow.5 - alast.5,
                     "stats/s"
                 );
                 last = now;

@@ -17,6 +17,17 @@ pub const RESET_GAP: u32 = 200;
 pub const CONCEAL_FRAMES: u32 = 4;
 /// Consecutive clean pops that lower the target by one frame. 2000 pops is 10 s.
 pub const SHRINK_AFTER_POPS: u64 = 2_000;
+/// Hard ceiling on buffered depth, in frames. 24 frames is 120 ms.
+///
+/// The adaptive target and the drift controller between them handle a sender and a
+/// playback device whose clocks differ by up to 0.1 %, which is ten times the drift of
+/// a real crystal. Nothing else bounds the depth, though: if the consumer is
+/// persistently slower than that — a device that reports a rate it does not keep, a
+/// broken driver, an emulated sound card — the buffer grows without limit, latency
+/// grows with it, and every error counter stays at zero, so nothing in the logs says
+/// why the audio is drifting further and further behind. This ceiling turns that
+/// silent unbounded growth into a bounded skip and a counter someone can see.
+pub const MAX_DEPTH: usize = 24;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Pop {
@@ -39,6 +50,8 @@ pub struct JitterStats {
     pub underruns: u64,
     pub resets: u64,
     pub malformed: u64,
+    /// Times the buffer hit `MAX_DEPTH` and had to discard its backlog.
+    pub overflows: u64,
 }
 
 /// Reorders incoming frames, conceals losses, and adapts its depth to the link.
@@ -110,6 +123,32 @@ impl JitterBuffer {
             return;
         }
         self.frames.insert(f.seq, f.bytes);
+        self.stats.depth = self.frames.len();
+        self.trim();
+    }
+
+    /// Discards the backlog when the buffer has outgrown `MAX_DEPTH`.
+    ///
+    /// The read cursor moves to the new front, so the frames thrown away are not then
+    /// counted as loss on the way past — they were dropped deliberately, and `overflows`
+    /// is the counter that says so. `last_frame` is cleared because the new front does
+    /// not continue the audio that was playing, so concealing from it would splice two
+    /// unrelated moments together.
+    fn trim(&mut self) {
+        if self.frames.len() <= MAX_DEPTH {
+            return;
+        }
+        while self.frames.len() > self.target {
+            let Some(oldest) = self.frames.keys().next().copied() else {
+                break;
+            };
+            self.frames.remove(&oldest);
+        }
+        self.next = self.frames.keys().next().copied();
+        self.last_frame = None;
+        self.last_silent = false;
+        self.conceal_run = 0;
+        self.stats.overflows += 1;
         self.stats.depth = self.frames.len();
     }
 
@@ -402,6 +441,65 @@ mod tests {
             TARGET_MIN,
             "latency comes back down on a clean link"
         );
+    }
+
+    #[test]
+    fn a_backlog_past_the_ceiling_is_discarded_down_to_target() {
+        let mut jb = JitterBuffer::new();
+        // Fill well past the ceiling without ever popping, as happens when the playback
+        // device consumes persistently slower than the sender produces.
+        for seq in 0..=MAX_DEPTH as u32 {
+            jb.push(frame(seq, 100 + seq as i16));
+        }
+        let st = jb.stats();
+        assert_eq!(st.overflows, 1, "one discard, not one per frame");
+        assert_eq!(st.depth, TARGET_MIN, "trimmed back to the target");
+        assert_eq!(
+            (st.lost, st.late, st.dup, st.resets),
+            (0, 0, 0, 0),
+            "a deliberate discard is not loss, lateness, duplication or a reset"
+        );
+    }
+
+    #[test]
+    fn the_frames_kept_after_a_discard_are_the_newest() {
+        let mut jb = JitterBuffer::new();
+        let last = MAX_DEPTH as u32;
+        for seq in 0..=last {
+            jb.push(frame(seq, 100 + seq as i16));
+        }
+        // TARGET_MIN frames survive, and they are the tail of the stream rather than
+        // its head — playing the head would replay audio the listener has moved past.
+        assert_eq!(data(jb.pop()), 100 + (last - 1) as i16);
+        assert_eq!(data(jb.pop()), 100 + last as i16);
+    }
+
+    #[test]
+    fn a_discard_does_not_strand_the_read_cursor() {
+        let mut jb = JitterBuffer::new();
+        let last = MAX_DEPTH as u32;
+        for seq in 0..=last {
+            jb.push(frame(seq, 7));
+        }
+        assert!(matches!(jb.pop(), Pop::Data(_)));
+        assert!(matches!(jb.pop(), Pop::Data(_)));
+        // The stream continues from where the survivors left off, with no phantom gap
+        // between the discarded sequence numbers and the next real frame.
+        jb.push(frame(last + 1, 9));
+        assert_eq!(data(jb.pop()), 9);
+        let st = jb.stats();
+        assert_eq!((st.lost, st.underruns), (0, 0));
+    }
+
+    #[test]
+    fn a_buffer_within_the_ceiling_is_left_alone() {
+        let mut jb = JitterBuffer::new();
+        for seq in 0..MAX_DEPTH as u32 {
+            jb.push(frame(seq, 5));
+        }
+        let st = jb.stats();
+        assert_eq!(st.overflows, 0);
+        assert_eq!(st.depth, MAX_DEPTH, "exactly at the ceiling is not over it");
     }
 
     #[test]
