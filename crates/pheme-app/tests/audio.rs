@@ -272,7 +272,7 @@ async fn audio_flows_client_to_server() {
     // client's packer thread backs frames up in its 200-frame capture ring and they
     // arrive in a burst after their slots have passed, which is honest behaviour and
     // has been seen to cost 33 frames in 300. The precise assertions — late, lost and
-    // underruns within two of zero — live in `pheme-app/src/audio.rs`'s lock-stepped
+    // underruns within two of zero — live in `pheme-app/src/audio/recv.rs`'s lock-stepped
     // unit tests. What this budget still catches is the defect it was written for: a
     // playback mock with no device clock let the server discard 95 % of the stream
     // while every assertion in this file passed.
@@ -290,14 +290,14 @@ async fn audio_flows_client_to_server() {
         "{lost} frames never reached the jitter buffer"
     );
 
-    // `audio_depth_ms` is the depth sampled just after a pop, so the 2-frame target
-    // reads as an alternation of 5 and 10 ms — a median of 10 on an idle machine, not
-    // the flat 10-15 the spec's definition of done names, which is the target rather
-    // than the depth. Before the playback mock had a device clock this counter was
-    // pinned at 0 for the whole run. Skip the first 50 iterations, while the buffer is
-    // still prefilling, and assert the lower bound only: a scheduling stall parks the
-    // buffer deeper and only the drift controller's 0.1 % correction brings it back,
-    // which takes about five seconds per frame — far longer than this test runs.
+    // `audio_depth_ms` reports the depth *before* each pop, which is the audio waiting
+    // to be played, so a 2-frame target reads as a flat 10 ms rather than an alternation
+    // of 5 and 10 — matching the spec's 10-15 ms definition of done, which names the
+    // target rather than the depth. Before the playback mock had a device clock this
+    // counter was pinned at 0 for the whole run. Skip the first 50 iterations, while the
+    // buffer is still prefilling, and assert the lower bound only: a scheduling stall
+    // parks the buffer deeper and only the drift controller's 0.1 % correction brings it
+    // back, which takes about five seconds per frame — far longer than this test runs.
     let mut steady = depths[50..].to_vec();
     steady.sort_unstable();
     let median = steady[steady.len() / 2];

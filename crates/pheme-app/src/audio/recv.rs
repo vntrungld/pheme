@@ -1,273 +1,16 @@
-//! Audio wiring between the backends in `pheme-audio` and the QUIC session.
-//!
-//! Each role runs one supervisor thread that owns its backend and rebuilds it every five
-//! seconds for as long as it is failing. Audio never affects the keyboard and mouse
-//! session: nothing here can make `run_client` or `run_server` return an error.
-
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use pheme_audio::drift::DriftController;
 use pheme_audio::frame::Frame;
 use pheme_audio::jitter::{JitterBuffer, JitterStats, Pop};
-use pheme_audio::pack::Packer;
-use pheme_audio::{AudioCapture, AudioPlayback, CHANNELS, FRAME_INTERLEAVED, FRAME_SAMPLES};
-use pheme_audio::{FRAME_US, RATE};
-use pheme_net::PeerSender;
-use pheme_proto::{AudioStream, Msg};
+use pheme_audio::{AudioPlayback, CHANNELS, FRAME_INTERLEAVED, FRAME_SAMPLES, RATE};
 use rubato::Resampler;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
-/// How long a failed backend waits before it is rebuilt.
-const RETRY: Duration = Duration::from_secs(5);
-/// How often the supervisor threads wake up.
-const TICK: Duration = Duration::from_millis(2);
-/// Capture ring, in frames. One second of audio is plenty of slack for a thread that
-/// wakes every 2 ms.
-const CAPTURE_RING_FRAMES: usize = 200;
-
-/// Where the capture backend comes from. Tests inject their own; production detects one.
-pub enum CaptureSource {
-    /// Detect the platform backend, optionally naming a device.
-    Detect(Option<String>),
-    /// Use this backend. It is started once and never rebuilt, because a `Box` cannot be
-    /// started twice — this variant exists for tests.
-    Backend(Box<dyn AudioCapture>),
-    /// Run no audio at all.
-    Disabled,
-}
-
-#[derive(Default)]
-pub struct OutCounters {
-    /// Frames handed to the transport.
-    pub sent: AtomicU64,
-    /// Frames dropped by silence suppression.
-    pub suppressed: AtomicU64,
-}
-
-/// Owns the client's capture backend and the thread that packs and sends its frames.
-pub struct AudioOut {
-    peer: Arc<Mutex<Option<PeerSender>>>,
-    stop: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
-}
-
-impl AudioOut {
-    pub fn spawn(source: CaptureSource, counters: Arc<OutCounters>) -> AudioOut {
-        let peer = Arc::new(Mutex::new(None));
-        let stop = Arc::new(AtomicBool::new(false));
-        let thread = match source {
-            CaptureSource::Disabled => None,
-            src => {
-                let peer = peer.clone();
-                let stop = stop.clone();
-                match std::thread::Builder::new()
-                    .name("pheme-audio-out".into())
-                    .spawn(move || out_thread(src, peer, stop, counters))
-                {
-                    Ok(t) => Some(t),
-                    Err(e) => {
-                        warn!("could not start the audio thread: {e}");
-                        None
-                    }
-                }
-            }
-        };
-        AudioOut { peer, stop, thread }
-    }
-
-    /// Attaches the session's transport, or detaches it when the session ends. While no
-    /// peer is attached the thread keeps draining the device and simply discards frames.
-    pub fn set_peer(&self, sender: Option<PeerSender>) {
-        *self.peer.lock().unwrap() = sender;
-    }
-
-    pub fn stop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
-        }
-    }
-}
-
-impl Drop for AudioOut {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
-
-/// Logs a repeating failure loudly once and quietly while it repeats unchanged.
-///
-/// `detect_*` never returns `Unsupported` on Linux or Windows — a daemon that is not
-/// running at startup but appears later must still be picked up — so a machine with no
-/// usable audio fails the same way every five seconds for the life of the process. At
-/// one `warn!` each that is roughly 17 000 lines a day, which buries the input logs
-/// this project actually needs. The first failure of a kind stays at `warn!`; identical
-/// repeats drop to `debug!`; a success restores the volume.
-#[derive(Default)]
-struct FailureLog {
-    last: Option<String>,
-}
-
-impl FailureLog {
-    /// Records `msg` and returns whether it deserves a `warn!` rather than a `debug!`.
-    fn is_new(&mut self, msg: &str) -> bool {
-        if self.last.as_deref() == Some(msg) {
-            return false;
-        }
-        self.last = Some(msg.to_string());
-        true
-    }
-
-    fn report(&mut self, msg: String) {
-        if self.is_new(&msg) {
-            warn!("{msg}");
-        } else {
-            debug!("{msg}");
-        }
-    }
-
-    /// The backend came up: the next failure is loud again.
-    fn cleared(&mut self) {
-        self.last = None;
-    }
-}
-
-/// Sleeps in short steps so `stop` is noticed promptly. Returns false if asked to stop.
-fn nap(total: Duration, stop: &AtomicBool) -> bool {
-    let mut left = total;
-    while left > Duration::ZERO {
-        if stop.load(Ordering::SeqCst) {
-            return false;
-        }
-        let step = left.min(Duration::from_millis(50));
-        std::thread::sleep(step);
-        left -= step;
-    }
-    !stop.load(Ordering::SeqCst)
-}
-
-fn out_thread(
-    source: CaptureSource,
-    peer: Arc<Mutex<Option<PeerSender>>>,
-    stop: Arc<AtomicBool>,
-    counters: Arc<OutCounters>,
-) {
-    let (device, mut injected, rebuild) = match source {
-        CaptureSource::Detect(d) => (d, None, true),
-        CaptureSource::Backend(b) => (None, Some(b), false),
-        CaptureSource::Disabled => return,
-    };
-    let mut failures = FailureLog::default();
-    loop {
-        if stop.load(Ordering::SeqCst) {
-            return;
-        }
-        let built = match injected.take() {
-            Some(b) => Ok(b),
-            None => pheme_audio::detect_capture(device.as_deref()),
-        };
-        let mut backend = match built {
-            Ok(b) => b,
-            Err(pheme_audio::Error::Unsupported(why)) => {
-                info!("audio capture is not available here: {why}");
-                return;
-            }
-            Err(e) => {
-                failures.report(format!("audio capture unavailable: {e}"));
-                if !rebuild || !nap(RETRY, &stop) {
-                    return;
-                }
-                continue;
-            }
-        };
-        let (producer, consumer) =
-            rtrb::RingBuffer::<i16>::new(FRAME_INTERLEAVED * CAPTURE_RING_FRAMES);
-        if let Err(e) = backend.start(producer) {
-            failures.report(format!("audio capture failed to start: {e}"));
-            if !rebuild || !nap(RETRY, &stop) {
-                return;
-            }
-            continue;
-        }
-        failures.cleared();
-        info!(device = %backend.device_name(), "audio capture started");
-        let end = pump_out(backend.as_ref(), consumer, &peer, &stop, &counters);
-        backend.stop();
-        if let PumpEnd::Failed(why) = end {
-            failures.report(format!("audio capture stopped: {why}"));
-        }
-        if stop.load(Ordering::SeqCst) || !rebuild {
-            return;
-        }
-        if !nap(RETRY, &stop) {
-            return;
-        }
-    }
-}
-
-/// Why a pump returned.
-enum PumpEnd {
-    /// A stop was requested, or the sender was dropped: do not rebuild.
-    Stopped,
-    /// The device, or something the pump owns, failed: rebuild after the retry delay.
-    Failed(String),
-}
-
-/// Packs whole frames out of the ring and sends them while a peer is attached. Returns
-/// when the backend dies or a stop is requested.
-fn pump_out(
-    backend: &dyn AudioCapture,
-    mut consumer: rtrb::Consumer<i16>,
-    peer: &Mutex<Option<PeerSender>>,
-    stop: &AtomicBool,
-    counters: &OutCounters,
-) -> PumpEnd {
-    let mut packer = Packer::new();
-    let mut frame = Vec::with_capacity(FRAME_INTERLEAVED);
-    let mut taken = 0u64;
-    while !stop.load(Ordering::SeqCst) {
-        if !backend.healthy() {
-            return PumpEnd::Failed("the capture device stopped".into());
-        }
-        while consumer.slots() >= FRAME_INTERLEAVED {
-            frame.clear();
-            for _ in 0..FRAME_INTERLEAVED {
-                match consumer.pop() {
-                    Ok(s) => frame.push(s),
-                    Err(_) => break,
-                }
-            }
-            if frame.len() != FRAME_INTERLEAVED {
-                break;
-            }
-            let ts_us = taken * FRAME_US;
-            taken += 1;
-            match packer.push(&frame, ts_us) {
-                None => {
-                    counters.suppressed.fetch_add(1, Ordering::Relaxed);
-                }
-                Some(f) => {
-                    let sender = peer.lock().unwrap().clone();
-                    if let Some(sender) = sender {
-                        sender.send_datagram(&Msg::Audio {
-                            stream: AudioStream::Playback,
-                            seq: f.seq,
-                            ts_us: f.ts_us,
-                            samples: f.bytes,
-                        });
-                        counters.sent.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            }
-        }
-        std::thread::sleep(TICK);
-    }
-    PumpEnd::Stopped
-}
+use super::{nap, FailureLog, PumpEnd, RETRY, TICK};
 
 /// Playback ring, in wire frames' worth of samples. It is sized for the worst plausible
 /// device rate; the worker keeps the actual fill near one frame regardless.
@@ -300,19 +43,19 @@ pub struct InStats {
     pub overflows: AtomicU64,
 }
 
-/// Owns the server's playback backend and the worker that feeds it.
-pub struct AudioIn {
+/// Owns a playback backend and the worker that feeds it.
+pub struct RecvSide {
     frames: Option<Sender<Frame>>,
     stats: Arc<InStats>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
-impl AudioIn {
-    pub fn spawn(source: PlaybackSource, stats: Arc<InStats>) -> AudioIn {
+impl RecvSide {
+    pub fn spawn(source: PlaybackSource, stats: Arc<InStats>) -> RecvSide {
         let stop = Arc::new(AtomicBool::new(false));
         if matches!(source, PlaybackSource::Disabled) {
-            return AudioIn {
+            return RecvSide {
                 frames: None,
                 stats,
                 stop,
@@ -334,7 +77,7 @@ impl AudioIn {
                 }
             }
         };
-        AudioIn {
+        RecvSide {
             frames: Some(tx),
             stats,
             stop,
@@ -362,7 +105,7 @@ impl AudioIn {
     }
 }
 
-impl Drop for AudioIn {
+impl Drop for RecvSide {
     fn drop(&mut self) {
         self.stop();
     }
@@ -499,8 +242,7 @@ fn pump_in(
                     break;
                 }
                 for plane in output.iter() {
-                    let v = (plane[i] * 32_768.0).round().clamp(-32_768.0, 32_767.0) as i16;
-                    let _ = producer.push(v);
+                    let _ = producer.push(to_i16(plane[i]));
                 }
             }
         }
@@ -510,8 +252,23 @@ fn pump_in(
     PumpEnd::Stopped
 }
 
+/// One resampled sample, converted to the wire's i16.
+///
+/// Clamping rather than wrapping is the whole point: the sinc resampler overshoots on
+/// near-full-scale input, so values outside +/-1.0 reach this in normal operation, and a
+/// wrapping cast would turn a positive overshoot into a large negative sample — an
+/// audible click with no counter to show for it.
+fn to_i16(v: f32) -> i16 {
+    (v * 32_768.0).round().clamp(-32_768.0, 32_767.0) as i16
+}
+
 fn publish(stats: &InStats, s: JitterStats) {
-    stats.depth_ms.store(s.depth as u64 * 5, Ordering::Relaxed);
+    // The pre-pop depth is the audio *waiting* to be played, which is what the latency
+    // budget in the spec counts. `s.depth` is sampled after the pop removed its frame
+    // and reads one frame lower.
+    stats
+        .depth_ms
+        .store(s.depth_prepop as u64 * 5, Ordering::Relaxed);
     stats.lost.store(s.lost, Ordering::Relaxed);
     stats.late.store(s.late, Ordering::Relaxed);
     stats.underruns.store(s.underruns, Ordering::Relaxed);
@@ -522,112 +279,11 @@ fn publish(stats: &InStats, s: JitterStats) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pheme_audio::mock::MockCapture;
-    use std::time::Instant;
-
-    fn tone() -> Vec<i16> {
-        (0..FRAME_INTERLEAVED).map(|i| (i as i16) - 240).collect()
-    }
-
-    fn silence() -> Vec<i16> {
-        vec![0; FRAME_INTERLEAVED]
-    }
-
-    fn wait_until(mut f: impl FnMut() -> bool, timeout: Duration) -> bool {
-        let t = Instant::now();
-        while t.elapsed() < timeout {
-            if f() {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        f()
-    }
-
-    #[test]
-    fn a_repeating_failure_is_only_loud_once() {
-        let mut log = FailureLog::default();
-        assert!(log.is_new("audio capture unavailable: no PipeWire"));
-        assert!(!log.is_new("audio capture unavailable: no PipeWire"));
-        assert!(!log.is_new("audio capture unavailable: no PipeWire"));
-        assert!(
-            log.is_new("audio capture unavailable: something else"),
-            "a different failure is news again"
-        );
-        log.cleared();
-        assert!(
-            log.is_new("audio capture unavailable: something else"),
-            "a success in between makes the next failure news again"
-        );
-    }
-
-    #[test]
-    fn disabled_audio_starts_no_thread() {
-        let counters = Arc::new(OutCounters::default());
-        let mut out = AudioOut::spawn(CaptureSource::Disabled, counters.clone());
-        out.set_peer(None);
-        out.stop();
-        assert_eq!(counters.sent.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn the_packer_thread_drains_the_ring_with_no_peer_attached() {
-        let (cap, handle) = MockCapture::new();
-        let counters = Arc::new(OutCounters::default());
-        let mut out = AudioOut::spawn(CaptureSource::Backend(Box::new(cap)), counters.clone());
-        assert!(wait_until(|| handle.started(), Duration::from_secs(2)));
-
-        // Twenty bursts of 100 frames. The ring holds 200 frames, so anything that does
-        // not drain continuously overruns.
-        for _ in 0..20 {
-            for _ in 0..100 {
-                handle.push(&tone());
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert_eq!(handle.overruns(), 0, "the packer thread fell behind");
-        out.stop();
-    }
-
-    #[test]
-    fn a_long_silence_is_counted_as_suppressed() {
-        let (cap, handle) = MockCapture::new();
-        let counters = Arc::new(OutCounters::default());
-        let mut out = AudioOut::spawn(CaptureSource::Backend(Box::new(cap)), counters.clone());
-        assert!(wait_until(|| handle.started(), Duration::from_secs(2)));
-
-        for _ in 0..200 {
-            handle.push(&silence());
-            std::thread::sleep(Duration::from_micros(200));
-        }
-        assert!(
-            wait_until(
-                || counters.suppressed.load(Ordering::Relaxed) >= 100,
-                Duration::from_secs(2)
-            ),
-            "expected most of 200 silent frames to be suppressed, got {}",
-            counters.suppressed.load(Ordering::Relaxed)
-        );
-        assert_eq!(
-            counters.sent.load(Ordering::Relaxed),
-            0,
-            "nothing is sent without a peer"
-        );
-        out.stop();
-    }
-
-    #[test]
-    fn an_injected_backend_that_fails_to_start_gives_up_quietly() {
-        let (cap, handle) = MockCapture::new();
-        handle.fail_next_start();
-        let counters = Arc::new(OutCounters::default());
-        let mut out = AudioOut::spawn(CaptureSource::Backend(Box::new(cap)), counters);
-        std::thread::sleep(Duration::from_millis(100));
-        assert!(!handle.started());
-        out.stop(); // must not hang
-    }
-
+    use crate::audio::wait_until;
     use pheme_audio::mock::{MockPlayback, MockPlaybackHandle};
+    use pheme_audio::pack::Packer;
+    use pheme_audio::FRAME_US;
+    use std::time::Duration;
 
     /// The tone's amplitude, measured robustly.
     ///
@@ -663,7 +319,7 @@ mod tests {
     #[test]
     fn disabled_playback_drops_what_it_is_given() {
         let stats = Arc::new(InStats::default());
-        let mut audio = AudioIn::spawn(PlaybackSource::Disabled, stats.clone());
+        let mut audio = RecvSide::spawn(PlaybackSource::Disabled, stats.clone());
         audio.push(Frame {
             seq: 0,
             ts_us: 0,
@@ -688,7 +344,7 @@ mod tests {
     /// ring back up instead costs a stall nothing but time, and keeps pops and pushes
     /// one to one.
     fn play_paced(
-        audio: &AudioIn,
+        audio: &RecvSide,
         handle: &MockPlaybackHandle,
         rate: u32,
         count: usize,
@@ -720,15 +376,13 @@ mod tests {
 
     /// The jitter buffer must be holding about its target: neither empty nor filling.
     ///
-    /// `audio_depth_ms` is the depth sampled just after a pop, so a 2-frame target
-    /// reads as 5 or 10 rather than a flat 10 — the spec's 10-15 ms names the target,
-    /// not the depth — and at 44.1 kHz, where one wire frame resamples to a hair more
-    /// than one device period, it sits at 5 and dips to 0 whenever the worker takes two
-    /// pops to refill the ring. The median is therefore what the lower bound looks at.
-    /// Before the playback mock had a device clock this counter was pinned at 0 for
-    /// whole runs, which is what that bound pins down; the maximum catches a buffer
-    /// that is quietly filling up instead. The first 50 iterations are skipped while
-    /// the buffer prefills.
+    /// `audio_depth_ms` reports the depth *before* each pop, which is the audio waiting
+    /// to be played. With a 2-frame target that reads as 10 ms, dipping to 5 at 44.1 kHz
+    /// where one wire frame resamples to a hair more than one device period and the
+    /// worker occasionally takes two pops to refill the ring. So a lower bound of 5 has
+    /// a whole frame of headroom, where the same number against the post-pop depth had
+    /// none and was a latent flake. The upper bound catches a buffer that is quietly
+    /// filling up; it rises by one frame for the same reason.
     fn assert_the_buffer_holds_audio(depths: &[u64]) {
         let mut steady = depths[50..].to_vec();
         steady.sort_unstable();
@@ -740,7 +394,7 @@ mod tests {
              playback worker is outrunning the sender"
         );
         assert!(
-            max <= 15,
+            max <= 20,
             "jitter depth reached {max} ms: the buffer is filling up, so the sender is \
              outrunning the playback worker"
         );
@@ -750,7 +404,7 @@ mod tests {
     fn frames_reach_the_playback_device() {
         let (play, handle) = MockPlayback::new(48_000);
         let stats = Arc::new(InStats::default());
-        let mut audio = AudioIn::spawn(PlaybackSource::Backend(Box::new(play)), stats.clone());
+        let mut audio = RecvSide::spawn(PlaybackSource::Backend(Box::new(play)), stats.clone());
         assert!(wait_until(|| handle.started(), Duration::from_secs(2)));
 
         let depths = play_paced(&audio, &handle, 48_000, 200);
@@ -802,7 +456,7 @@ mod tests {
     fn a_device_at_another_rate_is_resampled() {
         let (play, handle) = MockPlayback::new(44_100);
         let stats = Arc::new(InStats::default());
-        let mut audio = AudioIn::spawn(PlaybackSource::Backend(Box::new(play)), stats.clone());
+        let mut audio = RecvSide::spawn(PlaybackSource::Backend(Box::new(play)), stats.clone());
         assert!(wait_until(|| handle.started(), Duration::from_secs(2)));
 
         let depths = play_paced(&audio, &handle, 44_100, 200);
@@ -850,9 +504,84 @@ mod tests {
         let (play, handle) = MockPlayback::new(48_000);
         handle.fail_next_start();
         let stats = Arc::new(InStats::default());
-        let mut audio = AudioIn::spawn(PlaybackSource::Backend(Box::new(play)), stats);
+        let mut audio = RecvSide::spawn(PlaybackSource::Backend(Box::new(play)), stats);
         std::thread::sleep(Duration::from_millis(100));
         assert!(!handle.started());
         audio.stop(); // must not hang
+    }
+
+    /// A full-scale sine, which is where a conversion bug shows up.
+    fn loud_sine_frame(i: usize) -> Vec<i16> {
+        let mut out = Vec::with_capacity(FRAME_INTERLEAVED);
+        for n in 0..FRAME_SAMPLES {
+            let t = (i * FRAME_SAMPLES + n) as f32 / 48_000.0;
+            let v = (32_000.0 * (2.0 * std::f32::consts::PI * 440.0 * t).sin()) as i16;
+            out.push(v);
+            out.push(v);
+        }
+        out
+    }
+
+    #[test]
+    fn a_full_scale_signal_is_not_clipped_wrapped_or_inverted() {
+        let (play, handle) = MockPlayback::new(48_000);
+        let stats = Arc::new(InStats::default());
+        let mut audio = RecvSide::spawn(PlaybackSource::Backend(Box::new(play)), stats.clone());
+        assert!(wait_until(|| handle.started(), Duration::from_secs(2)));
+
+        let mut packer = Packer::new();
+        for i in 0..200 {
+            let f = packer
+                .push(&loud_sine_frame(i), i as u64 * FRAME_US)
+                .expect("a sine is never silent");
+            audio.push(f);
+            handle.drain_frames(1);
+            assert!(wait_until(
+                || handle.queued() >= FRAME_INTERLEAVED,
+                Duration::from_secs(5)
+            ));
+        }
+        audio.stop();
+
+        let rec = handle.recorded();
+        // Skip the prefill, where the worker is emitting silence.
+        let body = &rec[FRAME_INTERLEAVED * 10..];
+        let peak = body.iter().map(|s| i32::from(*s).abs()).max().unwrap_or(0);
+        // The upper bound is 32_768, not 32_767: `i16::MIN.abs()` is 32768, and -32768 is
+        // exactly what the production clamp produces when the resampler's sinc overshoot
+        // on a near-full-scale signal reaches the rail. That is correct behaviour, not
+        // clipping damage. The bound that earns its keep here is the lower one, which
+        // catches attenuation; wrapping is caught by `to_i16`'s own test below, since a
+        // wrapping cast turns an overshoot into a sign flip rather than a rail hit.
+        assert!(
+            (30_000..=32_768).contains(&peak),
+            "peak {peak} out of a 32000 input: the signal was clipped or attenuated"
+        );
+
+        // The wrap check is NOT done here. A pipeline recording legitimately contains
+        // large inter-sample steps: the jitter buffer emits a silence frame when it has
+        // nothing (`Pop::Idle`) and a full-gain copy of the previous frame when it
+        // conceals (`Pop::Conceal`), and either one is a phase discontinuity in a
+        // continuous sine — up to 32 768 for a drop to silence and roughly twice that
+        // across a half period. A step bound here would be measuring whether the buffer
+        // ever ran dry, not whether the conversion wrapped. The conversion is pinned
+        // directly instead, by `to_i16`'s own test below.
+    }
+
+    #[test]
+    fn the_sample_conversion_clamps_instead_of_wrapping() {
+        // Debt (e), pinned where it actually lives. The resampler overshoots on
+        // near-full-scale input, so values outside +/-1.0 reach this conversion in normal
+        // operation; a wrapping cast would turn a positive overshoot into a large
+        // negative sample, which is an audible click with no counter to show for it.
+        assert_eq!(to_i16(0.0), 0);
+        assert_eq!(to_i16(0.5), 16_384);
+        assert_eq!(to_i16(-0.5), -16_384);
+        assert_eq!(to_i16(1.0), 32_767, "the positive rail");
+        assert_eq!(to_i16(-1.0), -32_768, "the negative rail");
+        assert_eq!(to_i16(1.5), 32_767, "an overshoot clamps, it does not wrap");
+        assert_eq!(to_i16(-1.5), -32_768, "and the same below");
+        assert_eq!(to_i16(1e9), 32_767, "however far outside it lands");
+        assert_eq!(to_i16(-1e9), -32_768);
     }
 }

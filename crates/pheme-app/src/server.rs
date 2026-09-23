@@ -14,7 +14,7 @@ use pheme_proto::{AudioParams, AudioStream, Msg, PROTOCOL_VERSION};
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
-use crate::audio::{AudioIn, InStats, PlaybackSource};
+use crate::audio::{InStats, PlaybackSource, RecvSide};
 use crate::config::{config_dir, Config};
 
 pub struct ServerDeps {
@@ -53,7 +53,7 @@ struct Shared {
     capture: Mutex<Box<dyn InputCapture>>,
     link: Mutex<Option<Link>>,
     counters: Counters,
-    audio: AudioIn,
+    audio: RecvSide,
 }
 
 impl Shared {
@@ -119,7 +119,7 @@ pub async fn run_server(
         audio_stats,
     } = deps;
     let audio_stats = audio_stats.unwrap_or_default();
-    let audio_in = AudioIn::spawn(audio, audio_stats.clone());
+    let audio_in = RecvSide::spawn(audio, audio_stats.clone());
     let (ev_tx, ev_rx) = crossbeam_channel::bounded::<CaptureEvent>(4096);
     capture.start(ev_tx).context("starting input capture")?;
     let screens = capture.screens();

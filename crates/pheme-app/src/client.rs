@@ -10,11 +10,11 @@ use pheme_core::{ClientCore, InjectAction};
 use pheme_input::InputInject;
 use pheme_net::pairing::client_pair;
 use pheme_net::{Endpoint, Identity, NetError, Peer, TrustStore};
-use pheme_proto::{AudioParams, Msg, Os, PROTOCOL_VERSION};
+use pheme_proto::{AudioParams, AudioStream, Msg, Os, PROTOCOL_VERSION};
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
-use crate::audio::{AudioOut, CaptureSource, OutCounters};
+use crate::audio::{CaptureSource, OutCounters, SendSide};
 use crate::backoff::Backoff;
 use crate::config::{config_dir, Config};
 
@@ -94,7 +94,7 @@ pub async fn run_client(
         audio_counters,
     } = deps;
     let counters = audio_counters.unwrap_or_default();
-    let mut audio = AudioOut::spawn(audio, counters.clone());
+    let mut audio = SendSide::spawn(audio, AudioStream::Playback, counters.clone());
     let mut backoff = Backoff::new();
     loop {
         if *shutdown.borrow() {
@@ -148,7 +148,7 @@ async fn session(
     name: &str,
     inject: &mut dyn InputInject,
     stats: bool,
-    audio: &AudioOut,
+    audio: &SendSide,
     counters: &OutCounters,
     shutdown: &mut watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
