@@ -14,7 +14,7 @@ use tracing::{debug, warn};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::Media::Audio::{
-    eConsole, eRender, IAudioCaptureClient, IAudioClient, IAudioRenderClient, IMMDevice,
+    eCapture, eConsole, eRender, IAudioCaptureClient, IAudioClient, IAudioRenderClient, IMMDevice,
     IMMDeviceEnumerator, MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT,
     AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
     AUDCLNT_STREAMFLAGS_LOOPBACK, DEVICE_STATE_ACTIVE, WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
@@ -26,7 +26,7 @@ use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
     COINIT_MULTITHREADED, STGM_READ,
 };
-use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+use windows::Win32::System::Threading::{CreateEventW, ResetEvent, WaitForSingleObject};
 
 use crate::device::{DeviceThread, Ready};
 use crate::{AudioCapture, AudioPlayback, Error, Result, CHANNELS, RATE};
@@ -209,6 +209,68 @@ pub fn open_render_device(name: Option<&str>) -> Result<IMMDevice> {
         enumerator
             .GetDefaultAudioEndpoint(eRender, eConsole)
             .map_err(|e| Error::Device(format!("opening the default render endpoint: {e}")))
+    }
+}
+
+/// Opens a capture endpoint: the one whose friendly name matches `name`, or the default.
+///
+/// A copy of `open_render_device` against `eCapture` endpoints instead of `eRender` ones,
+/// with the same exact-then-substring matching and the same fallback to the default on a
+/// typo or an ambiguous name.
+pub fn open_capture_device(name: Option<&str>) -> Result<IMMDevice> {
+    // SAFETY: standard MMDevice enumeration; every raw pointer stays inside this block.
+    unsafe {
+        let enumerator: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+                .map_err(|e| Error::Device(format!("creating the device enumerator: {e}")))?;
+        // A name that is empty or only spaces is treated as "not configured": every
+        // endpoint contains the empty string, so matching on it would be ambiguous by
+        // construction.
+        if let Some(wanted) = name.map(str::trim).filter(|w| !w.is_empty()) {
+            let collection = enumerator
+                .EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE)
+                .map_err(|e| Error::Device(format!("enumerating capture endpoints: {e}")))?;
+            let count = collection
+                .GetCount()
+                .map_err(|e| Error::Device(format!("counting capture endpoints: {e}")))?;
+            let mut partial: Vec<(IMMDevice, String)> = Vec::new();
+            for i in 0..count {
+                let Ok(dev) = collection.Item(i) else {
+                    continue;
+                };
+                let found = friendly_name(&dev);
+                if found.eq_ignore_ascii_case(wanted) {
+                    return Ok(dev);
+                }
+                if contains_ignore_ascii_case(&found, wanted) {
+                    partial.push((dev, found));
+                }
+            }
+            match partial.len() {
+                1 => {
+                    let (dev, found) = partial.remove(0);
+                    debug!(
+                        device = wanted,
+                        matched = %found,
+                        "matched an audio device by substring"
+                    );
+                    return Ok(dev);
+                }
+                0 => warn!(device = wanted, "no such audio device; using the default"),
+                _ => {
+                    let candidates: Vec<&str> = partial.iter().map(|(_, n)| n.as_str()).collect();
+                    warn!(
+                        device = wanted,
+                        candidates = %candidates.join("; "),
+                        "several audio devices match; using the default. Write more of \
+                         one of the candidate names to pick it"
+                    );
+                }
+            }
+        }
+        enumerator
+            .GetDefaultAudioEndpoint(eCapture, eConsole)
+            .map_err(|e| Error::Device(format!("opening the default capture endpoint: {e}")))
     }
 }
 
@@ -543,6 +605,257 @@ fn capture_session(
     }
 }
 
+/// Records the server's microphone.
+///
+/// Unlike `WasapiCapture`, which loop-backs a render endpoint and therefore has to poll,
+/// this attaches to a real capture endpoint and can be driven by an event.
+pub struct WasapiMic {
+    device: Option<String>,
+    name: Arc<Mutex<String>>,
+    thread: DeviceThread,
+}
+
+impl WasapiMic {
+    pub fn new(device: Option<String>) -> WasapiMic {
+        WasapiMic {
+            device,
+            name: Arc::new(Mutex::new("not started".into())),
+            thread: DeviceThread::new(),
+        }
+    }
+}
+
+impl AudioCapture for WasapiMic {
+    fn start(&mut self, sink: rtrb::Producer<i16>) -> Result<()> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = stop.clone();
+        let device = self.device.clone();
+        let name = self.name.clone();
+        self.thread.start(
+            "pheme-wasapi-mic",
+            START_TIMEOUT,
+            move || stop.store(true, Ordering::SeqCst),
+            move |ready| mic_thread(device, sink, thread_stop, name, ready),
+        )
+    }
+
+    fn device_name(&self) -> String {
+        self.name.lock().unwrap().clone()
+    }
+
+    fn healthy(&self) -> bool {
+        self.thread.healthy()
+    }
+
+    fn stop(&mut self) {
+        self.thread.stop();
+    }
+}
+
+impl Drop for WasapiMic {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn mic_thread(
+    device: Option<String>,
+    mut sink: rtrb::Producer<i16>,
+    stop: Arc<AtomicBool>,
+    name: Arc<Mutex<String>>,
+    ready: Ready,
+) {
+    let _com = match ComGuard::new() {
+        Ok(g) => g,
+        Err(e) => {
+            ready.fail(e);
+            return;
+        }
+    };
+    // Set by `mic_session` the moment `client.Start()` succeeds, i.e. the moment `ready`
+    // has already been (or is about to be) sent an `Ok`. Once true, a session ending is a
+    // reopen-worthy failure rather than a startup failure that must be reported back to
+    // `start()`.
+    let mut signaled = false;
+    let mut dropped_total = 0u64;
+    while !stop.load(Ordering::SeqCst) {
+        match mic_session(
+            device.as_deref(),
+            &mut sink,
+            &stop,
+            &name,
+            &mut dropped_total,
+            &ready,
+            &mut signaled,
+        ) {
+            Ok(()) => {}
+            Err(e) => {
+                if !signaled {
+                    ready.fail(e);
+                    return;
+                }
+                warn!("WASAPI microphone session ended: {e}; reopening");
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+    }
+    debug!(dropped_total, "WASAPI microphone thread finished");
+}
+
+/// One device's worth of microphone capture. Returns when the device is invalidated, or
+/// `stop` is set.
+///
+/// Calls `ready.ok()` and sets `*signaled = true` the instant `client.Start()` succeeds,
+/// exactly as `capture_session` does, so `start()` is unblocked as soon as the device is
+/// actually running rather than once this (normally long-lived) session eventually ends.
+fn mic_session(
+    device: Option<&str>,
+    sink: &mut rtrb::Producer<i16>,
+    stop: &AtomicBool,
+    name: &Mutex<String>,
+    dropped_total: &mut u64,
+    ready: &Ready,
+    signaled: &mut bool,
+) -> Result<()> {
+    // SAFETY: a standard WASAPI event-driven capture session; all raw pointers stay in
+    // this block and every buffer obtained with GetBuffer is released before the next
+    // call.
+    unsafe {
+        let dev = open_capture_device(device)?;
+        *name.lock().unwrap() = friendly_name(&dev);
+        let client: IAudioClient = dev
+            .Activate(CLSCTX_ALL, None)
+            .map_err(|e| Error::Device(format!("activating the audio client: {e}")))?;
+        let mix = client
+            .GetMixFormat()
+            .map_err(|e| Error::Device(format!("reading the mix format: {e}")))?;
+        // `mix` is freed exactly once below, after its last use by either call, so that
+        // an unsupported format (an `Err` from `parse_format`) does not leak the
+        // allocation `GetMixFormat` made. `mix` is the device's own mix format, so
+        // `Initialize` accepting it does not depend on whether `parse_format` liked it.
+        let fmt = parse_format(mix);
+        // Unlike loopback, a real capture endpoint is not initialised with
+        // AUDCLNT_STREAMFLAGS_LOOPBACK, so it can be driven by an event rather than
+        // polled.
+        let init = client.Initialize(
+            AUDCLNT_SHAREMODE_SHARED,
+            AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+            BUFFER_100NS,
+            0,
+            mix,
+            None,
+        );
+        CoTaskMemFree(Some(mix as *const _));
+        let fmt = fmt?;
+        init.map_err(|e| Error::Device(format!("initialising microphone capture: {e}")))?;
+        debug!(?fmt, "WASAPI microphone format");
+
+        let capture: IAudioCaptureClient = client
+            .GetService()
+            .map_err(|e| Error::Device(format!("getting the capture service: {e}")))?;
+        let mut conv = ToWire::new(fmt)?;
+
+        let event: HANDLE = CreateEventW(None, true, false, None)
+            .map_err(|e| Error::Device(format!("creating the microphone event: {e}")))?;
+        let result = mic_loop(
+            &client,
+            event,
+            &capture,
+            sink,
+            stop,
+            &mut conv,
+            dropped_total,
+            ready,
+            signaled,
+        );
+        let _ = client.Stop();
+        // SAFETY: `event` was created by `CreateEventW` just above and is not used again
+        // after this call, on every exit path from this function.
+        let _ = CloseHandle(event);
+        result
+    }
+}
+
+/// # Safety
+/// `client` must already be initialised in event-driven shared mode (this function calls
+/// `Start`, not `Initialize`), and `event` must be a live, manual-reset event handle owned
+/// by the caller for the whole call — this function passes it to `SetEventHandle` itself
+/// but does not create or close it.
+#[allow(clippy::too_many_arguments)]
+unsafe fn mic_loop(
+    client: &IAudioClient,
+    event: HANDLE,
+    capture: &IAudioCaptureClient,
+    sink: &mut rtrb::Producer<i16>,
+    stop: &AtomicBool,
+    conv: &mut ToWire,
+    dropped_total: &mut u64,
+    ready: &Ready,
+    signaled: &mut bool,
+) -> Result<()> {
+    client
+        .SetEventHandle(event)
+        .map_err(|e| Error::Device(format!("SetEventHandle: {e}")))?;
+    client
+        .Start()
+        .map_err(|e| Error::Device(format!("starting microphone capture: {e}")))?;
+    // The device is now actually running: unblock `start()` here rather than only once
+    // this session (normally long-lived) eventually ends. This inversion shipped once
+    // already, in the render path, and made every Windows `start` time out while the
+    // device worked perfectly.
+    *signaled = true;
+    ready.ok();
+
+    while !stop.load(Ordering::SeqCst) {
+        // A 200 ms wait rather than INFINITE so `stop` is noticed promptly, and rather
+        // than the loopback path's 2.5 ms poll because a real capture endpoint can
+        // signal `event` itself. WAIT_TIMEOUT just means no packet arrived yet; anything
+        // else (WAIT_FAILED, WAIT_ABANDONED) is treated as a session failure so it
+        // reopens instead of spinning this loop hot without ever waiting.
+        let waited = WaitForSingleObject(event, 200);
+        if waited == WAIT_TIMEOUT {
+            continue;
+        }
+        if waited != WAIT_OBJECT_0 {
+            return Err(Error::Device(format!(
+                "WaitForSingleObject on the microphone event failed: {waited:?}"
+            )));
+        }
+        // `event` is manual-reset, so it must be cleared here or every future wait would
+        // return immediately instead of actually waiting for the next signal.
+        let _ = ResetEvent(event);
+        loop {
+            let packet = match capture.GetNextPacketSize() {
+                Ok(n) => n,
+                // A break here (rather than returning) would leave the outer loop
+                // spinning on the same invalidated `IAudioCaptureClient` forever, so
+                // this instead ends the session and lets `mic_thread` reopen a fresh
+                // device on its next iteration.
+                Err(e) if e.code() == AUDCLNT_E_DEVICE_INVALIDATED => {
+                    return Err(Error::Device("the audio device was invalidated".into()));
+                }
+                Err(e) => return Err(Error::Device(format!("GetNextPacketSize: {e}"))),
+            };
+            if packet == 0 {
+                break;
+            }
+            let mut data: *mut u8 = std::ptr::null_mut();
+            let mut frames = 0u32;
+            let mut flags = 0u32;
+            if let Err(e) = capture.GetBuffer(&mut data, &mut frames, &mut flags, None, None) {
+                if e.code() == AUDCLNT_E_DEVICE_INVALIDATED {
+                    return Err(Error::Device("the audio device was invalidated".into()));
+                }
+                return Err(Error::Device(format!("GetBuffer: {e}")));
+            }
+            let silent = flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0;
+            *dropped_total += conv.push(data, frames as usize, silent, sink);
+            let _ = capture.ReleaseBuffer(frames);
+        }
+    }
+    Ok(())
+}
+
 /// Plays the worker's samples on the server's speakers.
 ///
 /// The ring it drains is already at the device's rate — the playback worker resamples —
@@ -869,7 +1182,7 @@ unsafe fn render_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::contains_ignore_ascii_case;
+    use super::*;
 
     #[test]
     fn a_configured_name_matches_the_endpoint_it_is_a_prefix_of() {
@@ -890,5 +1203,82 @@ mod tests {
             "CABLE Input (VB-Audio Virtual Cable)",
             "CABLE Output"
         ));
+    }
+
+    fn fmt(rate: u32, channels: usize, float: bool) -> FormatInfo {
+        FormatInfo {
+            rate,
+            channels,
+            float,
+        }
+    }
+
+    /// Feeds `frames` of interleaved i16 through `ToWire` and returns what reached the ring.
+    fn push_i16(info: FormatInfo, src: &[i16], frames: usize) -> Vec<i16> {
+        let mut w = ToWire::new(info).expect("ToWire");
+        let (mut producer, mut consumer) = rtrb::RingBuffer::<i16>::new(1 << 16);
+        unsafe {
+            w.push(src.as_ptr() as *const u8, frames, false, &mut producer);
+        }
+        let mut out = Vec::new();
+        while let Ok(s) = consumer.pop() {
+            out.push(s);
+        }
+        out
+    }
+
+    #[test]
+    fn a_mono_source_is_duplicated_into_both_wire_channels() {
+        // Most microphones are mono and the wire format is stereo. Truncation is the rule
+        // for a source with more channels than the wire; a source with fewer must be
+        // duplicated, and nothing pinned that until now.
+        let src: Vec<i16> = vec![1000, -2000, 3000, -4000];
+        let out = push_i16(fmt(RATE, 1, false), &src, src.len());
+        assert_eq!(out.len(), src.len() * CHANNELS);
+        for (i, pair) in out.chunks_exact(CHANNELS).enumerate() {
+            assert_eq!(pair[0], pair[1], "channels differ at frame {i}");
+            assert_eq!(pair[0], src[i]);
+        }
+    }
+
+    #[test]
+    fn a_source_wider_than_the_wire_is_truncated_not_downmixed() {
+        // 5.1 input: take front left and front right, invent nothing.
+        let src: Vec<i16> = vec![10, 20, 30, 40, 50, 60];
+        let out = push_i16(fmt(RATE, 6, false), &src, 1);
+        assert_eq!(out, vec![10, 20]);
+    }
+
+    #[test]
+    fn a_source_at_the_wire_rate_is_not_resampled() {
+        let w = ToWire::new(fmt(RATE, 2, false)).expect("ToWire");
+        assert!(
+            w.resampler.is_none(),
+            "resampling at a ratio of 1.0 costs latency and CPU for nothing"
+        );
+    }
+
+    #[test]
+    fn a_source_below_the_wire_rate_produces_more_samples_than_it_consumed() {
+        // 44.1 kHz in, 48 kHz out: about 1.088 samples out per sample in. The exact count
+        // depends on the resampler's internal chunking, so bound it rather than pin it.
+        let frames = RESAMPLE_CHUNK * 4;
+        let src: Vec<i16> = (0..frames * 2).map(|i| (i % 1000) as i16).collect();
+        let out = push_i16(fmt(44_100, 2, false), &src, frames);
+        let out_frames = out.len() / CHANNELS;
+        assert!(
+            out_frames > frames,
+            "44.1 kHz must stretch to 48 kHz: {out_frames} frames out of {frames} in"
+        );
+        assert!(
+            out_frames < frames * 3 / 2,
+            "{out_frames} frames is far more than the 1.088 ratio allows"
+        );
+    }
+
+    #[test]
+    fn a_silent_packet_produces_silence_rather_than_reading_the_pointer() {
+        let out = push_i16(fmt(RATE, 2, false), &[], 4);
+        assert_eq!(out, vec![0; 4 * CHANNELS]);
     }
 }
