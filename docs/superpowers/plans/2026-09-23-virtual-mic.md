@@ -2864,11 +2864,21 @@ mod tests {
     }
 
     /// Feeds `frames` of interleaved i16 through `ToWire` and returns what reached the ring.
-    fn push_i16(info: FormatInfo, src: &[i16], frames: usize) -> Vec<i16> {
+    fn push_i16(info: FormatInfo, src: &[i16], frames: usize, silent: bool) -> Vec<i16> {
         let mut w = ToWire::new(info).expect("ToWire");
         let (mut producer, mut consumer) = rtrb::RingBuffer::<i16>::new(1 << 16);
+        // SAFETY: when `silent` is false, `src` holds `frames * channels` samples, which
+        // every caller below satisfies. When it is true we pass null, which `push`'s
+        // contract explicitly allows and which is what a silent WASAPI packet delivers.
+        // Passing an empty slice instead would be undefined behaviour: `[].as_ptr()` is
+        // a non-null dangling pointer, so `push` would read through it.
         unsafe {
-            w.push(src.as_ptr() as *const u8, frames, false, &mut producer);
+            let data = if silent {
+                std::ptr::null()
+            } else {
+                src.as_ptr() as *const u8
+            };
+            w.push(data, frames, silent, &mut producer);
         }
         let mut out = Vec::new();
         while let Ok(s) = consumer.pop() {
@@ -2883,7 +2893,7 @@ mod tests {
         // for a source with more channels than the wire; a source with fewer must be
         // duplicated, and nothing pinned that until now.
         let src: Vec<i16> = vec![1000, -2000, 3000, -4000];
-        let out = push_i16(fmt(RATE, 1, false), &src, src.len());
+        let out = push_i16(fmt(RATE, 1, false), &src, src.len(), false);
         assert_eq!(out.len(), src.len() * CHANNELS);
         for (i, pair) in out.chunks_exact(CHANNELS).enumerate() {
             assert_eq!(pair[0], pair[1], "channels differ at frame {i}");
@@ -2895,7 +2905,7 @@ mod tests {
     fn a_source_wider_than_the_wire_is_truncated_not_downmixed() {
         // 5.1 input: take front left and front right, invent nothing.
         let src: Vec<i16> = vec![10, 20, 30, 40, 50, 60];
-        let out = push_i16(fmt(RATE, 6, false), &src, 1);
+        let out = push_i16(fmt(RATE, 6, false), &src, 1, false);
         assert_eq!(out, vec![10, 20]);
     }
 
@@ -2914,7 +2924,7 @@ mod tests {
         // depends on the resampler's internal chunking, so bound it rather than pin it.
         let frames = RESAMPLE_CHUNK * 4;
         let src: Vec<i16> = (0..frames * 2).map(|i| (i % 1000) as i16).collect();
-        let out = push_i16(fmt(44_100, 2, false), &src, frames);
+        let out = push_i16(fmt(44_100, 2, false), &src, frames, false);
         let out_frames = out.len() / CHANNELS;
         assert!(
             out_frames > frames,
@@ -2928,13 +2938,13 @@ mod tests {
 
     #[test]
     fn a_silent_packet_produces_silence_rather_than_reading_the_pointer() {
-        let out = push_i16(fmt(RATE, 2, false), &[], 4);
+        let out = push_i16(fmt(RATE, 2, false), &[], 4, true);
         assert_eq!(out, vec![0; 4 * CHANNELS]);
     }
 }
 ```
 
-`push_i16` passes an empty slice for the silent case, so `push` must not dereference `data` when `silent` is true — which its safety comment already promises.
+The silent case passes a **null** pointer with `silent: true`, which is what `push`'s safety contract allows and what a real silent WASAPI packet delivers. Passing an empty slice would be undefined behaviour — `[].as_ptr()` is a non-null dangling pointer, so `push` would read through it rather than taking the silent branch.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
