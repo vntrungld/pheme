@@ -745,17 +745,22 @@ mod tests {
         );
         assert!(wait_until(|| handle.started(), SETTLE));
 
+        // Drive the device clock as well as the sender. Without a drain the worker fills
+        // the ring with prefill silence, stops popping, and never reports a depth at all
+        // — the pipeline stalls while the test still looks like it is running one.
         let mut packer = Packer::new();
-        for i in 0..20 {
+        for i in 0..40 {
             let f = packer
                 .push(&sine_frame(i), i as u64 * FRAME_US)
                 .expect("a sine is never silent");
             audio.push(f);
+            handle.drain_frames(1);
         }
         assert!(wait_until(
             || stats.depth_ms.load(Ordering::Relaxed) > 0,
             SETTLE
         ));
+
         let before = stats.resets.load(Ordering::Relaxed);
         audio.reset();
         assert!(
