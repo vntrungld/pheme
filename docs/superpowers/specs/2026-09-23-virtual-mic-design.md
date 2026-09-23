@@ -20,7 +20,8 @@ In:
 - Linux client: a virtual PipeWire `Audio/Source` node named "Pheme Mic".
 - Linux server: microphone capture from the default source or a named one.
 - Windows server: microphone capture through WASAPI on a real `eCapture`
-  endpoint, plus the mono→stereo fix this needs in `ToWire`.
+  endpoint, and tests pinning `ToWire`'s mono and rate conversion, which
+  nothing exercises today.
 - Protocol: `Msg::MicWanted`, `AudioParams` on `Msg::Hello`,
   `PROTOCOL_VERSION` 1 → 2.
 - `pheme-net`: `Msg::Audio` moves off the shared incoming channel.
@@ -410,19 +411,21 @@ sub-project 2 built, this attaches to a capture endpoint and can be
 driven by an event rather than polled, so it does not need the 2.5 ms
 poll loop. Format conversion reuses `ToWire`.
 
-### 6.2 `ToWire` needs a mono path
+### 6.2 `ToWire` already handles a mono source
 
-`ToWire` currently **truncates** channels beyond the first two, which is
-the right rule for sub-project 2's case — a surround output feeding a
-stereo wire format, where truncating avoids inventing a downmix nobody
-asked for. It is wrong in the other direction. A microphone commonly
-reports **one** channel, and truncation then indexes a source channel
-that does not exist.
+An earlier draft of this section claimed `ToWire` would index a channel
+that does not exist when given a single-channel microphone, and that a
+mono path had to be added. That is wrong, and reading the code settled
+it: `push` computes `let src_ch = if ch == 1 { 0 } else { c.min(ch - 1) };`,
+so a one-channel source is already duplicated into both wire channels
+and a source with more channels than the wire is already truncated. No
+change is needed.
 
-A single-channel source must be **duplicated** into both wire channels.
-This is a real bug being fixed, not a new feature: the existing rule was
-written for sources with more channels than the wire, and nothing has
-ever fed it a source with fewer.
+What is missing is a **test**. Nothing exercises `ToWire` with anything
+other than the stereo 48 kHz case sub-project 2 used, so the mono
+duplication and the rate conversion are both unpinned: a regression in
+either would ship silently and pitch-shift or half-silence every
+recording. Sub-project 3 adds those tests rather than the code.
 
 ## 7. `pheme-app` integration
 
