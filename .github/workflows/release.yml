@@ -35,7 +35,19 @@ jobs:
           sudo apt-get install -y libx11-dev libxi-dev libxtst-dev libxfixes-dev \
             libxrandr-dev libpipewire-0.3-dev libspa-0.2-dev clang pkg-config
 
-      - run: cargo build --release --locked
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        run: cargo build --release --locked
+
+      # Link the CRT statically on Windows. Without this the binary imports
+      # VCRUNTIME140.dll, which a clean Windows install does not have, and it dies
+      # at load time with no output at all — not even --version. A single-file CLI
+      # should not require the Visual C++ redistributable.
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: cargo build --release --locked
 
       - name: Package (Linux)
         if: runner.os == 'Linux'
