@@ -26,7 +26,7 @@ use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
     COINIT_MULTITHREADED, STGM_READ,
 };
-use windows::Win32::System::Threading::{CreateEventW, ResetEvent, WaitForSingleObject};
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
 use crate::device::{DeviceThread, Ready};
 use crate::{AudioCapture, AudioPlayback, Error, Result, CHANNELS, RATE};
@@ -755,7 +755,7 @@ fn mic_session(
             .map_err(|e| Error::Device(format!("getting the capture service: {e}")))?;
         let mut conv = ToWire::new(fmt)?;
 
-        let event: HANDLE = CreateEventW(None, true, false, None)
+        let event: HANDLE = CreateEventW(None, false, false, None)
             .map_err(|e| Error::Device(format!("creating the microphone event: {e}")))?;
         let result = mic_loop(
             &client,
@@ -778,7 +778,7 @@ fn mic_session(
 
 /// # Safety
 /// `client` must already be initialised in event-driven shared mode (this function calls
-/// `Start`, not `Initialize`), and `event` must be a live, manual-reset event handle owned
+/// `Start`, not `Initialize`), and `event` must be a live, auto-reset event handle owned
 /// by the caller for the whole call — this function passes it to `SetEventHandle` itself
 /// but does not create or close it.
 #[allow(clippy::too_many_arguments)]
@@ -821,9 +821,6 @@ unsafe fn mic_loop(
                 "WaitForSingleObject on the microphone event failed: {waited:?}"
             )));
         }
-        // `event` is manual-reset, so it must be cleared here or every future wait would
-        // return immediately instead of actually waiting for the next signal.
-        let _ = ResetEvent(event);
         loop {
             let packet = match capture.GetNextPacketSize() {
                 Ok(n) => n,
@@ -1214,11 +1211,19 @@ mod tests {
     }
 
     /// Feeds `frames` of interleaved i16 through `ToWire` and returns what reached the ring.
-    fn push_i16(info: FormatInfo, src: &[i16], frames: usize) -> Vec<i16> {
+    fn push_i16(info: FormatInfo, src: &[i16], frames: usize, silent: bool) -> Vec<i16> {
         let mut w = ToWire::new(info).expect("ToWire");
         let (mut producer, mut consumer) = rtrb::RingBuffer::<i16>::new(1 << 16);
+        // SAFETY: when `silent` is false, `src` holds `frames * channels` samples, which
+        // every caller below satisfies. When it is true we pass null, which `push`'s
+        // contract explicitly allows and which is what a silent WASAPI packet delivers.
         unsafe {
-            w.push(src.as_ptr() as *const u8, frames, false, &mut producer);
+            let data = if silent {
+                std::ptr::null()
+            } else {
+                src.as_ptr() as *const u8
+            };
+            w.push(data, frames, silent, &mut producer);
         }
         let mut out = Vec::new();
         while let Ok(s) = consumer.pop() {
@@ -1233,7 +1238,7 @@ mod tests {
         // for a source with more channels than the wire; a source with fewer must be
         // duplicated, and nothing pinned that until now.
         let src: Vec<i16> = vec![1000, -2000, 3000, -4000];
-        let out = push_i16(fmt(RATE, 1, false), &src, src.len());
+        let out = push_i16(fmt(RATE, 1, false), &src, src.len(), false);
         assert_eq!(out.len(), src.len() * CHANNELS);
         for (i, pair) in out.chunks_exact(CHANNELS).enumerate() {
             assert_eq!(pair[0], pair[1], "channels differ at frame {i}");
@@ -1245,7 +1250,7 @@ mod tests {
     fn a_source_wider_than_the_wire_is_truncated_not_downmixed() {
         // 5.1 input: take front left and front right, invent nothing.
         let src: Vec<i16> = vec![10, 20, 30, 40, 50, 60];
-        let out = push_i16(fmt(RATE, 6, false), &src, 1);
+        let out = push_i16(fmt(RATE, 6, false), &src, 1, false);
         assert_eq!(out, vec![10, 20]);
     }
 
@@ -1264,7 +1269,7 @@ mod tests {
         // depends on the resampler's internal chunking, so bound it rather than pin it.
         let frames = RESAMPLE_CHUNK * 4;
         let src: Vec<i16> = (0..frames * 2).map(|i| (i % 1000) as i16).collect();
-        let out = push_i16(fmt(44_100, 2, false), &src, frames);
+        let out = push_i16(fmt(44_100, 2, false), &src, frames, false);
         let out_frames = out.len() / CHANNELS;
         assert!(
             out_frames > frames,
@@ -1278,7 +1283,7 @@ mod tests {
 
     #[test]
     fn a_silent_packet_produces_silence_rather_than_reading_the_pointer() {
-        let out = push_i16(fmt(RATE, 2, false), &[], 4);
+        let out = push_i16(fmt(RATE, 2, false), &[], 4, true);
         assert_eq!(out, vec![0; 4 * CHANNELS]);
     }
 }
