@@ -1,7 +1,5 @@
 //! `pheme setup`: one-time OS prerequisites.
 
-use anyhow::Context;
-
 pub const UDEV_RULE: &str = "# Pheme: allow members of the input group to create virtual input devices\nKERNEL==\"uinput\", MODE=\"0660\", GROUP=\"input\", TAG+=\"uaccess\"\n";
 
 /// Makes systemd load the `uinput` module at boot (`modprobe uinput` alone does not
@@ -10,6 +8,9 @@ pub const MODULES_LOAD: &str = "uinput\n";
 
 #[cfg(target_os = "linux")]
 pub fn run() -> anyhow::Result<()> {
+    // Imported here rather than at module scope: the Windows and fallback `run`
+    // bodies below do not use it, and an unused import fails `-D warnings` there.
+    use anyhow::Context;
     use std::path::Path;
     use std::process::Command;
 

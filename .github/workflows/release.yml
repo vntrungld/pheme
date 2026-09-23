@@ -1,0 +1,82 @@
+name: release
+
+# Tagging `v*` publishes a GitHub release with binaries attached. Running this
+# workflow by hand from the Actions tab builds the same binaries and leaves them
+# as downloadable artifacts, which is the way to get a build without tagging.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: x86_64-linux
+          - os: windows-latest
+            name: x86_64-windows
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Same packages as the ci workflow: the PipeWire bindings are generated at
+      # build time, so the headers and clang have to be present.
+      - name: Linux build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxi-dev libxtst-dev libxfixes-dev \
+            libxrandr-dev libpipewire-0.3-dev libspa-0.2-dev clang pkg-config
+
+      - run: cargo build --release --locked
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p dist/pheme
+          cp target/release/pheme README.md LICENSE docs/testing.md dist/pheme/
+          tar -C dist -czf pheme-${{ matrix.name }}.tar.gz pheme
+          sha256sum pheme-${{ matrix.name }}.tar.gz > pheme-${{ matrix.name }}.tar.gz.sha256
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/pheme | Out-Null
+          Copy-Item target/release/pheme.exe, README.md, LICENSE, docs/testing.md dist/pheme/
+          Compress-Archive -Path dist/pheme -DestinationPath pheme-${{ matrix.name }}.zip
+          (Get-FileHash pheme-${{ matrix.name }}.zip -Algorithm SHA256).Hash `
+            | Out-File -Encoding ascii pheme-${{ matrix.name }}.zip.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pheme-${{ matrix.name }}
+          path: |
+            pheme-${{ matrix.name }}.*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      # gh is preinstalled on the runner, so no third-party release action is needed.
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            $(find artifacts -type f | sort)
