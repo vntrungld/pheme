@@ -27,9 +27,23 @@ pub(crate) const TICK: Duration = Duration::from_millis(2);
 pub(crate) enum PumpEnd {
     /// A stop was requested, or the channel was dropped: do not rebuild.
     Stopped,
+    /// The gate closed: stop the device and wait for it to open again. Not a failure, so
+    /// it is neither logged as one nor made to serve the five-second retry delay.
+    Unwanted,
     /// The device, or something the pump owns, failed: rebuild after the retry delay.
     Failed(String),
 }
+
+/// How long a `RecvSide` keeps reporting demand after its last consumer left.
+///
+/// Applications probe recording devices — enumerate, open briefly, close — and without a
+/// debounce each probe would open and close the far end's microphone, which is visible to
+/// the user and hard on the device. Only the closing edge waits; a consumer arriving is
+/// reported at once.
+pub(crate) const LINGER: Duration = Duration::from_secs(3);
+
+/// How long a gated `SendSide` sleeps between checks while its gate is shut.
+pub(crate) const GATE_POLL: Duration = Duration::from_millis(20);
 
 /// Logs a repeating failure loudly once and quietly while it repeats unchanged.
 ///

@@ -1,16 +1,18 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use pheme_audio::drift::DriftController;
 use pheme_audio::frame::Frame;
 use pheme_audio::jitter::{JitterBuffer, JitterStats, Pop};
-use pheme_audio::{AudioPlayback, CHANNELS, FRAME_INTERLEAVED, FRAME_SAMPLES, RATE};
+use pheme_audio::{AudioPlayback, Demand, CHANNELS, FRAME_INTERLEAVED, FRAME_SAMPLES, RATE};
 use rubato::Resampler;
+use tokio::sync::watch;
 use tracing::{info, warn};
 
-use super::{nap, FailureLog, PumpEnd, RETRY, TICK};
+use super::{nap, FailureLog, PumpEnd, LINGER, RETRY, TICK};
 
 /// Playback ring, in wire frames' worth of samples. It is sized for the worst plausible
 /// device rate; the worker keeps the actual fill near one frame regardless.
@@ -24,6 +26,14 @@ pub enum PlaybackSource {
     /// Started once and never rebuilt — for tests.
     Backend(Box<dyn AudioPlayback>),
     Disabled,
+}
+
+/// What `pump_in` needs to report demand and act on a reset, bundled so the function
+/// stays under the argument-count lint rather than growing a tenth positional parameter.
+struct DemandGate<'a> {
+    wanted_tx: &'a watch::Sender<bool>,
+    linger: Duration,
+    reset_requested: &'a AtomicBool,
 }
 
 /// Cumulative counters; the stats line reports the difference per interval.
@@ -49,27 +59,44 @@ pub struct RecvSide {
     stats: Arc<InStats>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    wanted_rx: watch::Receiver<bool>,
+    reset_requested: Arc<AtomicBool>,
 }
 
 impl RecvSide {
     pub fn spawn(source: PlaybackSource, stats: Arc<InStats>) -> RecvSide {
+        RecvSide::spawn_with_linger(source, stats, LINGER)
+    }
+
+    /// As `spawn`, with the closing-edge debounce named explicitly. Tests use a short one.
+    pub fn spawn_with_linger(
+        source: PlaybackSource,
+        stats: Arc<InStats>,
+        linger: Duration,
+    ) -> RecvSide {
         let stop = Arc::new(AtomicBool::new(false));
+        let (wanted_tx, wanted_rx) = watch::channel(false);
+        let reset_requested = Arc::new(AtomicBool::new(false));
         if matches!(source, PlaybackSource::Disabled) {
             return RecvSide {
                 frames: None,
                 stats,
                 stop,
                 thread: None,
+                wanted_rx,
+                reset_requested,
             };
         }
         let (tx, rx) = crossbeam_channel::bounded::<Frame>(FRAME_QUEUE);
         let thread = {
             let stop = stop.clone();
             let stats = stats.clone();
+            let reset_requested = reset_requested.clone();
             match std::thread::Builder::new()
                 .name("pheme-audio-in".into())
-                .spawn(move || in_thread(source, rx, stop, stats))
-            {
+                .spawn(move || {
+                    in_thread(source, rx, stop, stats, wanted_tx, linger, reset_requested)
+                }) {
                 Ok(t) => Some(t),
                 Err(e) => {
                     warn!("could not start the audio playback thread: {e}");
@@ -82,6 +109,8 @@ impl RecvSide {
             stats,
             stop,
             thread,
+            wanted_rx,
+            reset_requested,
         }
     }
 
@@ -94,6 +123,25 @@ impl RecvSide {
                 self.stats.dropped.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+
+    /// Whether anything is consuming what this side plays, debounced by the linger.
+    ///
+    /// False whenever no backend is running: a backend that is not running cannot deliver
+    /// audio to anything, so asking the far end to open a microphone for it would be pure
+    /// cost. That is not a violation of the fail-open rule — that rule protects against
+    /// *not knowing*, and this is knowing the answer is no.
+    pub fn wanted(&self) -> watch::Receiver<bool> {
+        self.wanted_rx.clone()
+    }
+
+    /// Drops everything buffered and prefills again.
+    ///
+    /// The client calls this as it asks the server to reopen its microphone, *before* the
+    /// audio starts arriving. The worker acts on it at its next tick, which is within
+    /// `TICK`, long before the first frame of a resumed stream can cross the network.
+    pub fn reset(&self) {
+        self.reset_requested.store(true, Ordering::SeqCst);
     }
 
     pub fn stop(&mut self) {
@@ -116,6 +164,9 @@ fn in_thread(
     rx: Receiver<Frame>,
     stop: Arc<AtomicBool>,
     stats: Arc<InStats>,
+    wanted_tx: watch::Sender<bool>,
+    linger: Duration,
+    reset_requested: Arc<AtomicBool>,
 ) {
     let (device, mut injected, rebuild) = match source {
         PlaybackSource::Detect(d) => (d, None, true),
@@ -124,6 +175,9 @@ fn in_thread(
     };
     let mut failures = FailureLog::default();
     loop {
+        // Between backends nothing can be playing to anyone, so the gate is shut: before
+        // a backend is built, after one stops, and on every return below.
+        let _ = wanted_tx.send(false);
         if stop.load(Ordering::SeqCst) {
             return;
         }
@@ -156,13 +210,20 @@ fn in_thread(
         failures.cleared();
         let rate = backend.rate();
         info!(device = %backend.device_name(), rate, "audio playback started");
-        match pump_in(backend.as_ref(), producer, &rx, &stop, &stats, rate) {
-            PumpEnd::Stopped => {
-                backend.stop();
-                return;
-            }
+        let gate = DemandGate {
+            wanted_tx: &wanted_tx,
+            linger,
+            reset_requested: &reset_requested,
+        };
+        let end = pump_in(backend.as_ref(), producer, &rx, &stop, &stats, rate, &gate);
+        backend.stop();
+        let _ = wanted_tx.send(false);
+        match end {
+            PumpEnd::Stopped => return,
+            // `pump_in` has no gate of its own to close; the enum is shared with
+            // send.rs's `pump_out`, so the match must still cover it.
+            PumpEnd::Unwanted => return,
             PumpEnd::Failed(why) => {
-                backend.stop();
                 failures.report(format!("audio playback stopped: {why}"));
             }
         }
@@ -182,6 +243,7 @@ fn pump_in(
     stop: &AtomicBool,
     stats: &InStats,
     rate: u32,
+    gate: &DemandGate,
 ) -> PumpEnd {
     let base = f64::from(rate) / f64::from(RATE);
     let params = rubato::SincInterpolationParameters {
@@ -204,8 +266,12 @@ fn pump_in(
     let mut drift = DriftController::new(base);
     let frame_out = (FRAME_SAMPLES as f64 * base).ceil() as usize * CHANNELS;
     let keep = 2 * frame_out;
+    let mut idle_since: Option<Instant> = None;
 
     while !stop.load(Ordering::SeqCst) {
+        if gate.reset_requested.swap(false, Ordering::SeqCst) {
+            jitter.restart();
+        }
         if !backend.healthy() {
             return PumpEnd::Failed("the playback device stopped".into());
         }
@@ -244,6 +310,21 @@ fn pump_in(
                 for plane in output.iter() {
                     let _ = producer.push(to_i16(plane[i]));
                 }
+            }
+        }
+        let now = backend.demand();
+        match now {
+            Demand::Idle => {
+                if idle_since.is_none() {
+                    idle_since = Some(Instant::now());
+                }
+                if idle_since.is_some_and(|t| t.elapsed() >= gate.linger) {
+                    let _ = gate.wanted_tx.send(false);
+                }
+            }
+            Demand::Wanted | Demand::Unknown => {
+                idle_since = None;
+                let _ = gate.wanted_tx.send(true);
             }
         }
         publish(stats, jitter.stats());
@@ -569,6 +650,125 @@ mod tests {
         // A step bound here would be measuring whether the buffer ever ran dry, not
         // whether the conversion's rails and scale are correct. Those are pinned directly
         // instead, by `to_i16`'s own test below.
+    }
+
+    const FAST_LINGER: Duration = Duration::from_millis(100);
+
+    #[test]
+    fn demand_is_false_before_a_backend_is_running() {
+        let (play, _handle) = MockPlayback::new(48_000);
+        let stats = Arc::new(InStats::default());
+        let mut audio = RecvSide::spawn_with_linger(
+            PlaybackSource::Backend(Box::new(play)),
+            stats,
+            FAST_LINGER,
+        );
+        // Nothing has reported consumers yet, and a backend that is not running cannot
+        // deliver audio to anything, so asking for a microphone would be pure cost.
+        assert!(!*audio.wanted().borrow());
+        audio.stop();
+    }
+
+    #[test]
+    fn an_unknown_backend_is_treated_as_wanted() {
+        let (play, handle) = MockPlayback::new(48_000);
+        let stats = Arc::new(InStats::default());
+        let mut audio = RecvSide::spawn_with_linger(
+            PlaybackSource::Backend(Box::new(play)),
+            stats,
+            FAST_LINGER,
+        );
+        assert!(wait_until(|| handle.started(), Duration::from_secs(2)));
+        let w = audio.wanted();
+        assert!(
+            wait_until(|| *w.borrow(), Duration::from_secs(2)),
+            "Unknown must mean open, or a backend that cannot detect consumers silently \
+             kills the feature"
+        );
+        audio.stop();
+    }
+
+    #[test]
+    fn an_idle_backend_closes_the_gate_only_after_the_linger() {
+        let (play, handle) = MockPlayback::new(48_000);
+        handle.set_demand(Demand::Wanted);
+        let stats = Arc::new(InStats::default());
+        let mut audio = RecvSide::spawn_with_linger(
+            PlaybackSource::Backend(Box::new(play)),
+            stats,
+            FAST_LINGER,
+        );
+        let w = audio.wanted();
+        assert!(wait_until(|| *w.borrow(), Duration::from_secs(2)));
+
+        handle.set_demand(Demand::Idle);
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(
+            *w.borrow(),
+            "the gate must not close on the first idle poll: applications probe devices"
+        );
+        assert!(
+            wait_until(|| !*w.borrow(), Duration::from_secs(2)),
+            "but it must close once the linger has passed"
+        );
+        audio.stop();
+    }
+
+    #[test]
+    fn a_consumer_returning_inside_the_linger_never_closes_the_gate() {
+        let (play, handle) = MockPlayback::new(48_000);
+        handle.set_demand(Demand::Wanted);
+        let stats = Arc::new(InStats::default());
+        let mut audio = RecvSide::spawn_with_linger(
+            PlaybackSource::Backend(Box::new(play)),
+            stats,
+            Duration::from_millis(400),
+        );
+        let w = audio.wanted();
+        assert!(wait_until(|| *w.borrow(), Duration::from_secs(2)));
+
+        for _ in 0..5 {
+            handle.set_demand(Demand::Idle);
+            std::thread::sleep(Duration::from_millis(80));
+            handle.set_demand(Demand::Wanted);
+            std::thread::sleep(Duration::from_millis(20));
+            assert!(*w.borrow(), "the microphone must not flap");
+        }
+        audio.stop();
+    }
+
+    #[test]
+    fn a_reset_empties_the_buffer() {
+        let (play, handle) = MockPlayback::new(48_000);
+        let stats = Arc::new(InStats::default());
+        let mut audio = RecvSide::spawn_with_linger(
+            PlaybackSource::Backend(Box::new(play)),
+            stats.clone(),
+            FAST_LINGER,
+        );
+        assert!(wait_until(|| handle.started(), Duration::from_secs(2)));
+
+        let mut packer = Packer::new();
+        for i in 0..20 {
+            let f = packer
+                .push(&sine_frame(i), i as u64 * FRAME_US)
+                .expect("a sine is never silent");
+            audio.push(f);
+        }
+        assert!(wait_until(
+            || stats.depth_ms.load(Ordering::Relaxed) > 0,
+            Duration::from_secs(2)
+        ));
+        let before = stats.resets.load(Ordering::Relaxed);
+        audio.reset();
+        assert!(
+            wait_until(
+                || stats.resets.load(Ordering::Relaxed) > before,
+                Duration::from_secs(2)
+            ),
+            "the worker must act on the reset"
+        );
+        audio.stop();
     }
 
     #[test]

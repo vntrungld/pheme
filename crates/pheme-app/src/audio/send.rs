@@ -8,7 +8,7 @@ use pheme_net::PeerSender;
 use pheme_proto::{AudioStream, Msg};
 use tracing::{info, warn};
 
-use super::{nap, FailureLog, PumpEnd, RETRY, TICK};
+use super::{nap, FailureLog, PumpEnd, GATE_POLL, RETRY, TICK};
 
 /// Capture ring, in frames. One second of audio is plenty of slack for a thread that
 /// wakes every 2 ms.
@@ -18,11 +18,37 @@ const CAPTURE_RING_FRAMES: usize = 200;
 pub enum CaptureSource {
     /// Detect the platform backend, optionally naming a device.
     Detect(Option<String>),
-    /// Use this backend. It is started once and never rebuilt, because a `Box` cannot be
-    /// started twice — this variant exists for tests.
+    /// Use this backend. It is started and stopped as often as the gate asks, which is
+    /// what lets a test drive `set_wanted`.
     Backend(Box<dyn AudioCapture>),
     /// Run no audio at all.
     Disabled,
+}
+
+/// Per-tag labels so two `SendSide`s in the same process log distinguishably: once each
+/// role runs both directions, a shared thread name and a shared failure wording make a
+/// failing microphone indistinguishable in the log from a failing speaker capture.
+trait StreamLabel {
+    /// The name given to this side's thread.
+    fn thread_name(&self) -> &'static str;
+    /// What this side's failure messages call the device it opens.
+    fn subject(&self) -> &'static str;
+}
+
+impl StreamLabel for AudioStream {
+    fn thread_name(&self) -> &'static str {
+        match self {
+            AudioStream::Playback => "pheme-audio-out",
+            AudioStream::Mic => "pheme-mic-out",
+        }
+    }
+
+    fn subject(&self) -> &'static str {
+        match self {
+            AudioStream::Playback => "audio capture",
+            AudioStream::Mic => "microphone",
+        }
+    }
 }
 
 #[derive(Default)]
@@ -37,6 +63,7 @@ pub struct OutCounters {
 pub struct SendSide {
     peer: Arc<Mutex<Option<PeerSender>>>,
     stop: Arc<AtomicBool>,
+    wanted: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -50,14 +77,16 @@ impl SendSide {
     ) -> SendSide {
         let peer = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
+        let wanted = Arc::new(AtomicBool::new(true));
         let thread = match source {
             CaptureSource::Disabled => None,
             src => {
                 let peer = peer.clone();
                 let stop = stop.clone();
+                let wanted = wanted.clone();
                 match std::thread::Builder::new()
-                    .name("pheme-audio-out".into())
-                    .spawn(move || out_thread(src, stream, peer, stop, counters))
+                    .name(stream.thread_name().into())
+                    .spawn(move || out_thread(src, stream, peer, stop, counters, wanted))
                 {
                     Ok(t) => Some(t),
                     Err(e) => {
@@ -67,13 +96,27 @@ impl SendSide {
                 }
             }
         };
-        SendSide { peer, stop, thread }
+        SendSide {
+            peer,
+            stop,
+            wanted,
+            thread,
+        }
     }
 
     /// Attaches the session's transport, or detaches it when the session ends. While no
     /// peer is attached the thread keeps draining the device and simply discards frames.
     pub fn set_peer(&self, sender: Option<PeerSender>) {
         *self.peer.lock().unwrap() = sender;
+    }
+
+    /// Opens or closes the capture device.
+    ///
+    /// This stops the device itself rather than merely ceasing to send, so the operating
+    /// system reports the microphone as closed and its indicator goes out. A side nobody
+    /// calls this on stays open, which is what the client's speaker capture wants.
+    pub fn set_wanted(&self, wanted: bool) {
+        self.wanted.store(wanted, Ordering::SeqCst);
     }
 
     pub fn stop(&mut self) {
@@ -96,10 +139,11 @@ fn out_thread(
     peer: Arc<Mutex<Option<PeerSender>>>,
     stop: Arc<AtomicBool>,
     counters: Arc<OutCounters>,
+    wanted: Arc<AtomicBool>,
 ) {
-    let (device, mut injected, rebuild) = match source {
-        CaptureSource::Detect(d) => (d, None, true),
-        CaptureSource::Backend(b) => (None, Some(b), false),
+    let (device, mut injected) = match source {
+        CaptureSource::Detect(d) => (d, None),
+        CaptureSource::Backend(b) => (None, Some(b)),
         CaptureSource::Disabled => return,
     };
     let mut failures = FailureLog::default();
@@ -107,41 +151,60 @@ fn out_thread(
         if stop.load(Ordering::SeqCst) {
             return;
         }
-        let built = match injected.take() {
-            Some(b) => Ok(b),
-            None => pheme_audio::detect_capture(device.as_deref()),
-        };
-        let mut backend = match built {
-            Ok(b) => b,
-            Err(pheme_audio::Error::Unsupported(why)) => {
-                info!("audio capture is not available here: {why}");
+        if !wanted.load(Ordering::SeqCst) {
+            if !nap(GATE_POLL, &stop) {
                 return;
             }
-            Err(e) => {
-                failures.report(format!("audio capture unavailable: {e}"));
-                if !rebuild || !nap(RETRY, &stop) {
+            continue;
+        }
+        // The injected backend is reused across every reopen — it is a test double, and
+        // the gate may start and stop it any number of times over a session. A detected
+        // backend is rebuilt fresh each time instead: a real device that failed to open
+        // is not trusted to succeed if merely retried on the same instance.
+        let mut fresh: Option<Box<dyn AudioCapture>>;
+        let backend: &mut dyn AudioCapture = match injected.as_deref_mut() {
+            Some(b) => b,
+            None => match pheme_audio::detect_capture(device.as_deref()) {
+                Ok(b) => {
+                    fresh = Some(b);
+                    fresh.as_deref_mut().expect("just assigned")
+                }
+                Err(pheme_audio::Error::Unsupported(why)) => {
+                    info!("audio capture is not available here: {why}");
                     return;
                 }
-                continue;
-            }
+                Err(e) => {
+                    failures.report(format!("{} unavailable: {e}", stream.subject()));
+                    if !nap(RETRY, &stop) {
+                        return;
+                    }
+                    continue;
+                }
+            },
         };
         let (producer, consumer) =
             rtrb::RingBuffer::<i16>::new(FRAME_INTERLEAVED * CAPTURE_RING_FRAMES);
         if let Err(e) = backend.start(producer) {
-            failures.report(format!("audio capture failed to start: {e}"));
-            if !rebuild || !nap(RETRY, &stop) {
+            failures.report(format!("{} failed to start: {e}", stream.subject()));
+            if !nap(RETRY, &stop) {
                 return;
             }
             continue;
         }
         failures.cleared();
         info!(device = %backend.device_name(), "audio capture started");
-        let end = pump_out(backend.as_ref(), stream, consumer, &peer, &stop, &counters);
+        let end = pump_out(backend, stream, consumer, &peer, &stop, &counters, &wanted);
         backend.stop();
-        if let PumpEnd::Failed(why) = end {
-            failures.report(format!("audio capture stopped: {why}"));
+        match end {
+            PumpEnd::Stopped => return,
+            // The gate closed. Go straight back to the top: reopening must be prompt,
+            // and a closed gate is not a failure to back off from.
+            PumpEnd::Unwanted => continue,
+            PumpEnd::Failed(why) => {
+                failures.report(format!("{} stopped: {why}", stream.subject()));
+            }
         }
-        if stop.load(Ordering::SeqCst) || !rebuild {
+        if stop.load(Ordering::SeqCst) {
             return;
         }
         if !nap(RETRY, &stop) {
@@ -151,7 +214,7 @@ fn out_thread(
 }
 
 /// Packs whole frames out of the ring and sends them while a peer is attached. Returns
-/// when the backend dies or a stop is requested.
+/// when the gate closes, the backend dies, or a stop is requested.
 fn pump_out(
     backend: &dyn AudioCapture,
     stream: AudioStream,
@@ -159,11 +222,15 @@ fn pump_out(
     peer: &Mutex<Option<PeerSender>>,
     stop: &AtomicBool,
     counters: &OutCounters,
+    wanted: &AtomicBool,
 ) -> PumpEnd {
     let mut packer = Packer::new();
     let mut frame = Vec::with_capacity(FRAME_INTERLEAVED);
     let mut taken = 0u64;
     while !stop.load(Ordering::SeqCst) {
+        if !wanted.load(Ordering::SeqCst) {
+            return PumpEnd::Unwanted;
+        }
         if !backend.healthy() {
             return PumpEnd::Failed("the capture device stopped".into());
         }
@@ -315,5 +382,111 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         assert!(!handle.started());
         out.stop(); // must not hang
+    }
+
+    #[test]
+    fn a_side_that_is_not_wanted_closes_its_device() {
+        let (cap, handle) = MockCapture::new();
+        let counters = Arc::new(OutCounters::default());
+        let mut audio = SendSide::spawn(
+            CaptureSource::Backend(Box::new(cap)),
+            AudioStream::Mic,
+            counters,
+        );
+        assert!(wait_until(|| handle.started(), Duration::from_secs(2)));
+
+        audio.set_wanted(false);
+        assert!(
+            wait_until(|| !handle.started(), Duration::from_secs(2)),
+            "the device must actually close, not merely stop sending: an open microphone \
+             keeps its indicator lit"
+        );
+
+        audio.set_wanted(true);
+        assert!(wait_until(|| handle.started(), Duration::from_secs(2)));
+        assert_eq!(handle.start_count(), 2, "it was really reopened");
+        audio.stop();
+    }
+
+    #[test]
+    fn a_side_nobody_gates_stays_open() {
+        // The client's speaker capture is never gated; it must behave exactly as before.
+        let (cap, handle) = MockCapture::new();
+        let counters = Arc::new(OutCounters::default());
+        let mut audio = SendSide::spawn(
+            CaptureSource::Backend(Box::new(cap)),
+            AudioStream::Playback,
+            counters,
+        );
+        assert!(wait_until(|| handle.started(), Duration::from_secs(2)));
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(handle.started());
+        assert_eq!(handle.start_count(), 1);
+        audio.stop();
+    }
+
+    #[test]
+    fn flipping_the_gate_faster_than_the_device_can_follow_settles_correctly() {
+        // Review Focus 2. An application that opens and closes a recording device in a
+        // burst must leave the gate and the device agreeing, with no wedged state and
+        // no thread left behind.
+        let (cap, handle) = MockCapture::new();
+        let counters = Arc::new(OutCounters::default());
+        let mut audio = SendSide::spawn(
+            CaptureSource::Backend(Box::new(cap)),
+            AudioStream::Mic,
+            counters,
+        );
+        assert!(wait_until(|| handle.started(), Duration::from_secs(2)));
+        for _ in 0..20 {
+            audio.set_wanted(false);
+            audio.set_wanted(true);
+        }
+        assert!(
+            wait_until(|| handle.started(), Duration::from_secs(3)),
+            "the gate ended on `true`, so the device must end open"
+        );
+        audio.set_wanted(false);
+        assert!(
+            wait_until(|| !handle.started(), Duration::from_secs(3)),
+            "the gate ended on `false`, so the device must end closed"
+        );
+        audio.stop();
+    }
+
+    #[test]
+    fn a_wanted_side_whose_device_will_not_open_keeps_retrying_quietly() {
+        // Review Focus 4. The gate says open and the device says no; the retry cycle must
+        // be the ordinary one, and the device must come up on its own once it can.
+        let (cap, handle) = MockCapture::new();
+        handle.fail_next_start();
+        let counters = Arc::new(OutCounters::default());
+        let mut audio = SendSide::spawn(
+            CaptureSource::Backend(Box::new(cap)),
+            AudioStream::Mic,
+            counters,
+        );
+        assert!(
+            wait_until(|| handle.started(), Duration::from_secs(8)),
+            "the retry cycle must bring the microphone up after a failed start"
+        );
+        audio.stop();
+    }
+
+    #[test]
+    fn the_two_streams_get_different_labels() {
+        // Authorised addition beyond the brief: once each role runs two `SendSide`s, a
+        // shared thread name and a shared failure wording make a failing microphone
+        // indistinguishable in the log from a failing speaker capture.
+        assert_ne!(
+            AudioStream::Mic.thread_name(),
+            AudioStream::Playback.thread_name(),
+            "two SendSides sharing a thread name would be indistinguishable in the log"
+        );
+        assert_ne!(
+            AudioStream::Mic.subject(),
+            AudioStream::Playback.subject(),
+            "a failing microphone must not read like a failing speaker capture"
+        );
     }
 }
