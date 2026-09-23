@@ -3890,6 +3890,41 @@ async fn a_client_with_no_virtual_microphone_never_opens_the_server_one() {
 }
 
 #[tokio::test]
+async fn a_reconnecting_client_that_is_still_recording_reopens_the_microphone() {
+    // This is the test that pins the handshake's MicWanted, and the only one that can.
+    //
+    // The demand signal is a watch channel, so the per-change send only fires when the
+    // value *changes*. A fresh session clones a receiver that already sees the current
+    // value, so after a reconnect — where the client's virtual microphone never stopped
+    // reporting Wanted — nothing changes and nothing is sent. Only the unconditional
+    // send after the handshake reopens the far end's microphone.
+    //
+    // Delete that send and this test goes red while everything else stays green: a user
+    // whose network blipped mid-recording would find the microphone shut for good, with
+    // no counter and no log line saying why.
+    let pair = spawn_mic_pair(Demand::Wanted, true);
+    assert!(wait_until(|| pair.server_mic.started(), Duration::from_secs(5)).await);
+    let opened_once = pair.server_mic.start_count();
+
+    // Drop the client's connection without touching its demand, then let it reconnect.
+    pair.drop_client_connection();
+    assert!(
+        wait_until(|| !pair.server_mic.started(), Duration::from_secs(10)).await,
+        "losing the client must close the microphone"
+    );
+    assert!(
+        wait_until(
+            || pair.server_mic.start_count() > opened_once,
+            Duration::from_secs(15)
+        )
+        .await,
+        "the reconnected session must ask for the microphone again, even though the \
+         client's demand never changed"
+    );
+    pair.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_disconnect_closes_the_server_microphone() {
     // Review Focus 1. No client means no consumer. Clearing the peer alone would stop the
     // frames but leave the device open for the life of the process.
@@ -3958,6 +3993,8 @@ async fn a_resumed_stream_is_not_discarded_as_late() {
 ```
 
 `MockCaptureHandle` and `MockPlaybackHandle` are already `Clone`, which the disconnect test needs.
+
+`MicPair` needs one more helper for the reconnect test: `drop_client_connection()`, which closes the client's current QUIC connection without stopping the client task, so its own reconnect loop builds a fresh session. The client already reconnects on its own with backoff; the harness only has to break the link. If that turns out not to be reachable from the test's side, say so rather than weakening the test — the property it pins is the one the review found unguarded.
 
 - [ ] **Step 3: Run the tests**
 
