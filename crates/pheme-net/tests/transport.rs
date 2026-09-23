@@ -181,3 +181,63 @@ async fn dropping_peer_closes_the_connection() {
         "{reason:?}"
     );
 }
+
+/// Audio must not be able to delay input. The two travel on the same QUIC connection and
+/// used to share one bounded channel, so a receiver that stalled for a moment would find
+/// a burst of audio queued ahead of the next mouse movement.
+#[tokio::test]
+async fn audio_cannot_queue_ahead_of_input() {
+    let s = side("server");
+    let c = side("client");
+    trust_each_other(&s, &c);
+    let server = Endpoint::server("127.0.0.1:0".parse().unwrap(), &s.id, s.trust.clone()).unwrap();
+    let addr: SocketAddr = server.local_addr().unwrap();
+    let client = Endpoint::client(&c.id, c.trust.clone()).unwrap();
+
+    let server_task = tokio::spawn(async move {
+        let Incoming::Peer(mut peer) = server.accept().await.unwrap() else {
+            panic!("expected peer")
+        };
+        let mut input = peer.take_incoming();
+        let mut audio = peer.take_audio();
+        // The control stream is ordered and reliable, so the Key sent last arrives; what
+        // matters is that it is not queued behind the audio, which goes to its own
+        // channel entirely.
+        match input.recv().await.unwrap() {
+            Msg::Key { seq: 42, .. } => {}
+            other => panic!("input channel delivered {other:?}"),
+        }
+        let mut frames = 0;
+        while let Ok(Some(m)) = tokio::time::timeout(Duration::from_secs(2), audio.recv()).await {
+            assert!(
+                matches!(m, Msg::Audio { .. }),
+                "the audio channel carried {m:?}"
+            );
+            frames += 1;
+            if frames == 8 {
+                break;
+            }
+        }
+        assert_eq!(frames, 8, "every audio frame reached the audio channel");
+        peer.close("done");
+    });
+
+    let peer = client.connect(addr).await.unwrap();
+    for seq in 0..8 {
+        peer.sender().send_datagram(&Msg::Audio {
+            stream: pheme_proto::AudioStream::Mic,
+            seq,
+            ts_us: u64::from(seq) * 5_000,
+            samples: vec![0u8; 960],
+        });
+    }
+    peer.sender()
+        .send_control(&Msg::Key {
+            seq: 42,
+            code: pheme_proto::KeyCode(0x04),
+            down: true,
+        })
+        .await
+        .unwrap();
+    server_task.await.unwrap();
+}

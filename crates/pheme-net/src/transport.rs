@@ -18,6 +18,13 @@ use crate::verifier::PinnedVerifier;
 use crate::{NetError, Result, ALPN_MAIN, ALPN_PAIR};
 
 const CONTROL_BUFFER: usize = 256;
+/// Audio frames the receiver may queue before dropping them.
+///
+/// Small on purpose. `JitterBuffer` downstream has a ceiling of 24 frames, so a deeper
+/// queue here can only add latency that the buffer will then discard; and a full channel
+/// dropping a frame is a loss the jitter buffer conceals, whereas a full *shared* channel
+/// used to mean a mouse event waiting behind 1.28 s of audio.
+const AUDIO_BUFFER: usize = 32;
 /// How long `accept()` waits for a connected, trusted peer to open its control stream before
 /// giving up on it and moving on to the next connection.
 const CONTROL_STREAM_TIMEOUT: Duration = Duration::from_secs(5);
@@ -392,6 +399,7 @@ pub struct Peer {
     fingerprint: String,
     sender: PeerSender,
     incoming: Option<mpsc::Receiver<Msg>>,
+    audio: Option<mpsc::Receiver<Msg>>,
 }
 
 impl Peer {
@@ -403,11 +411,21 @@ impl Peer {
         mut recv: RecvStream,
     ) -> Peer {
         let (tx, rx) = mpsc::channel(CONTROL_BUFFER);
+        let (audio_tx, audio_rx) = mpsc::channel(AUDIO_BUFFER);
         let control_tx = tx.clone();
+        let control_audio_tx = audio_tx.clone();
         tokio::spawn(async move {
             let mut buf = Vec::with_capacity(256);
             loop {
                 match framing::read_frame(&mut recv, &mut buf).await {
+                    // Audio can also arrive on the control stream if a peer misbehaves, or a
+                    // future version routes it there; keep it out of the input channel either
+                    // way, so `take_incoming()` never yields a `Msg::Audio`.
+                    Ok(Some(m @ Msg::Audio { .. })) => {
+                        if control_audio_tx.try_send(m).is_err() {
+                            debug!("audio channel full; dropping a frame");
+                        }
+                    }
                     Ok(Some(m)) => {
                         if control_tx.send(m).await.is_err() {
                             break;
@@ -425,6 +443,13 @@ impl Peer {
         tokio::spawn(async move {
             while let Ok(bytes) = dgram_conn.read_datagram().await {
                 match decode(&bytes) {
+                    Ok(m @ Msg::Audio { .. }) => {
+                        // Never block the datagram reader on a slow audio consumer:
+                        // a dropped frame is concealed, a stalled reader delays input.
+                        if audio_tx.try_send(m).is_err() {
+                            debug!("audio channel full; dropping a frame");
+                        }
+                    }
                     Ok(m) => {
                         if tx.send(m).await.is_err() {
                             break;
@@ -444,6 +469,7 @@ impl Peer {
             fingerprint,
             sender,
             incoming: Some(rx),
+            audio: Some(audio_rx),
         }
     }
 
@@ -463,11 +489,19 @@ impl Peer {
         self.sender.clone()
     }
 
-    /// Takes the merged control+datagram receiver. Panics if called twice.
+    /// Takes the control and non-audio datagram receiver. Panics if called twice.
     pub fn take_incoming(&mut self) -> mpsc::Receiver<Msg> {
         self.incoming
             .take()
             .expect("incoming receiver already taken")
+    }
+
+    /// Takes the receiver carrying `Msg::Audio` and nothing else. Panics if called twice.
+    ///
+    /// Audio is deliberately not merged with the input channel: they share a connection
+    /// but not a deadline. Input must never wait behind audio.
+    pub fn take_audio(&mut self) -> mpsc::Receiver<Msg> {
+        self.audio.take().expect("audio receiver already taken")
     }
 
     pub fn rtt(&self) -> Duration {

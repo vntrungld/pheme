@@ -276,6 +276,7 @@ async fn handle_peer(
     mut router_dead: watch::Receiver<()>,
 ) -> anyhow::Result<()> {
     let mut rx = peer.take_incoming();
+    let mut audio_rx = peer.take_audio();
     let hello = tokio::select! {
         _ = shutdown.changed() => {
             peer.close("server shutting down");
@@ -349,6 +350,13 @@ async fn handle_peer(
             msg = rx.recv() => match msg {
                 Some(Msg::Ping(n)) => { let _ = peer.sender().send_control(&Msg::Pong(n)).await; }
                 Some(Msg::Bye { reason }) => { info!(%reason, "client said bye"); break Ok(()); }
+                Some(other) => tracing::debug!(?other, "ignoring message from client"),
+                None => break Ok(()),
+            },
+            // Temporary: Task 14 rewrites this arm with a stream-tag check and a format
+            // gate. For now the `Msg::Audio` handling just moved here unchanged, since
+            // `take_incoming()` no longer carries audio at all.
+            msg = audio_rx.recv() => match msg {
                 Some(Msg::Audio {
                     stream: AudioStream::Playback,
                     seq,
