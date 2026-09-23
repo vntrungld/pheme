@@ -211,3 +211,27 @@ pub fn detect_virtual_mic(device: Option<&str>) -> Result<Box<dyn AudioPlayback>
         ))
     }
 }
+
+/// Picks the server's microphone backend for this OS. `device` names a specific device;
+/// `None` means the platform default.
+pub fn detect_mic(device: Option<&str>) -> Result<Box<dyn AudioCapture>> {
+    #[cfg(target_os = "linux")]
+    {
+        Ok(Box::new(linux_pipewire::PipewireMic::new(
+            device.map(str::to_string),
+        )))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        Ok(Box::new(windows::wasapi::WasapiMic::new(
+            device.map(str::to_string),
+        )))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        let _ = device;
+        Err(Error::Unsupported(
+            "no microphone capture backend for this platform".into(),
+        ))
+    }
+}

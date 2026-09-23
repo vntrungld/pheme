@@ -42,12 +42,16 @@ enum Cmd {
     Stop,
 }
 
-/// Builds the SPA pod describing our one and only format: S16LE, 48 kHz, stereo.
-fn format_pod() -> Result<Vec<u8>> {
+/// Builds the SPA pod describing S16LE at 48 kHz with `channels` channels.
+///
+/// Channel positions are declared explicitly rather than left unpositioned: negotiating
+/// a stereo mix from an unpositioned source into a positioned sink segfaults inside
+/// `libspa-audioconvert`, which cost a core dump to find.
+fn format_pod(channels: usize) -> Result<Vec<u8>> {
     let mut info = AudioInfoRaw::new();
     info.set_format(AudioFormat::S16LE);
     info.set_rate(RATE);
-    info.set_channels(CHANNELS as u32);
+    info.set_channels(channels as u32);
     // `AudioInfoRaw::new()` leaves the channel-position array unpositioned (all-zero,
     // `AudioInfoRawFlags::UNPOSITIONED`). That is fine for the capture side, whose peer
     // is always another PipeWire stream on the *input* side of the conversion. For
@@ -57,12 +61,16 @@ fn format_pod() -> Result<Vec<u8>> {
     // (segfault inside the channel-mix code, reproduced with a minimal scratch
     // reproduction and a core dump backtrace through
     // `pw_main_loop_run -> ... -> libspa-audioconvert.so`, with no Rust frames beyond
-    // `MainLoop::run`). Declaring the two channels explicitly as front-left/front-right
-    // — exactly what CHANNELS = 2 always means in this crate — avoids that code path
-    // entirely and matches how the upstream `tone.rs` example builds its format.
+    // `MainLoop::run`). Declaring channel positions explicitly — front-left/front-right
+    // for stereo, or the single mono position for a one-channel node — avoids that code
+    // path entirely and matches how the upstream `tone.rs` example builds its format.
     let mut position = [0u32; pw::spa::param::audio::MAX_CHANNELS];
-    position[0] = pw::spa::sys::SPA_AUDIO_CHANNEL_FL;
-    position[1] = pw::spa::sys::SPA_AUDIO_CHANNEL_FR;
+    if channels == 1 {
+        position[0] = pw::spa::sys::SPA_AUDIO_CHANNEL_MONO;
+    } else {
+        position[0] = pw::spa::sys::SPA_AUDIO_CHANNEL_FL;
+        position[1] = pw::spa::sys::SPA_AUDIO_CHANNEL_FR;
+    }
     info.set_position(position);
     let obj = Object {
         type_: SpaTypes::ObjectParamFormat.as_raw(),
@@ -118,7 +126,31 @@ impl AudioCapture for PipewireCapture {
             move || {
                 let _ = cmd_tx.send(Cmd::Stop);
             },
-            move |ready| capture_thread(sink, ready, cmd_rx),
+            move |ready| {
+                // Built on the device thread, not before it is spawned: `PropertiesBox`
+                // wraps a raw `pw_properties` pointer and is not `Send`.
+                //
+                // `Direction::Input` plus `media.class = Audio/Sink` is what makes this
+                // a sink that other applications can select, rather than a recording
+                // stream.
+                let props = pw::properties::properties! {
+                    *pw::keys::MEDIA_TYPE => "Audio",
+                    *pw::keys::MEDIA_CATEGORY => "Capture",
+                    *pw::keys::MEDIA_CLASS => "Audio/Sink",
+                    *pw::keys::MEDIA_ROLE => "Music",
+                    *pw::keys::NODE_NAME => "pheme-speaker",
+                    *pw::keys::NODE_DESCRIPTION => "Pheme Speaker",
+                    *pw::keys::AUDIO_RATE => "48000",
+                    *pw::keys::AUDIO_CHANNELS => "2",
+                    *pw::keys::NODE_LATENCY => "240/48000",
+                };
+                if let Err(e) = capture_run(props, sink, &ready, cmd_rx, "Pheme Speaker") {
+                    warn!("Pheme Speaker could not start: {e}");
+                    // `capture_run` only returns `Err` before it has sent a readiness
+                    // reply, so this is the one and only reply in the failure path.
+                    ready.fail(e);
+                }
+            },
         )
     }
 
@@ -148,21 +180,20 @@ struct CaptureData {
     sink: rtrb::Producer<i16>,
 }
 
-fn capture_thread(sink: rtrb::Producer<i16>, ready: Ready, cmd_rx: pw::channel::Receiver<Cmd>) {
-    if let Err(e) = run(sink, &ready, cmd_rx) {
-        warn!("Pheme Speaker could not start: {e}");
-        // `run` only returns `Err` before it has sent a readiness reply, so this is the
-        // one and only reply in the failure path.
-        ready.fail(e);
-    }
-}
-
-/// Builds the node, runs the main loop until told to stop, and tears the node down.
+/// The capture side of both PipeWire backends: build a node from `props`, drain its
+/// buffers into `sink` until asked to stop.
 ///
 /// On success this sends `Ok(())` on `ready` once the node is connected and then blocks
 /// in `mainloop.run()` until a `Cmd::Stop` arrives. On failure it returns `Err` without
-/// sending anything, leaving the reply to the caller in `capture_thread`.
-fn run(sink: rtrb::Producer<i16>, ready: &Ready, cmd_rx: pw::channel::Receiver<Cmd>) -> Result<()> {
+/// sending anything, leaving the caller to reply on `ready`. `label` names the node in
+/// log messages; the virtual sink and the microphone differ only in `props` and `label`.
+fn capture_run(
+    props: pw::properties::PropertiesBox,
+    sink: rtrb::Producer<i16>,
+    ready: &Ready,
+    cmd_rx: pw::channel::Receiver<Cmd>,
+    label: &str,
+) -> Result<()> {
     let mainloop = pw::main_loop::MainLoopRc::new(None)
         .map_err(|e| Error::Device(format!("creating the PipeWire main loop: {e}")))?;
     let context = pw::context::ContextRc::new(&mainloop, None)
@@ -189,24 +220,8 @@ fn run(sink: rtrb::Producer<i16>, ready: &Ready, cmd_rx: pw::channel::Receiver<C
         })
         .register();
 
-    // `Direction::Input` plus `media.class = Audio/Sink` is what makes this a sink that
-    // other applications can select, rather than a recording stream.
-    let stream = pw::stream::StreamBox::new(
-        &core,
-        "pheme-speaker",
-        pw::properties::properties! {
-            *pw::keys::MEDIA_TYPE => "Audio",
-            *pw::keys::MEDIA_CATEGORY => "Capture",
-            *pw::keys::MEDIA_CLASS => "Audio/Sink",
-            *pw::keys::MEDIA_ROLE => "Music",
-            *pw::keys::NODE_NAME => "pheme-speaker",
-            *pw::keys::NODE_DESCRIPTION => "Pheme Speaker",
-            *pw::keys::AUDIO_RATE => "48000",
-            *pw::keys::AUDIO_CHANNELS => "2",
-            *pw::keys::NODE_LATENCY => "240/48000",
-        },
-    )
-    .map_err(|e| Error::Device(format!("creating the Pheme Speaker node: {e}")))?;
+    let stream = pw::stream::StreamBox::new(&core, label, props)
+        .map_err(|e| Error::Device(format!("creating the {label} node: {e}")))?;
 
     let _listener = stream
         .add_local_listener_with_user_data(CaptureData { sink })
@@ -233,10 +248,11 @@ fn run(sink: rtrb::Producer<i16>, ready: &Ready, cmd_rx: pw::channel::Receiver<C
         .state_changed({
             let quit_loop = mainloop.clone();
             let mut streamed = false;
+            let label = label.to_string();
             move |_, _, old, new| {
-                debug!(?old, ?new, "Pheme Speaker state");
+                debug!(?old, ?new, label, "capture stream state");
                 if let Some(why) = stream_died(&mut streamed, &new) {
-                    warn!("Pheme Speaker is gone: {why}; ending the PipeWire thread");
+                    warn!("{label} is gone: {why}; ending the PipeWire thread");
                     quit_loop.quit();
                 }
             }
@@ -244,7 +260,7 @@ fn run(sink: rtrb::Producer<i16>, ready: &Ready, cmd_rx: pw::channel::Receiver<C
         .register()
         .map_err(|e| Error::Device(format!("registering the stream listener: {e}")))?;
 
-    let bytes = format_pod()?;
+    let bytes = format_pod(CHANNELS)?;
     let mut params = [Pod::from_bytes(&bytes)
         .ok_or_else(|| Error::Backend("the audio format pod is malformed".into()))?];
     stream
@@ -254,7 +270,7 @@ fn run(sink: rtrb::Producer<i16>, ready: &Ready, cmd_rx: pw::channel::Receiver<C
             StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS,
             &mut params,
         )
-        .map_err(|e| Error::Device(format!("connecting the Pheme Speaker node: {e}")))?;
+        .map_err(|e| Error::Device(format!("connecting the {label} node: {e}")))?;
 
     let quit_loop = mainloop.clone();
     let _receiver = cmd_rx.attach(mainloop.loop_(), move |cmd| match cmd {
@@ -462,7 +478,7 @@ fn play_run(
         .register()
         .map_err(|e| Error::Device(format!("registering the stream listener: {e}")))?;
 
-    let bytes = format_pod()?;
+    let bytes = format_pod(CHANNELS)?;
     let mut params = [Pod::from_bytes(&bytes)
         .ok_or_else(|| Error::Backend("the audio format pod is malformed".into()))?];
     stream
@@ -488,12 +504,99 @@ fn play_run(
     Ok(())
 }
 
+/// The server's microphone: a recording stream against a real capture device.
+pub struct PipewireMic {
+    device: Option<String>,
+    thread: DeviceThread,
+}
+
+impl PipewireMic {
+    /// `device` is matched by PipeWire as `target.object`, i.e. against a node name or
+    /// serial, exactly as `PipewirePlayback` matches an output. `pactl list sources
+    /// short` prints the node names. An unknown value falls back to the default source.
+    pub fn new(device: Option<String>) -> PipewireMic {
+        PipewireMic {
+            device,
+            thread: DeviceThread::new(),
+        }
+    }
+}
+
+impl AudioCapture for PipewireMic {
+    fn start(&mut self, sink: rtrb::Producer<i16>) -> Result<()> {
+        init();
+        let (cmd_tx, cmd_rx) = pw::channel::channel::<Cmd>();
+        let device = self.device.clone();
+        self.thread.start(
+            "pheme-pw-mic-cap",
+            START_TIMEOUT,
+            move || {
+                let _ = cmd_tx.send(Cmd::Stop);
+            },
+            move |ready| {
+                // Built on the device thread, not before it is spawned: `PropertiesBox`
+                // wraps a raw `pw_properties` pointer and is not `Send`.
+                let mut props = pw::properties::properties! {
+                    *pw::keys::MEDIA_TYPE => "Audio",
+                    *pw::keys::MEDIA_CATEGORY => "Capture",
+                    *pw::keys::MEDIA_CLASS => "Stream/Input/Audio",
+                    *pw::keys::MEDIA_ROLE => "Communication",
+                    *pw::keys::NODE_NAME => "pheme-mic-capture",
+                    *pw::keys::NODE_DESCRIPTION => "Pheme microphone capture",
+                    *pw::keys::AUDIO_RATE => "48000",
+                    *pw::keys::AUDIO_CHANNELS => "2",
+                    *pw::keys::NODE_LATENCY => "240/48000",
+                };
+                if let Some(d) = device.as_deref() {
+                    // `pw::keys::TARGET_OBJECT` exists only under the "v0_3_44"
+                    // feature, which this crate deliberately does not enable (see the
+                    // Cargo.toml comment on the `pipewire` dependency, and
+                    // `play_run`'s matching device property above). The property name
+                    // is a stable part of the PipeWire protocol regardless of which
+                    // pipewire-rs binding exposes a constant for it, so it is spelled
+                    // out here as a plain string.
+                    props.insert("target.object", d);
+                }
+                if let Err(e) = capture_run(props, sink, &ready, cmd_rx, "Pheme microphone") {
+                    warn!("Pheme microphone could not start: {e}");
+                    // `capture_run` only returns `Err` before it has sent a readiness
+                    // reply, so this is the one and only reply in the failure path.
+                    ready.fail(e);
+                }
+            },
+        )
+    }
+
+    fn device_name(&self) -> String {
+        self.device
+            .clone()
+            .unwrap_or_else(|| "default source".into())
+    }
+
+    fn healthy(&self) -> bool {
+        self.thread.healthy()
+    }
+
+    fn stop(&mut self) {
+        self.thread.stop();
+    }
+}
+
+impl Drop for PipewireMic {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 /// The client's virtual microphone: we write samples, applications record them.
 ///
 /// The mirror of `PipewireCapture`. `Direction::Output` plus `media.class = Audio/Source`
 /// is what makes this a recording device other applications can select, rather than a
 /// playback stream.
 pub struct PipewireVirtualSource {
+    node: String,
+    description: String,
+    channels: usize,
     demand: Arc<AtomicU8>,
     thread: DeviceThread,
 }
@@ -511,7 +614,16 @@ impl Default for PipewireVirtualSource {
 
 impl PipewireVirtualSource {
     pub fn new() -> PipewireVirtualSource {
+        PipewireVirtualSource::with_channels("pheme-mic", "Pheme Mic", CHANNELS)
+    }
+
+    /// The general form. Only tests pass anything but `CHANNELS`: production has one
+    /// audio format and it is stereo.
+    pub fn with_channels(node: &str, description: &str, channels: usize) -> PipewireVirtualSource {
         PipewireVirtualSource {
+            node: node.to_string(),
+            description: description.to_string(),
+            channels,
             // Unknown until the node exists: until then we do not know, and not knowing
             // means keep the far end's microphone open.
             demand: Arc::new(AtomicU8::new(DEMAND_UNKNOWN)),
@@ -525,13 +637,18 @@ impl AudioPlayback for PipewireVirtualSource {
         init();
         let (cmd_tx, cmd_rx) = pw::channel::channel::<Cmd>();
         let demand = self.demand.clone();
+        let node = self.node.clone();
+        let description = self.description.clone();
+        let channels = self.channels;
         self.thread.start(
             "pheme-pw-mic",
             START_TIMEOUT,
             move || {
                 let _ = cmd_tx.send(Cmd::Stop);
             },
-            move |ready| virtual_source_thread(source, demand, ready, cmd_rx),
+            move |ready| {
+                virtual_source_thread(source, node, description, channels, demand, ready, cmd_rx)
+            },
         )
     }
 
@@ -542,7 +659,7 @@ impl AudioPlayback for PipewireVirtualSource {
     }
 
     fn device_name(&self) -> String {
-        "Pheme Mic".into()
+        self.description.clone()
     }
 
     fn healthy(&self) -> bool {
@@ -582,16 +699,28 @@ impl Drop for PipewireVirtualSource {
 /// lock-free and never allocates, and an empty ring simply yields silence.
 struct VirtualSourceData {
     source: rtrb::Consumer<i16>,
+    channels: usize,
 }
 
 fn virtual_source_thread(
     source: rtrb::Consumer<i16>,
+    node: String,
+    description: String,
+    channels: usize,
     demand: Arc<AtomicU8>,
     ready: Ready,
     cmd_rx: pw::channel::Receiver<Cmd>,
 ) {
-    if let Err(e) = source_run(source, demand, &ready, cmd_rx) {
-        warn!("Pheme Mic could not start: {e}");
+    if let Err(e) = source_run(
+        source,
+        &node,
+        &description,
+        channels,
+        demand,
+        &ready,
+        cmd_rx,
+    ) {
+        warn!("{description} could not start: {e}");
         // `source_run` only returns `Err` before it has sent a readiness reply, so this
         // is the one and only reply in the failure path.
         ready.fail(e);
@@ -604,6 +733,9 @@ fn virtual_source_thread(
 /// channel receiver's lifetime to the `MainLoopRc` local that produced it.
 fn source_run(
     source: rtrb::Consumer<i16>,
+    node: &str,
+    description: &str,
+    channels: usize,
     demand: Arc<AtomicU8>,
     ready: &Ready,
     cmd_rx: pw::channel::Receiver<Cmd>,
@@ -636,23 +768,23 @@ fn source_run(
 
     let stream = pw::stream::StreamBox::new(
         &core,
-        "pheme-mic",
+        node,
         pw::properties::properties! {
             *pw::keys::MEDIA_TYPE => "Audio",
             *pw::keys::MEDIA_CATEGORY => "Playback",
             *pw::keys::MEDIA_CLASS => "Audio/Source",
             *pw::keys::MEDIA_ROLE => "Communication",
-            *pw::keys::NODE_NAME => "pheme-mic",
-            *pw::keys::NODE_DESCRIPTION => "Pheme Mic",
+            *pw::keys::NODE_NAME => node,
+            *pw::keys::NODE_DESCRIPTION => description,
             *pw::keys::AUDIO_RATE => "48000",
-            *pw::keys::AUDIO_CHANNELS => "2",
+            *pw::keys::AUDIO_CHANNELS => channels.to_string(),
             *pw::keys::NODE_LATENCY => "240/48000",
         },
     )
-    .map_err(|e| Error::Device(format!("creating the Pheme Mic node: {e}")))?;
+    .map_err(|e| Error::Device(format!("creating the {description} node: {e}")))?;
 
     let _listener = stream
-        .add_local_listener_with_user_data(VirtualSourceData { source })
+        .add_local_listener_with_user_data(VirtualSourceData { source, channels })
         .process(|stream, data| {
             let Some(mut buffer) = stream.dequeue_buffer() else {
                 return;
@@ -661,13 +793,13 @@ fn source_run(
             let Some(d) = datas.first_mut() else {
                 return;
             };
-            let stride = 2 * CHANNELS;
+            let stride = 2 * data.channels;
             let Some(slice) = d.data() else {
                 return;
             };
             let frames = slice.len() / stride;
             for f in 0..frames {
-                for c in 0..CHANNELS {
+                for c in 0..data.channels {
                     // An empty ring plays silence rather than stalling the graph.
                     let v = data.source.pop().unwrap_or(0);
                     let at = f * stride + c * 2;
@@ -683,8 +815,9 @@ fn source_run(
             let quit_loop = mainloop.clone();
             let demand = demand.clone();
             let mut streamed = false;
+            let description = description.to_string();
             move |_, _, old, new| {
-                debug!(?old, ?new, "Pheme Mic state");
+                debug!(?old, ?new, description, "virtual source state");
                 demand.store(
                     if matches!(new, StreamState::Streaming) {
                         DEMAND_WANTED
@@ -694,7 +827,7 @@ fn source_run(
                     Ordering::SeqCst,
                 );
                 if let Some(why) = stream_died(&mut streamed, &new) {
-                    warn!("Pheme Mic is gone: {why}; ending the PipeWire thread");
+                    warn!("{description} is gone: {why}; ending the PipeWire thread");
                     quit_loop.quit();
                 }
             }
@@ -702,7 +835,7 @@ fn source_run(
         .register()
         .map_err(|e| Error::Device(format!("registering the stream listener: {e}")))?;
 
-    let bytes = format_pod()?;
+    let bytes = format_pod(channels)?;
     let mut params = [Pod::from_bytes(&bytes)
         .ok_or_else(|| Error::Backend("the audio format pod is malformed".into()))?];
     stream
@@ -712,7 +845,7 @@ fn source_run(
             StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS,
             &mut params,
         )
-        .map_err(|e| Error::Device(format!("connecting the Pheme Mic node: {e}")))?;
+        .map_err(|e| Error::Device(format!("connecting the {description} node: {e}")))?;
 
     let quit_loop = mainloop.clone();
     let _receiver = cmd_rx.attach(mainloop.loop_(), move |cmd| match cmd {
@@ -731,7 +864,7 @@ fn source_run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AudioPlayback, Demand, FRAME_INTERLEAVED};
+    use crate::{AudioCapture, AudioPlayback, Demand, CHANNELS, FRAME_INTERLEAVED, FRAME_SAMPLES};
 
     /// True when a PipeWire daemon is reachable. CI containers may not have one.
     fn have_pipewire() -> bool {
@@ -766,5 +899,117 @@ mod tests {
         assert!(saw_idle, "an unconsumed source must settle on Idle");
         src.stop();
         assert!(!src.healthy());
+    }
+
+    /// Drains `want` samples out of `consumer`, waiting up to two seconds.
+    fn drain_at_least(consumer: &mut rtrb::Consumer<i16>, want: usize) -> Vec<i16> {
+        let mut out = Vec::with_capacity(want);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while out.len() < want && std::time::Instant::now() < deadline {
+            while let Ok(s) = consumer.pop() {
+                out.push(s);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        out
+    }
+
+    /// A single-channel `Audio/Source` node, so the mono upmix can be tested without
+    /// mono hardware. Test-only: production never creates a mono node.
+    fn mono_test_source() -> PipewireVirtualSource {
+        PipewireVirtualSource::with_channels("pheme-mono-test", "Pheme Mono Test", 1)
+    }
+
+    #[test]
+    fn the_mic_captures_from_our_own_virtual_source() {
+        if !have_pipewire() {
+            eprintln!("no PipeWire daemon; skipping");
+            return;
+        }
+        // Feed a constant 6000 into Pheme Mic, then capture from it. This exercises the
+        // virtual source, the microphone capture and the demand signal at once, and needs
+        // no sound hardware at all.
+        let (mut feed, src_ring) = rtrb::RingBuffer::<i16>::new(FRAME_INTERLEAVED * 64);
+        let mut src = PipewireVirtualSource::new();
+        src.start(src_ring).expect("virtual source");
+
+        let (producer, mut consumer) = rtrb::RingBuffer::<i16>::new(FRAME_INTERLEAVED * 64);
+        let mut mic = PipewireMic::new(Some("pheme-mic".into()));
+        mic.start(producer).expect("microphone capture");
+
+        // Keep the source fed while the graph settles and runs.
+        let feeder = std::thread::spawn(move || {
+            for _ in 0..400 {
+                while feed.slots() >= 2 {
+                    let _ = feed.push(6000);
+                    let _ = feed.push(6000);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+
+        let got = drain_at_least(&mut consumer, FRAME_INTERLEAVED * 8);
+        assert!(
+            got.len() >= FRAME_INTERLEAVED * 8,
+            "only {} samples arrived from the virtual source",
+            got.len()
+        );
+        // A linked consumer is exactly what the demand signal is meant to notice.
+        assert_eq!(
+            src.demand(),
+            Demand::Wanted,
+            "capturing from the node must show up as demand"
+        );
+        let peak = got.iter().map(|s| i32::from(*s).abs()).max().unwrap_or(0);
+        assert!(
+            peak > 3000,
+            "the signal arrived at level {peak}, expected ~6000"
+        );
+
+        mic.stop();
+        src.stop();
+        feeder.join().unwrap();
+    }
+
+    #[test]
+    fn a_mono_source_arrives_as_two_identical_channels() {
+        if !have_pipewire() {
+            eprintln!("no PipeWire daemon; skipping");
+            return;
+        }
+        // The risk the spec flags: most microphones are mono, and the wire format is
+        // stereo. The upmix is the graph's job, and this is the test that says so.
+        let (mut feed, src_ring) = rtrb::RingBuffer::<i16>::new(FRAME_SAMPLES * 64);
+        let mut src = mono_test_source();
+        src.start(src_ring).expect("mono source");
+
+        let (producer, mut consumer) = rtrb::RingBuffer::<i16>::new(FRAME_INTERLEAVED * 64);
+        let mut mic = PipewireMic::new(Some("pheme-mono-test".into()));
+        mic.start(producer).expect("microphone capture");
+
+        let feeder = std::thread::spawn(move || {
+            for _ in 0..400 {
+                while feed.slots() >= 1 {
+                    let _ = feed.push(5000);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+
+        let got = drain_at_least(&mut consumer, FRAME_INTERLEAVED * 8);
+        assert!(got.len() >= FRAME_INTERLEAVED * 8);
+        // Skip the first frames while the graph is still ramping.
+        let body = &got[FRAME_INTERLEAVED * 2..];
+        let peak = body.iter().map(|s| i32::from(*s).abs()).max().unwrap_or(0);
+        assert!(peak > 2500, "the mono signal arrived at level {peak}");
+        let mismatched = body.chunks_exact(CHANNELS).filter(|p| p[0] != p[1]).count();
+        assert_eq!(
+            mismatched, 0,
+            "a mono source must reach both wire channels identically"
+        );
+
+        mic.stop();
+        src.stop();
+        feeder.join().unwrap();
     }
 }
