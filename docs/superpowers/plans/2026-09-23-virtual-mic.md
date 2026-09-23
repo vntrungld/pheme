@@ -1017,8 +1017,20 @@ Add the public restart next to the private `reset`:
     /// instead of leaving the buffer to infer it.
     ///
     /// Counted in `resets`, because that is what it is: one per recording is honest.
+    ///
+    /// Unlike the gap-triggered `reset`, this also drops the adaptive target back to
+    /// `TARGET_MIN`. `reset` keeps the target deliberately, because a sequence jump on a
+    /// continuing link does not change what that link's jitter is — but a closed gate is
+    /// a deliberate pause, and the receiver spends it underrunning, which ratchets the
+    /// target up once per recording. Ten seconds of clean audio sheds one frame, so a
+    /// user who records repeatedly would climb to the 40 ms ceiling because they paused,
+    /// not because the network was bad. A genuinely poor link re-learns its target within
+    /// one concealment; latency is this project's first stated priority, so starting low
+    /// and re-learning is the right side to err on.
     pub fn restart(&mut self) {
         self.reset();
+        self.target = TARGET_MIN;
+        self.stats.target = TARGET_MIN;
     }
 ```
 
@@ -1248,24 +1260,49 @@ Nothing in the suite bounds the amplitude of what comes out, so a regression in 
         // Skip the prefill, where the worker is emitting silence.
         let body = &rec[FRAME_INTERLEAVED * 10..];
         let peak = body.iter().map(|s| i32::from(*s).abs()).max().unwrap_or(0);
+        // The upper bound is 32_768, not 32_767: `i16::MIN.abs()` is 32768, and -32768 is
+        // exactly what the production clamp produces when the resampler's sinc overshoot
+        // on a near-full-scale signal reaches the rail. That is correct behaviour, not
+        // clipping damage. The bound that earns its keep here is the lower one, which
+        // catches attenuation; wrapping is caught by the inter-sample step below, since a
+        // wrapping cast turns an overshoot into a sign flip rather than a rail hit.
         assert!(
-            (30_000..=32_767).contains(&peak),
+            (30_000..=32_768).contains(&peak),
             "peak {peak} out of a 32000 input: the signal was clipped or attenuated"
         );
 
-        // A wrapping cast turns a positive overshoot into a large negative sample, which
-        // shows up as a step no 440 Hz signal can make. At full scale one sample step is
-        // about 1900; 20000 is far above any legitimate step and far below a 65536 wrap.
-        let biggest_step = body
-            .chunks_exact(CHANNELS)
-            .zip(body.chunks_exact(CHANNELS).skip(1))
-            .map(|(a, b)| (i32::from(b[0]) - i32::from(a[0])).abs())
-            .max()
-            .unwrap_or(0);
-        assert!(
-            biggest_step < 20_000,
-            "a sample stepped by {biggest_step}: the conversion wrapped instead of clamping"
-        );
+        // The wrap check is NOT done here. A pipeline recording legitimately contains
+        // large inter-sample steps: the jitter buffer emits a silence frame when it has
+        // nothing (`Pop::Idle`) and a full-gain copy of the previous frame when it
+        // conceals (`Pop::Conceal`), and either one is a phase discontinuity in a
+        // continuous sine — up to 32 768 for a drop to silence and roughly twice that
+        // across a half period. A step bound here would be measuring whether the buffer
+        // ever ran dry, not whether the conversion wrapped. The conversion is pinned
+        // directly instead, by `to_i16`'s own test below.
+    }
+
+    #[test]
+    fn the_sample_conversion_scales_and_rails_correctly() {
+        // Debt (e), pinned where it actually lives. The resampler overshoots on
+        // near-full-scale input, so values outside +/-1.0 reach this conversion in normal
+        // operation; a wrapping cast would turn a positive overshoot into a large
+        // negative sample, which is an audible click with no counter to show for it.
+        assert_eq!(to_i16(0.0), 0);
+        assert_eq!(to_i16(0.5), 16_384);
+        assert_eq!(to_i16(-0.5), -16_384);
+        assert_eq!(to_i16(1.0), 32_767, "the positive rail");
+        assert_eq!(to_i16(-1.0), -32_768, "the negative rail");
+        assert_eq!(to_i16(1.5), 32_767, "an overshoot clamps, it does not wrap");
+        assert_eq!(to_i16(-1.5), -32_768, "and the same below");
+        assert_eq!(to_i16(1e9), 32_767, "however far outside it lands");
+        assert_eq!(to_i16(-1e9), -32_768);
+        // These two are the ones that can actually fail. Rust's `f32 as i16` has
+        // saturated since 1.45, so the clamp above is behaviourally a no-op and no
+        // assertion can distinguish the clamped form from the bare cast — measured, not
+        // assumed. What is worth pinning is the scale and the rounding: a 32_767.0 scale
+        // yields 29_490 for 0.9, and truncation yields 10_922 for a third.
+        assert_eq!(to_i16(0.9), 29_491, "the scale is 32_768, not 32_767");
+        assert_eq!(to_i16(1.0 / 3.0), 10_923, "the conversion rounds, it does not truncate");
     }
 ```
 
