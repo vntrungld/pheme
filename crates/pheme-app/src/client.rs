@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context};
+use pheme_audio::frame::Frame;
 use pheme_core::{ClientCore, InjectAction};
 use pheme_input::InputInject;
 use pheme_net::pairing::client_pair;
@@ -14,7 +15,7 @@ use pheme_proto::{AudioParams, AudioStream, Msg, Os, PROTOCOL_VERSION};
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
-use crate::audio::{CaptureSource, OutCounters, SendSide};
+use crate::audio::{CaptureSource, InStats, OutCounters, PlaybackSource, RecvSide, SendSide};
 use crate::backoff::Backoff;
 use crate::config::{config_dir, Config};
 
@@ -30,6 +31,39 @@ pub struct ClientDeps {
     /// what production does; a test passes its own so it can assert that silence
     /// suppression really stops the traffic rather than merely sending quiet frames.
     pub audio_counters: Option<Arc<OutCounters>>,
+    /// Where audio received from the server's microphone is played: the client's virtual
+    /// microphone.
+    pub mic: PlaybackSource,
+    /// Counters the mic worker publishes. `None` allocates a private set.
+    pub mic_stats: Option<Arc<InStats>>,
+}
+
+/// The mic frame in `m`, if it is one this client should play.
+///
+/// A client receives `AudioStream::Mic` and sends `AudioStream::Playback`; a frame tagged
+/// the other way is not ours and is dropped rather than routed into the mic buffer.
+fn mic_frame(m: &Msg) -> Option<Frame> {
+    match m {
+        Msg::Audio {
+            stream: AudioStream::Mic,
+            seq,
+            ts_us,
+            samples,
+        } if samples.len() == pheme_audio::FRAME_BYTES => Some(Frame {
+            seq: *seq,
+            ts_us: *ts_us,
+            bytes: samples.clone(),
+        }),
+        _ => None,
+    }
+}
+
+/// The two audio sides `session` needs, bundled so the function stays under the
+/// argument-count lint rather than growing an eighth positional parameter.
+struct SessionAudio<'a> {
+    audio: &'a SendSide,
+    counters: &'a OutCounters,
+    mic: &'a RecvSide,
 }
 
 fn apply(inject: &mut dyn InputInject, a: InjectAction) {
@@ -92,9 +126,13 @@ pub async fn run_client(
         stats,
         audio,
         audio_counters,
+        mic,
+        mic_stats,
     } = deps;
     let counters = audio_counters.unwrap_or_default();
     let mut audio = SendSide::spawn(audio, AudioStream::Playback, counters.clone());
+    let mic_stats = mic_stats.unwrap_or_default();
+    let mut mic = RecvSide::spawn(mic, mic_stats.clone());
     let mut backoff = Backoff::new();
     loop {
         if *shutdown.borrow() {
@@ -112,8 +150,11 @@ pub async fn run_client(
                     &name,
                     inject.as_mut(),
                     stats,
-                    &audio,
-                    &counters,
+                    SessionAudio {
+                        audio: &audio,
+                        counters: &counters,
+                        mic: &mic,
+                    },
                     &mut shutdown,
                 )
                 .await
@@ -139,6 +180,7 @@ pub async fn run_client(
         }
     }
     audio.stop();
+    mic.stop();
     endpoint.close();
     Ok(())
 }
@@ -148,12 +190,18 @@ async fn session(
     name: &str,
     inject: &mut dyn InputInject,
     stats: bool,
-    audio: &SendSide,
-    counters: &OutCounters,
+    audio: SessionAudio<'_>,
     shutdown: &mut watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
+    let SessionAudio {
+        audio,
+        counters,
+        mic,
+    } = audio;
     let screens = inject.screens();
     let mut rx = peer.take_incoming();
+    let mut audio_rx = peer.take_audio();
+    let mut mic_wanted = mic.wanted();
     let sender = peer.sender();
     sender
         .send_control(&Msg::Hello {
@@ -194,6 +242,14 @@ async fn session(
         other => bail!("unexpected handshake reply: {other:?}"),
     }
 
+    // The server starts every session with its microphone closed, so without this the
+    // first demand is never sent and the microphone never opens.
+    let wanted = *mic_wanted.borrow_and_update();
+    if wanted {
+        mic.reset();
+    }
+    let _ = sender.send_control(&Msg::MicWanted { wanted }).await;
+
     let mut core = ClientCore::new(screens);
     let mut ping = tokio::time::interval(Duration::from_secs(1));
     let mut ping_seq = 0u64;
@@ -226,6 +282,27 @@ async fn session(
                 }
                 None => break Ok(()),
             },
+            m = audio_rx.recv() => match m {
+                Some(m) => {
+                    if let Some(f) = mic_frame(&m) {
+                        mic.push(f);
+                    }
+                }
+                None => break Ok(()),
+            },
+            _ = mic_wanted.changed() => {
+                let wanted = *mic_wanted.borrow_and_update();
+                if wanted {
+                    // Reset *before* asking, not after the audio starts arriving. While
+                    // the server's microphone was shut its numbering stood still and this
+                    // buffer's read cursor kept advancing, so the resuming stream arrives
+                    // behind the cursor; if that distance is under RESET_GAP nothing
+                    // resets on its own and every frame is discarded as late. The client
+                    // knows when it is asking, so it says so.
+                    mic.reset();
+                }
+                let _ = sender.send_control(&Msg::MicWanted { wanted }).await;
+            }
             _ = ping.tick() => {
                 ping_seq += 1;
                 let _ = sender.send_control(&Msg::Ping(ping_seq)).await;
@@ -283,6 +360,8 @@ pub async fn main(cfg: Config, host: Option<&str>, stats: bool) -> anyhow::Resul
             stats,
             audio: CaptureSource::Detect(cfg.audio.capture_device.clone()),
             audio_counters: None,
+            mic: PlaybackSource::DetectVirtualMic(None),
+            mic_stats: None,
         },
         shutdown_rx,
     )
@@ -303,8 +382,8 @@ pub async fn pair(cfg: Config, host: &str, code: &str) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{count_gap, input_seq};
-    use pheme_proto::{Button, KeyCode, Modifiers, Msg};
+    use super::{count_gap, input_seq, mic_frame};
+    use pheme_proto::{AudioStream, Button, KeyCode, Modifiers, Msg};
 
     #[test]
     fn first_datagram_starts_tracking_without_loss() {
@@ -379,5 +458,44 @@ mod tests {
             (2, Some(1)),
             "gap across the wrap"
         );
+    }
+
+    #[test]
+    fn a_mic_frame_is_for_the_client_and_a_playback_frame_is_not() {
+        // Review Focus 3. Each side owns one direction. A frame tagged for the other one
+        // is a confused or hostile peer, and must be ignored rather than fed into the
+        // buffer for the direction this side does own - which would splice unrelated
+        // audio into a live recording.
+        let mic = Msg::Audio {
+            stream: AudioStream::Mic,
+            seq: 1,
+            ts_us: 0,
+            samples: vec![0; 960],
+        };
+        let playback = Msg::Audio {
+            stream: AudioStream::Playback,
+            seq: 1,
+            ts_us: 0,
+            samples: vec![0; 960],
+        };
+        assert!(mic_frame(&mic).is_some());
+        assert!(
+            mic_frame(&playback).is_none(),
+            "a client must ignore the direction it sends rather than receives"
+        );
+        assert!(mic_frame(&Msg::Ping(1)).is_none());
+    }
+
+    #[test]
+    fn a_malformed_mic_frame_is_rejected_before_it_reaches_the_buffer() {
+        let short = Msg::Audio {
+            stream: AudioStream::Mic,
+            seq: 1,
+            ts_us: 0,
+            samples: vec![0; 10],
+        };
+        // The jitter buffer counts and drops these too, but rejecting here keeps a peer
+        // from spending the audio channel on garbage.
+        assert!(mic_frame(&short).is_none());
     }
 }

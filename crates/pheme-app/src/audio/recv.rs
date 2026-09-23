@@ -22,10 +22,42 @@ const FRAME_QUEUE: usize = 256;
 
 /// Where the playback backend comes from. Tests inject their own.
 pub enum PlaybackSource {
+    /// The machine's speakers.
     Detect(Option<String>),
-    /// Started once and never rebuilt — for tests.
+    /// The client's virtual microphone. A different detector, because a `RecvSide` that
+    /// opened the speakers here would play the server's microphone out loud.
+    DetectVirtualMic(Option<String>),
+    /// Started once and never rebuilt — for tests. A `RecvSide` is never gated, so
+    /// unlike its capture counterpart it has no reason to restart a backend.
     Backend(Box<dyn AudioPlayback>),
     Disabled,
+}
+
+impl PlaybackSource {
+    /// The name given to this side's thread.
+    ///
+    /// Once each role runs two `RecvSide`s — one playing to the speakers, one to the
+    /// virtual microphone — a shared thread name would make a failing virtual
+    /// microphone indistinguishable in the log from failing speakers. `Backend` is a
+    /// test double with no real direction of its own, so it takes the speaker label.
+    fn thread_name(&self) -> &'static str {
+        match self {
+            PlaybackSource::DetectVirtualMic(_) => "pheme-mic-in",
+            PlaybackSource::Detect(_) | PlaybackSource::Backend(_) | PlaybackSource::Disabled => {
+                "pheme-audio-in"
+            }
+        }
+    }
+
+    /// What this side's failure messages call the device it opens.
+    fn subject(&self) -> &'static str {
+        match self {
+            PlaybackSource::DetectVirtualMic(_) => "virtual microphone",
+            PlaybackSource::Detect(_) | PlaybackSource::Backend(_) | PlaybackSource::Disabled => {
+                "audio playback"
+            }
+        }
+    }
 }
 
 /// What `pump_in` needs to report demand and act on a reset, bundled so the function
@@ -93,7 +125,7 @@ impl RecvSide {
             let stats = stats.clone();
             let reset_requested = reset_requested.clone();
             match std::thread::Builder::new()
-                .name("pheme-audio-in".into())
+                .name(source.thread_name().into())
                 .spawn(move || {
                     in_thread(source, rx, stop, stats, wanted_tx, linger, reset_requested)
                 }) {
@@ -168,9 +200,13 @@ fn in_thread(
     linger: Duration,
     reset_requested: Arc<AtomicBool>,
 ) {
-    let (device, mut injected, rebuild) = match source {
-        PlaybackSource::Detect(d) => (d, None, true),
-        PlaybackSource::Backend(b) => (None, Some(b), false),
+    let subject = source.subject();
+    // `virtual_mic` here is not a spelling of "not real": it is which of the two
+    // playback detectors this side wants.
+    let (device, mut injected, rebuild, virtual_mic) = match source {
+        PlaybackSource::Detect(d) => (d, None, true, false),
+        PlaybackSource::DetectVirtualMic(d) => (d, None, true, true),
+        PlaybackSource::Backend(b) => (None, Some(b), false, false),
         PlaybackSource::Disabled => return,
     };
     let mut failures = FailureLog::default();
@@ -183,6 +219,7 @@ fn in_thread(
         }
         let built = match injected.take() {
             Some(b) => Ok(b),
+            None if virtual_mic => pheme_audio::detect_virtual_mic(device.as_deref()),
             None => pheme_audio::detect_playback(device.as_deref()),
         };
         let mut backend = match built {
@@ -192,7 +229,7 @@ fn in_thread(
                 return;
             }
             Err(e) => {
-                failures.report(format!("audio playback unavailable: {e}"));
+                failures.report(format!("{subject} unavailable: {e}"));
                 if !rebuild || !nap(RETRY, &stop) {
                     return;
                 }
@@ -201,7 +238,7 @@ fn in_thread(
         };
         let (producer, consumer) = rtrb::RingBuffer::<i16>::new(PLAYBACK_RING_SAMPLES);
         if let Err(e) = backend.start(consumer) {
-            failures.report(format!("audio playback failed to start: {e}"));
+            failures.report(format!("{subject} failed to start: {e}"));
             if !rebuild || !nap(RETRY, &stop) {
                 return;
             }
@@ -224,7 +261,7 @@ fn in_thread(
             // send.rs's `pump_out`, so the match must still cover it.
             PumpEnd::Unwanted => return,
             PumpEnd::Failed(why) => {
-                failures.report(format!("audio playback stopped: {why}"));
+                failures.report(format!("{subject} stopped: {why}"));
             }
         }
         if stop.load(Ordering::SeqCst) || !rebuild {
@@ -768,6 +805,23 @@ mod tests {
             "the worker must act on the reset"
         );
         audio.stop();
+    }
+
+    #[test]
+    fn the_two_playback_sources_get_different_labels() {
+        // Authorised addition beyond the brief: once each role runs two `RecvSide`s, a
+        // shared thread name and a shared failure wording make a failing virtual
+        // microphone indistinguishable in the log from failing speakers.
+        assert_ne!(
+            PlaybackSource::DetectVirtualMic(None).thread_name(),
+            PlaybackSource::Detect(None).thread_name(),
+            "two RecvSides sharing a thread name would be indistinguishable in the log"
+        );
+        assert_ne!(
+            PlaybackSource::DetectVirtualMic(None).subject(),
+            PlaybackSource::Detect(None).subject(),
+            "a failing virtual microphone must not read like failing speakers"
+        );
     }
 
     #[test]
