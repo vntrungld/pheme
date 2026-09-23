@@ -254,10 +254,13 @@ fn pump_in(
 
 /// One resampled sample, converted to the wire's i16.
 ///
-/// Clamping rather than wrapping is the whole point: the sinc resampler overshoots on
-/// near-full-scale input, so values outside +/-1.0 reach this in normal operation, and a
-/// wrapping cast would turn a positive overshoot into a large negative sample — an
-/// audible click with no counter to show for it.
+/// The sinc resampler overshoots on near-full-scale input, so values outside +/-1.0 reach
+/// this in normal operation and something has to decide what they become. A plain `f32 as
+/// i16` cast already saturates rather than wrapping, so the explicit clamp is
+/// defence-in-depth: it states the intent, and it keeps the rails correct if this is ever
+/// rewritten into a conversion that would not saturate on its own. No test can
+/// distinguish the clamped form from the bare cast, which is exactly why the intent is
+/// written down here.
 fn to_i16(v: f32) -> i16 {
     (v * 32_768.0).round().clamp(-32_768.0, 32_767.0) as i16
 }
@@ -551,29 +554,31 @@ mod tests {
         // exactly what the production clamp produces when the resampler's sinc overshoot
         // on a near-full-scale signal reaches the rail. That is correct behaviour, not
         // clipping damage. The bound that earns its keep here is the lower one, which
-        // catches attenuation; wrapping is caught by `to_i16`'s own test below, since a
-        // wrapping cast turns an overshoot into a sign flip rather than a rail hit.
+        // catches attenuation; the rails and scale are pinned separately, by `to_i16`'s
+        // own test below.
         assert!(
             (30_000..=32_768).contains(&peak),
             "peak {peak} out of a 32000 input: the signal was clipped or attenuated"
         );
 
-        // The wrap check is NOT done here. A pipeline recording legitimately contains
-        // large inter-sample steps: the jitter buffer emits a silence frame when it has
-        // nothing (`Pop::Idle`) and a full-gain copy of the previous frame when it
-        // conceals (`Pop::Conceal`), and either one is a phase discontinuity in a
-        // continuous sine — up to 32 768 for a drop to silence and roughly twice that
-        // across a half period. A step bound here would be measuring whether the buffer
-        // ever ran dry, not whether the conversion wrapped. The conversion is pinned
-        // directly instead, by `to_i16`'s own test below.
+        // No step bound is taken here. A pipeline recording legitimately contains large
+        // inter-sample steps: the jitter buffer emits a silence frame when it has nothing
+        // (`Pop::Idle`) and a full-gain copy of the previous frame when it conceals
+        // (`Pop::Conceal`), and either one is a phase discontinuity in a continuous sine —
+        // up to 32 768 for a drop to silence and roughly twice that across a half period.
+        // A step bound here would be measuring whether the buffer ever ran dry, not
+        // whether the conversion's rails and scale are correct. Those are pinned directly
+        // instead, by `to_i16`'s own test below.
     }
 
     #[test]
-    fn the_sample_conversion_clamps_instead_of_wrapping() {
+    fn the_sample_conversion_scales_and_rails_correctly() {
         // Debt (e), pinned where it actually lives. The resampler overshoots on
         // near-full-scale input, so values outside +/-1.0 reach this conversion in normal
-        // operation; a wrapping cast would turn a positive overshoot into a large
-        // negative sample, which is an audible click with no counter to show for it.
+        // operation. `f32 as i16` already saturates rather than wraps in safe Rust — see
+        // `to_i16`'s doc comment — so what these pin is the scale and the rounding, plus
+        // the rails the clamp states as intent: a wrong scale factor or a truncation
+        // instead of a round would still be a real, audible defect, just not a wrap.
         assert_eq!(to_i16(0.0), 0);
         assert_eq!(to_i16(0.5), 16_384);
         assert_eq!(to_i16(-0.5), -16_384);
@@ -582,6 +587,14 @@ mod tests {
         assert_eq!(to_i16(1.5), 32_767, "an overshoot clamps, it does not wrap");
         assert_eq!(to_i16(-1.5), -32_768, "and the same below");
         assert_eq!(to_i16(1e9), 32_767, "however far outside it lands");
+        // These two are the ones that can fail. 0.9 pins the scale factor: a 32_767.0
+        // scale yields 29_490. A third pins the rounding: truncation yields 10_922.
+        assert_eq!(to_i16(0.9), 29_491, "the scale is 32_768, not 32_767");
+        assert_eq!(
+            to_i16(1.0 / 3.0),
+            10_923,
+            "the conversion rounds, it does not truncate"
+        );
         assert_eq!(to_i16(-1e9), -32_768);
     }
 }
