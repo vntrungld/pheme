@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::{AudioCapture, AudioPlayback, Error, Result, CHANNELS, FRAME_SAMPLES, RATE};
+use crate::{AudioCapture, AudioPlayback, Demand, Error, Result, CHANNELS, FRAME_SAMPLES, RATE};
 
 struct CaptureState {
     sink: Option<rtrb::Producer<i16>>,
@@ -10,6 +10,8 @@ struct CaptureState {
     fail_start: bool,
     healthy: bool,
     overruns: u64,
+    start_count: u64,
+    stopped: bool,
 }
 
 impl Default for CaptureState {
@@ -20,6 +22,8 @@ impl Default for CaptureState {
             fail_start: false,
             healthy: true,
             overruns: 0,
+            start_count: 0,
+            stopped: false,
         }
     }
 }
@@ -85,6 +89,17 @@ impl MockCaptureHandle {
     pub fn set_healthy(&self, healthy: bool) {
         self.state.lock().unwrap().healthy = healthy;
     }
+
+    /// How many times `start` has succeeded. The demand gate is expected to drive this
+    /// past one over a session.
+    pub fn start_count(&self) -> u64 {
+        self.state.lock().unwrap().start_count
+    }
+
+    /// Whether `stop` has been called at least once.
+    pub fn stopped(&self) -> bool {
+        self.state.lock().unwrap().stopped
+    }
 }
 
 impl AudioCapture for MockCapture {
@@ -95,6 +110,7 @@ impl AudioCapture for MockCapture {
         }
         st.sink = Some(sink);
         st.started = true;
+        st.start_count += 1;
         Ok(())
     }
 
@@ -111,6 +127,7 @@ impl AudioCapture for MockCapture {
         let mut st = self.state.lock().unwrap();
         st.sink = None;
         st.started = false;
+        st.stopped = true;
     }
 }
 
@@ -125,6 +142,7 @@ struct PlaybackState {
     /// short plays silence for the rest of its period rather than banking the deficit
     /// and swallowing a burst later.
     credit: f64,
+    demand: Demand,
 }
 
 /// Samples per channel a device running at `rate` consumes in one 5 ms wire frame's
@@ -151,6 +169,7 @@ impl MockPlayback {
             fail_start: false,
             rate,
             credit: 0.0,
+            demand: Demand::Unknown,
         }));
         (
             MockPlayback {
@@ -237,6 +256,11 @@ impl MockPlaybackHandle {
     pub fn fail_next_start(&self) {
         self.state.lock().unwrap().fail_start = true;
     }
+
+    /// Sets what the backend will report about its consumers.
+    pub fn set_demand(&self, d: Demand) {
+        self.state.lock().unwrap().demand = d;
+    }
 }
 
 impl AudioPlayback for MockPlayback {
@@ -262,6 +286,10 @@ impl AudioPlayback for MockPlayback {
         self.state.lock().unwrap().started
     }
 
+    fn demand(&self) -> Demand {
+        self.state.lock().unwrap().demand
+    }
+
     fn stop(&mut self) {
         let mut st = self.state.lock().unwrap();
         st.source = None;
@@ -272,7 +300,7 @@ impl AudioPlayback for MockPlayback {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AudioCapture, AudioPlayback};
+    use crate::{AudioCapture, AudioPlayback, Demand};
 
     #[test]
     fn capture_hands_pushed_samples_to_the_sink() {
@@ -403,5 +431,51 @@ mod tests {
         let (_producer, consumer) = rtrb::RingBuffer::<i16>::new(4);
         assert!(play.start(consumer).is_err());
         assert!(!handle.started());
+    }
+
+    #[test]
+    fn a_playback_backend_reports_unknown_demand_unless_it_knows_better() {
+        let (play, _handle) = MockPlayback::new(48_000);
+        assert_eq!(
+            play.demand(),
+            Demand::Unknown,
+            "the default must be the one that keeps a microphone open"
+        );
+    }
+
+    #[test]
+    fn a_playback_backend_can_report_what_its_consumers_are_doing() {
+        let (play, handle) = MockPlayback::new(48_000);
+        handle.set_demand(Demand::Idle);
+        assert_eq!(play.demand(), Demand::Idle);
+        handle.set_demand(Demand::Wanted);
+        assert_eq!(play.demand(), Demand::Wanted);
+    }
+
+    #[test]
+    fn a_capture_backend_can_be_started_again_after_being_stopped() {
+        // The demand gate stops the microphone outright so its indicator goes out, then
+        // starts it again when a consumer comes back. A backend that can only be started
+        // once would make the gate a one-way door.
+        let (mut cap, handle) = MockCapture::new();
+        let (producer, mut consumer) = rtrb::RingBuffer::<i16>::new(16);
+        cap.start(producer).unwrap();
+        assert_eq!(handle.start_count(), 1);
+        assert_eq!(handle.push(&[1, 2]), 2);
+        cap.stop();
+        assert!(handle.stopped());
+        assert!(!handle.started());
+
+        let (producer, mut consumer2) = rtrb::RingBuffer::<i16>::new(16);
+        cap.start(producer).unwrap();
+        assert_eq!(handle.start_count(), 2, "a second start really started it");
+        assert!(handle.started());
+        assert_eq!(handle.push(&[7, 8]), 2);
+        assert_eq!(consumer2.pop(), Ok(7));
+        assert_eq!(consumer2.pop(), Ok(8));
+        // The first ring received only what was pushed before the stop.
+        assert_eq!(consumer.pop(), Ok(1));
+        assert_eq!(consumer.pop(), Ok(2));
+        assert!(consumer.pop().is_err(), "nothing went to the old ring");
     }
 }

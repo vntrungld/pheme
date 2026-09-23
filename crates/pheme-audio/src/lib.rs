@@ -43,6 +43,24 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Whether anything is consuming what a playback backend emits.
+///
+/// Only `Idle` may close a microphone. `Unknown` is the trait default, so a backend that
+/// cannot tell — which is every backend except the Linux virtual source — keeps the
+/// microphone open without having to opt in. The asymmetry is deliberate: a microphone
+/// wrongly held open wastes bandwidth and lights an indicator, while one wrongly held
+/// shut makes the whole feature fail silently, and silent failure is the defect class
+/// that has reached a user three times in this project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Demand {
+    /// Something is recording from this device right now.
+    Wanted,
+    /// Nothing is recording, and the backend is sure of it.
+    Idle,
+    /// The backend cannot tell. Treated as `Wanted`.
+    Unknown,
+}
+
 /// Reads audio out of the machine: the virtual sink on Linux, loopback of the default
 /// output on Windows.
 pub trait AudioCapture: Send {
@@ -97,6 +115,14 @@ pub trait AudioPlayback: Send {
     /// the life of the process.
     fn healthy(&self) -> bool {
         true
+    }
+    /// Whether anything is consuming what this backend emits.
+    ///
+    /// Meaningful only for a backend that presents a device to other applications — the
+    /// client's virtual microphone. A backend that writes to real speakers keeps the
+    /// default, and nothing reads it.
+    fn demand(&self) -> Demand {
+        Demand::Unknown
     }
     /// Idempotent. Joins the device thread before returning.
     fn stop(&mut self);
