@@ -271,6 +271,13 @@ impl JitterBuffer {
     /// this buffer grew while concealing the previous recording's tail-off is not a
     /// property of the link the new stream will face, and carrying it over would delay
     /// the very first frames of the new stream behind a stale, inflated prefill target.
+    ///
+    /// Call this exactly once per resume — when the microphone is asked to reopen — and
+    /// never on every tick or poll while it stays closed or idle. Nothing here guards
+    /// against repeated calls: each one unconditionally re-pins the target to
+    /// `TARGET_MIN`, so calling it more often than that silently disables the adaptive
+    /// ratchet in `miss()` for good, with no counter that flags it as a problem —
+    /// `stats.resets` climbs the same way one honest restart per recording would.
     pub fn restart(&mut self) {
         self.reset();
         self.target = TARGET_MIN;
