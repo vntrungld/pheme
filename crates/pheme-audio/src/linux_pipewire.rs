@@ -13,10 +13,7 @@
 //! those pieces does not type-check; keeping them all as locals in one function sidesteps
 //! that entirely and matches how the upstream `pipewire` crate's own examples do it.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
-use std::sync::{Arc, Once};
-use std::thread::JoinHandle;
+use std::sync::Once;
 use std::time::Duration;
 
 use pipewire as pw;
@@ -28,6 +25,7 @@ use pw::spa::utils::{Direction, SpaTypes};
 use pw::stream::{StreamFlags, StreamState};
 use tracing::{debug, warn};
 
+use crate::device::{DeviceThread, Ready};
 use crate::{AudioCapture, AudioPlayback, Error, Result, CHANNELS, RATE};
 
 /// How long `start` waits for the PipeWire thread to report success or failure.
@@ -77,29 +75,6 @@ fn format_pod() -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-struct Running {
-    cmd: pw::channel::Sender<Cmd>,
-    thread: JoinHandle<()>,
-    /// Cleared by `AliveGuard` when the PipeWire thread's stack is torn down, which is
-    /// how a daemon restart becomes visible to the supervisor in `pheme-app`.
-    alive: Arc<AtomicBool>,
-}
-
-/// Clears a backend's `alive` flag when the PipeWire thread's stack unwinds or returns.
-///
-/// This is a guard rather than a statement after the call so that a panic inside a
-/// PipeWire callback — which unwinds the thread without ever reaching that statement —
-/// also flips `healthy()` to false. A thread that has died is a thread that has died,
-/// however it died, and the supervisor's rebuild is the only thing that brings audio
-/// back either way.
-struct AliveGuard(Arc<AtomicBool>);
-
-impl Drop for AliveGuard {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
-    }
-}
-
 /// Decides, from a stream state change, whether the stream is gone for good.
 ///
 /// `Error` is unambiguous. `Unconnected` is not: every stream starts there, so it only
@@ -121,74 +96,29 @@ fn stream_died(streamed: &mut bool, new: &StreamState) -> Option<String> {
 }
 
 /// The client's virtual sink: applications play into "Pheme Speaker" and we read it.
+#[derive(Default)]
 pub struct PipewireCapture {
-    running: Option<Running>,
-}
-
-impl Default for PipewireCapture {
-    fn default() -> Self {
-        PipewireCapture::new()
-    }
+    thread: DeviceThread,
 }
 
 impl PipewireCapture {
     pub fn new() -> PipewireCapture {
-        PipewireCapture { running: None }
+        PipewireCapture::default()
     }
 }
 
 impl AudioCapture for PipewireCapture {
     fn start(&mut self, sink: rtrb::Producer<i16>) -> Result<()> {
-        if self.running.is_some() {
-            return Ok(());
-        }
         init();
-        let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
         let (cmd_tx, cmd_rx) = pw::channel::channel::<Cmd>();
-        let alive = Arc::new(AtomicBool::new(true));
-        let thread_alive = alive.clone();
-        let thread = std::thread::Builder::new()
-            .name("pheme-pw-sink".into())
-            .spawn(move || {
-                let _alive = AliveGuard(thread_alive);
-                capture_thread(sink, ready_tx, cmd_rx);
-            })
-            .map_err(|e| Error::Backend(format!("spawning the PipeWire thread: {e}")))?;
-
-        match ready_rx.recv_timeout(START_TIMEOUT) {
-            Ok(Ok(())) => {
-                self.running = Some(Running {
-                    cmd: cmd_tx,
-                    thread,
-                    alive,
-                });
-                Ok(())
-            }
-            Ok(Err(e)) => {
-                let _ = thread.join();
-                Err(e)
-            }
-            Err(_) => {
-                // `Cmd::Stop` only becomes observable once the thread reaches
-                // `cmd_rx.attach(..)`, which is after the main loop, context, core,
-                // stream and listener have all been constructed. If construction itself
-                // is what's hanging (rather than merely being slow), that message may
-                // never be picked up, so `thread.join()` here could block forever —
-                // exactly the unbounded wait `start`'s contract promises not to be. We
-                // ask the thread to stop and then deliberately do not join it: dropping
-                // the `JoinHandle` detaches it, so it runs to completion (or hangs) on
-                // its own instead of `start` hanging with it.
+        self.thread.start(
+            "pheme-pw-sink",
+            START_TIMEOUT,
+            move || {
                 let _ = cmd_tx.send(Cmd::Stop);
-                warn!(
-                    "Pheme Speaker thread did not report readiness within 1 s; abandoning it \
-                     detached rather than blocking `start` further"
-                );
-                drop(thread);
-                Err(Error::Backend(
-                    "the PipeWire thread did not report readiness within 1 s".into(),
-                ))
-            }
-        }
+            },
+            move |ready| capture_thread(sink, ready, cmd_rx),
+        )
     }
 
     fn device_name(&self) -> String {
@@ -196,16 +126,11 @@ impl AudioCapture for PipewireCapture {
     }
 
     fn healthy(&self) -> bool {
-        self.running
-            .as_ref()
-            .is_some_and(|r| r.alive.load(Ordering::SeqCst))
+        self.thread.healthy()
     }
 
     fn stop(&mut self) {
-        if let Some(r) = self.running.take() {
-            let _ = r.cmd.send(Cmd::Stop);
-            let _ = r.thread.join();
-        }
+        self.thread.stop();
     }
 }
 
@@ -222,16 +147,12 @@ struct CaptureData {
     sink: rtrb::Producer<i16>,
 }
 
-fn capture_thread(
-    sink: rtrb::Producer<i16>,
-    ready: mpsc::Sender<Result<()>>,
-    cmd_rx: pw::channel::Receiver<Cmd>,
-) {
+fn capture_thread(sink: rtrb::Producer<i16>, ready: Ready, cmd_rx: pw::channel::Receiver<Cmd>) {
     if let Err(e) = run(sink, &ready, cmd_rx) {
         warn!("Pheme Speaker could not start: {e}");
         // `run` only returns `Err` before it has sent a readiness reply, so this is the
         // one and only reply in the failure path.
-        let _ = ready.send(Err(e));
+        ready.fail(e);
     }
 }
 
@@ -240,11 +161,7 @@ fn capture_thread(
 /// On success this sends `Ok(())` on `ready` once the node is connected and then blocks
 /// in `mainloop.run()` until a `Cmd::Stop` arrives. On failure it returns `Err` without
 /// sending anything, leaving the reply to the caller in `capture_thread`.
-fn run(
-    sink: rtrb::Producer<i16>,
-    ready: &mpsc::Sender<Result<()>>,
-    cmd_rx: pw::channel::Receiver<Cmd>,
-) -> Result<()> {
+fn run(sink: rtrb::Producer<i16>, ready: &Ready, cmd_rx: pw::channel::Receiver<Cmd>) -> Result<()> {
     let mainloop = pw::main_loop::MainLoopRc::new(None)
         .map_err(|e| Error::Device(format!("creating the PipeWire main loop: {e}")))?;
     let context = pw::context::ContextRc::new(&mainloop, None)
@@ -347,7 +264,7 @@ fn run(
     // already given up (the 1 s timeout in `start` elapsed), there is nothing to notify
     // and we fall through to `mainloop.run()`, which will exit as soon as the `Cmd::Stop`
     // that `start` sent on timeout is delivered.
-    let _ = ready.send(Ok(()));
+    ready.ok();
 
     mainloop.run();
     let _ = stream.disconnect();
@@ -357,7 +274,7 @@ fn run(
 /// The server's playback stream: samples in, speakers out.
 pub struct PipewirePlayback {
     device: Option<String>,
-    running: Option<Running>,
+    thread: DeviceThread,
 }
 
 impl PipewirePlayback {
@@ -367,63 +284,24 @@ impl PipewirePlayback {
     pub fn new(device: Option<String>) -> PipewirePlayback {
         PipewirePlayback {
             device,
-            running: None,
+            thread: DeviceThread::new(),
         }
     }
 }
 
 impl AudioPlayback for PipewirePlayback {
     fn start(&mut self, source: rtrb::Consumer<i16>) -> Result<()> {
-        if self.running.is_some() {
-            return Ok(());
-        }
         init();
-        let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
         let (cmd_tx, cmd_rx) = pw::channel::channel::<Cmd>();
         let device = self.device.clone();
-        let alive = Arc::new(AtomicBool::new(true));
-        let thread_alive = alive.clone();
-        let thread = std::thread::Builder::new()
-            .name("pheme-pw-play".into())
-            .spawn(move || {
-                let _alive = AliveGuard(thread_alive);
-                playback_thread(source, device, ready_tx, cmd_rx);
-            })
-            .map_err(|e| Error::Backend(format!("spawning the PipeWire thread: {e}")))?;
-
-        match ready_rx.recv_timeout(START_TIMEOUT) {
-            Ok(Ok(())) => {
-                self.running = Some(Running {
-                    cmd: cmd_tx,
-                    thread,
-                    alive,
-                });
-                Ok(())
-            }
-            Ok(Err(e)) => {
-                let _ = thread.join();
-                Err(e)
-            }
-            Err(_) => {
-                // Same reasoning as `PipewireCapture::start`: `Cmd::Stop` only becomes
-                // observable once the thread reaches `cmd_rx.attach(..)` inside `run`,
-                // which is after the main loop, context, core, stream and listener have
-                // all been constructed. If construction itself hangs, joining here could
-                // block forever, which would break `start`'s 1 s-bound contract. Ask the
-                // thread to stop, then deliberately do not join it: dropping the
-                // `JoinHandle` detaches it, so it runs to completion (or hangs) on its
-                // own instead of blocking `start`.
+        self.thread.start(
+            "pheme-pw-play",
+            START_TIMEOUT,
+            move || {
                 let _ = cmd_tx.send(Cmd::Stop);
-                warn!(
-                    "Pheme playback thread did not report readiness within 1 s; abandoning it \
-                     detached rather than blocking `start` further"
-                );
-                drop(thread);
-                Err(Error::Backend(
-                    "the PipeWire thread did not report readiness within 1 s".into(),
-                ))
-            }
-        }
+            },
+            move |ready| playback_thread(source, device, ready, cmd_rx),
+        )
     }
 
     /// Always 48 kHz: we ask PipeWire for our format and it converts to whatever the
@@ -437,16 +315,11 @@ impl AudioPlayback for PipewirePlayback {
     }
 
     fn healthy(&self) -> bool {
-        self.running
-            .as_ref()
-            .is_some_and(|r| r.alive.load(Ordering::SeqCst))
+        self.thread.healthy()
     }
 
     fn stop(&mut self) {
-        if let Some(r) = self.running.take() {
-            let _ = r.cmd.send(Cmd::Stop);
-            let _ = r.thread.join();
-        }
+        self.thread.stop();
     }
 }
 
@@ -466,14 +339,14 @@ struct PlaybackData {
 fn playback_thread(
     source: rtrb::Consumer<i16>,
     device: Option<String>,
-    ready: mpsc::Sender<Result<()>>,
+    ready: Ready,
     cmd_rx: pw::channel::Receiver<Cmd>,
 ) {
     if let Err(e) = play_run(source, device, &ready, cmd_rx) {
         warn!("Pheme playback could not start: {e}");
         // `play_run` only returns `Err` before it has sent a readiness reply, so this is
         // the one and only reply in the failure path.
-        let _ = ready.send(Err(e));
+        ready.fail(e);
     }
 }
 
@@ -484,7 +357,7 @@ fn playback_thread(
 fn play_run(
     source: rtrb::Consumer<i16>,
     device: Option<String>,
-    ready: &mpsc::Sender<Result<()>>,
+    ready: &Ready,
     cmd_rx: pw::channel::Receiver<Cmd>,
 ) -> Result<()> {
     let mainloop = pw::main_loop::MainLoopRc::new(None)
@@ -607,7 +480,7 @@ fn play_run(
 
     // The node exists and is connected: tell `start` it can return. See `run`'s comment
     // above for what happens if the caller has already given up.
-    let _ = ready.send(Ok(()));
+    ready.ok();
 
     mainloop.run();
     let _ = stream.disconnect();
