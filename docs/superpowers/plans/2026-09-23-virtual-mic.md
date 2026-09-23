@@ -14,7 +14,7 @@
 
 - One audio format, everywhere, forever: 48 000 Hz, 2 channels, interleaved i16 little-endian, 240 samples per channel per frame = 480 interleaved = 960 bytes = 5 ms. Never introduce a second one.
 - Every document, comment, identifier, log message and commit message in this repository is in **English**.
-- Commit format is `{ACTION}: {SHORT_DESCRIPTION}` where ACTION is one of `Update`, `Fix`, `WIP`, `Hotfix`; title under 72 characters, imperative mood; blank line; body wrapped at 72 columns; then the trailer `Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>`.
+- Commit format is `{ACTION}: {SHORT_DESCRIPTION}` where ACTION is one of `Update`, `Fix`, `WIP`, `Hotfix`; title under 72 characters, imperative mood; blank line; body wrapped at 72 columns; then the trailer `Co-Authored-By: Claude <noreply@anthropic.com>`.
 - Audio never breaks the KVM session: nothing in an audio path may make `run_client` or `run_server` return an error.
 - Real-time device callbacks never allocate, never lock, and never block.
 - `AudioCapture::start` and `AudioPlayback::start` are synchronous and bounded: they return only once the device is running or has failed, and the timeout path **detaches the device thread, never joins it**.
@@ -418,7 +418,7 @@ healthy() is correct by construction rather than by each backend
 remembering to do it, and the timeout path detaches rather than joins so
 a thread hung in device construction cannot make start unbounded.
 
-Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Co-Authored-By: Claude <noreply@anthropic.com>
 MSG
 )"
 ```
@@ -582,7 +582,7 @@ This removes the copy of the liveness guard whose absence once made
 healthy() permanently true here, taking the daemon-restart rebuild path
 with it.
 
-Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Co-Authored-By: Claude <noreply@anthropic.com>
 MSG
 )"
 ```
@@ -691,7 +691,7 @@ session rather than at its start, which timed out every Windows start
 while the device itself worked. Centralising the handshake removes the
 place that mistake can be made again.
 
-Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Co-Authored-By: Claude <noreply@anthropic.com>
 MSG
 )"
 ```
@@ -864,7 +864,7 @@ indicator goes out. That makes restarting a backend a normal event
 rather than a one-way door, so the mocks now count starts and record
 stops for tests to assert on.
 
-Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Co-Authored-By: Claude <noreply@anthropic.com>
 MSG
 )"
 ```
@@ -1053,7 +1053,7 @@ depth_prepop reports the depth before a pop removes its frame, which is
 the quantity the latency budget counts; the existing depth is sampled
 after the removal and reads a frame lower.
 
-Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Co-Authored-By: Claude <noreply@anthropic.com>
 MSG
 )"
 ```
@@ -1316,7 +1316,7 @@ test bounds the amplitude and the inter-sample step of a full-scale
 signal, so a lost clamp or a wrapping cast in the f32 conversion fails
 instead of passing silently.
 
-Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Co-Authored-By: Claude <noreply@anthropic.com>
 MSG
 )"
 ```
@@ -1778,7 +1778,7 @@ would make the far end's microphone flap.
 A side nobody gates stays open, which is what the client's speaker
 capture wants.
 
-Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Co-Authored-By: Claude <noreply@anthropic.com>
 MSG
 )"
 ```
@@ -1939,7 +1939,7 @@ peer reports a malformed handshake rather than a version mismatch. Both
 ends are built from the same tree and nothing is released, so this costs
 nothing today.
 
-Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Co-Authored-By: Claude <noreply@anthropic.com>
 MSG
 )"
 ```
@@ -2120,7 +2120,7 @@ of 24 frames, so a deeper queue here would only add latency that the
 buffer discards, and a full audio channel drops a frame the jitter
 buffer conceals rather than delaying a keystroke.
 
-Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Co-Authored-By: Claude <noreply@anthropic.com>
 MSG
 )"
 ```
@@ -2446,7 +2446,7 @@ Windows client report no demand rather than unknown demand, so the
 server never opens its microphone for a client that could not deliver
 the audio anywhere.
 
-Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Co-Authored-By: Claude <noreply@anthropic.com>
 MSG
 )"
 ```
@@ -2793,7 +2793,7 @@ nobody here has. A second test captures from our own Pheme Mic node,
 which exercises the virtual source, the capture stream and the demand
 signal together and needs no sound hardware at all.
 
-Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Co-Authored-By: Claude <noreply@anthropic.com>
 MSG
 )"
 ```
@@ -3004,7 +3004,7 @@ pitch-shifted, with no counter moving. Those are now four tests, and
 they run on the Windows CI job that has been green since sub-project 2's
 last fix.
 
-Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Co-Authored-By: Claude <noreply@anthropic.com>
 MSG
 )"
 ```
@@ -3245,7 +3245,7 @@ with every counter reading zero.
 The first MicWanted goes out with the handshake, because the server
 starts every session with its microphone closed.
 
-Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Co-Authored-By: Claude <noreply@anthropic.com>
 MSG
 )"
 ```
@@ -3493,7 +3493,7 @@ Clearing the peer alone would stop the frames but leave the device open
 for the life of the process, indicator lit, with nothing on the other
 end to listen.
 
-Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Co-Authored-By: Claude <noreply@anthropic.com>
 MSG
 )"
 ```
@@ -3683,7 +3683,7 @@ the next line presented two seconds of counters under a per-second
 label. Stats now have their own interval, which fires late rather than
 skipping, so every line covers exactly one interval.
 
-Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Co-Authored-By: Claude <noreply@anthropic.com>
 MSG
 )"
 ```
@@ -3944,7 +3944,7 @@ Both directions of the pair drive their own device clock. Sub-project 2
 learned that the hard way: a playback mock without one let the receiver
 discard 95 % of the stream while every assertion passed.
 
-Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Co-Authored-By: Claude <noreply@anthropic.com>
 MSG
 )"
 ```
@@ -4058,7 +4058,7 @@ The manual matrix gains rows M1 to M10. M4 is the one to run twice: a
 recording that starts silent after the gate reopens is invisible to
 every counter.
 
-Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Co-Authored-By: Claude <noreply@anthropic.com>
 MSG
 )"
 ```
