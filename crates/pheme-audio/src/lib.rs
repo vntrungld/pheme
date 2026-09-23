@@ -4,6 +4,7 @@
 //! The whole crate speaks one format and only one: 48 kHz, 2 channels, interleaved i16,
 //! 240 samples per channel per frame (5 ms, 960 bytes on the wire).
 
+pub mod device;
 pub mod drift;
 pub mod frame;
 pub mod jitter;
