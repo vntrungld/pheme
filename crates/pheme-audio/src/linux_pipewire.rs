@@ -803,18 +803,25 @@ fn source_run(
                 return;
             };
             let stride = 2 * data.channels;
-            let Some(slice) = d.data() else {
-                return;
-            };
-            let frames = slice.len() / stride;
-            for f in 0..frames {
-                for c in 0..data.channels {
-                    // An empty ring plays silence rather than stalling the graph.
-                    let v = data.source.pop().unwrap_or(0);
-                    let at = f * stride + c * 2;
-                    slice[at..at + 2].copy_from_slice(&v.to_le_bytes());
+            // A buffer with no mapped data still has to be handed back with a size of
+            // zero, exactly as the playback callback does: PipeWire reuses buffers, so
+            // returning early would leave the previous period's size in place and replay
+            // that audio instead of silence.
+            let frames = match d.data() {
+                Some(slice) => {
+                    let frames = slice.len() / stride;
+                    for f in 0..frames {
+                        for c in 0..data.channels {
+                            // An empty ring plays silence rather than stalling the graph.
+                            let v = data.source.pop().unwrap_or(0);
+                            let at = f * stride + c * 2;
+                            slice[at..at + 2].copy_from_slice(&v.to_le_bytes());
+                        }
+                    }
+                    frames
                 }
-            }
+                None => 0,
+            };
             let chunk = d.chunk_mut();
             *chunk.offset_mut() = 0;
             *chunk.stride_mut() = stride as i32;
