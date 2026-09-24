@@ -70,14 +70,24 @@ pub struct SendSide {
 impl SendSide {
     /// `stream` tags every datagram this side sends: `Playback` on a client, `Mic` on a
     /// server. It is the only thing that distinguishes the two directions here.
+    ///
+    /// `wanted` is the gate's initial state, applied before the worker thread exists.
+    ///
+    /// It is a parameter rather than something the caller corrects afterwards because
+    /// there is no happens-before relationship between a spawned thread's first read and
+    /// a store the parent makes after `spawn` returns: a side created open and closed a
+    /// moment later can still have opened its device, which for a microphone means its
+    /// indicator lights at every server start. The client's speaker capture passes true;
+    /// the server's microphone passes false and waits to be asked.
     pub fn spawn(
         source: CaptureSource,
         stream: AudioStream,
         counters: Arc<OutCounters>,
+        wanted: bool,
     ) -> SendSide {
         let peer = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
-        let wanted = Arc::new(AtomicBool::new(true));
+        let wanted = Arc::new(AtomicBool::new(wanted));
         let thread = match source {
             CaptureSource::Disabled => None,
             src => {
@@ -312,6 +322,7 @@ mod tests {
             CaptureSource::Disabled,
             AudioStream::Playback,
             counters.clone(),
+            true,
         );
         out.set_peer(None);
         out.stop();
@@ -326,6 +337,7 @@ mod tests {
             CaptureSource::Backend(Box::new(cap)),
             AudioStream::Playback,
             counters.clone(),
+            true,
         );
         assert!(wait_until(|| handle.started(), SETTLE));
 
@@ -349,6 +361,7 @@ mod tests {
             CaptureSource::Backend(Box::new(cap)),
             AudioStream::Playback,
             counters.clone(),
+            true,
         );
         assert!(wait_until(|| handle.started(), SETTLE));
 
@@ -381,6 +394,7 @@ mod tests {
             CaptureSource::Backend(Box::new(cap)),
             AudioStream::Playback,
             counters,
+            true,
         );
         std::thread::sleep(Duration::from_millis(100));
         assert!(!handle.started());
@@ -395,6 +409,7 @@ mod tests {
             CaptureSource::Backend(Box::new(cap)),
             AudioStream::Mic,
             counters,
+            true,
         );
         assert!(wait_until(|| handle.started(), SETTLE));
 
@@ -412,6 +427,34 @@ mod tests {
     }
 
     #[test]
+    fn a_side_that_starts_closed_does_not_open_its_device() {
+        // The server's microphone must not be opened before a client asks for it — not
+        // even briefly. `MockCaptureHandle::start_count` is what makes "not even briefly"
+        // observable; a side that was created open and closed a moment later would show
+        // a count of one here.
+        let (cap, handle) = MockCapture::new();
+        let counters = Arc::new(OutCounters::default());
+        let mut audio = SendSide::spawn(
+            CaptureSource::Backend(Box::new(cap)),
+            AudioStream::Mic,
+            counters,
+            false,
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            handle.start_count(),
+            0,
+            "a side that starts closed must never have opened its device"
+        );
+        assert!(!handle.started());
+
+        audio.set_wanted(true);
+        assert!(wait_until(|| handle.started(), SETTLE));
+        assert_eq!(handle.start_count(), 1);
+        audio.stop();
+    }
+
+    #[test]
     fn a_side_nobody_gates_stays_open() {
         // The client's speaker capture is never gated; it must behave exactly as before.
         let (cap, handle) = MockCapture::new();
@@ -420,6 +463,7 @@ mod tests {
             CaptureSource::Backend(Box::new(cap)),
             AudioStream::Playback,
             counters,
+            true,
         );
         assert!(wait_until(|| handle.started(), SETTLE));
         std::thread::sleep(Duration::from_millis(50));
@@ -439,6 +483,7 @@ mod tests {
             CaptureSource::Backend(Box::new(cap)),
             AudioStream::Mic,
             counters,
+            true,
         );
         assert!(wait_until(|| handle.started(), SETTLE));
         for _ in 0..20 {
@@ -468,6 +513,7 @@ mod tests {
             CaptureSource::Backend(Box::new(cap)),
             AudioStream::Mic,
             counters,
+            true,
         );
         assert!(
             wait_until(|| handle.started(), SETTLE),

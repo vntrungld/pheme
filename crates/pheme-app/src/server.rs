@@ -128,10 +128,11 @@ pub async fn run_server(
     let audio_stats = audio_stats.unwrap_or_default();
     let audio_in = RecvSide::spawn(audio, audio_stats.clone());
     let mic_counters = mic_counters.unwrap_or_default();
-    let mic = SendSide::spawn(mic, AudioStream::Mic, mic_counters.clone());
     // Closed until a client says something is recording. A server with no client has no
-    // consumer, so there is nothing for an open microphone to be open for.
-    mic.set_wanted(false);
+    // consumer, so there is nothing for an open microphone to be open for. This is the
+    // spawn's initial state, not a correction applied after: a store made once the
+    // thread is already running is not guaranteed to be seen before its first read.
+    let mic = SendSide::spawn(mic, AudioStream::Mic, mic_counters.clone(), false);
     let (ev_tx, ev_rx) = crossbeam_channel::bounded::<CaptureEvent>(4096);
     capture.start(ev_tx).context("starting input capture")?;
     let screens = capture.screens();

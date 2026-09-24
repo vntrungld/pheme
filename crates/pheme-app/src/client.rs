@@ -130,7 +130,8 @@ pub async fn run_client(
         mic_stats,
     } = deps;
     let counters = audio_counters.unwrap_or_default();
-    let mut audio = SendSide::spawn(audio, AudioStream::Playback, counters.clone());
+    // The client's speaker capture is never gated: it starts open.
+    let mut audio = SendSide::spawn(audio, AudioStream::Playback, counters.clone(), true);
     let mic_stats = mic_stats.unwrap_or_default();
     let mut mic = RecvSide::spawn(mic, mic_stats.clone());
     let mut backoff = Backoff::new();
