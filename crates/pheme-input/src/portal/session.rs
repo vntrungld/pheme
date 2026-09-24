@@ -359,6 +359,15 @@ async fn next_portal(
     .await
 }
 
+/// How many `Disabled` signals in a row, with no capture in between, are answered with
+/// a re-enable before the session gives up.
+///
+/// The portal specification does not forbid a compositor from disabling a session the
+/// instant each `Enable` returns, and answering that for ever is an unbounded D-Bus
+/// loop. A handful of attempts covers the transient case (a session momentarily
+/// suspended while something else takes a grab) without spinning on a permanent one.
+const MAX_DISABLED_STREAK: u32 = 5;
+
 /// Runs one portal session until it is told to stop or the session ends.
 ///
 /// Everything happens on this one thread: `ei::Context` and its event stream are
@@ -467,6 +476,8 @@ pub(crate) async fn run(
 
     let mut motion = Motion::default();
     let mut held = HeldKeys::default();
+    // Consecutive `Disabled` signals with no capture in between; see the `Disabled` arm.
+    let mut disabled_streak = 0u32;
 
     loop {
         // `or` is biased toward its first argument, and that bias is the point:
@@ -529,6 +540,9 @@ pub(crate) async fn run(
                     );
                 }
                 sess.activation = id;
+                // A capture happened, so whatever made the compositor disable the
+                // session before is over; the streak counts *consecutive* failures.
+                disabled_streak = 0;
                 // A new capture starts with no sub-pixel remainder owed to it.
                 motion = Motion::default();
                 match position {
@@ -607,7 +621,26 @@ pub(crate) async fn run(
                 // specification says of this signal that "if input capturing is
                 // currently ongoing, the Deactivated signal is emitted before this
                 // signal", and that arm has already done both.
-                warn!("the compositor disabled the session; re-enabling");
+                sess.armed = false;
+                disabled_streak += 1;
+                if disabled_streak > MAX_DISABLED_STREAK {
+                    // Our own `Disable()` cannot cause this — the specification says
+                    // no `Disabled` is emitted for an application-initiated disable —
+                    // but nothing stops a compositor from disabling the session again
+                    // the instant each `Enable` returns. Re-enabling for ever would be
+                    // an unbounded D-Bus loop with an error line per turn, and the
+                    // capture would never work anyway. Give up and let the server
+                    // report a backend that stopped.
+                    error!(
+                        "the compositor disabled the session {disabled_streak} times \
+                         without a capture in between; giving up on input capture"
+                    );
+                    break;
+                }
+                warn!(
+                    attempt = disabled_streak,
+                    "the compositor disabled the session; re-enabling"
+                );
                 if let Err(e) = sess.set_barriers(&edges).await {
                     error!("re-enabling after Disabled failed: {e}");
                 }
