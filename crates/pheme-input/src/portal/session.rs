@@ -60,6 +60,11 @@ struct Session {
     sides: std::collections::HashMap<u32, pheme_core::Side>,
     /// Set while a capture is running; `Release` is ignored for any other id.
     activation: Option<u32>,
+    /// True once `Enable` has succeeded and the barriers it armed have not been taken
+    /// away again. It is what tells an empty barrier set that has something to remove
+    /// from one that has not — `start()` always runs before any client can connect, so
+    /// the first `set_barriers` is always the empty one.
+    armed: bool,
 }
 
 /// Creates the session, starts it, fetches the zones and connects to libei —
@@ -119,6 +124,7 @@ async fn establish() -> Result<(Session, ei::Context)> {
         zone_set: 0,
         sides: Default::default(),
         activation: None,
+        armed: false,
     };
     s.refresh_zones().await?;
 
@@ -172,8 +178,33 @@ impl Session {
     ///
     /// `SetPointerBarriers` suspends the session, so `Enable` must follow *every*
     /// call — not only the first. A client connecting mid-session lands here.
+    ///
+    /// An empty `edges` means "capture nothing": either there is nothing to capture for
+    /// yet (this is what `start()` passes, because it runs before any client can
+    /// connect) or everything has been withdrawn (the last client went away, or the
+    /// input lock came on — spec §7). The first of those has nothing to undo, and
+    /// `Disable()` on a session that has never been enabled is a call the specification
+    /// neither describes nor promises to accept; failing it would take `start()`, and
+    /// therefore `pheme server`, down with it. The second must still go through, or the
+    /// barriers stay armed with nothing behind them.
     async fn set_barriers(&mut self, edges: &[CaptureEdge]) -> Result<()> {
         let want = barriers(&self.zones, edges);
+        if want.is_empty() && !edges.is_empty() {
+            // Not the same thing as "no edges": these edges produced no barrier at all,
+            // so nothing will ever activate and the switch will simply never happen.
+            // The only way to see it is from here.
+            warn!(
+                ?edges,
+                zones = ?self.zones,
+                "no pointer barrier could be placed for these capture edges; \
+                 crossing them will do nothing"
+            );
+        }
+        if want.is_empty() && !self.armed {
+            self.sides.clear();
+            debug!("no capture edges, and nothing armed to withdraw; leaving the session idle");
+            return Ok(());
+        }
         self.sides = want.iter().map(|b| (b.id.get(), b.side)).collect();
         let list: Vec<Barrier> = want
             .iter()
@@ -213,17 +244,21 @@ impl Session {
 
         if list.is_empty() {
             // No edges left: stop capturing entirely rather than leave a session
-            // armed with nothing to trigger it.
+            // armed with nothing to trigger it. Reached only when something *was*
+            // armed, so the session has been enabled and `Disable` applies.
             self.portal
                 .disable(&self.session, DisableOptions::default())
                 .await
                 .map_err(|e| pe("Disable", e))?;
+            self.armed = false;
             return Ok(());
         }
         self.portal
             .enable(&self.session, EnableOptions::default())
             .await
-            .map_err(|e| pe("Enable", e))
+            .map_err(|e| pe("Enable", e))?;
+        self.armed = true;
+        Ok(())
     }
 }
 
