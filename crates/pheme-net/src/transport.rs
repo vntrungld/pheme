@@ -1,7 +1,7 @@
 //! quinn endpoints and peers with length-prefixed control frames and raw datagrams.
 
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -400,6 +400,7 @@ pub struct Peer {
     sender: PeerSender,
     incoming: Option<mpsc::Receiver<Msg>>,
     audio: Option<mpsc::Receiver<Msg>>,
+    audio_dropped: Arc<AtomicU64>,
 }
 
 impl Peer {
@@ -414,6 +415,12 @@ impl Peer {
         let (audio_tx, audio_rx) = mpsc::channel(AUDIO_BUFFER);
         let control_tx = tx.clone();
         let control_audio_tx = audio_tx.clone();
+        // A frame dropped here is the one audio loss nothing downstream can attribute:
+        // the jitter buffer never sees it, so its own `dropped` and `overflows` read
+        // clean while the listener hears a gap. Spec §2.5 requires it to be counted.
+        let audio_dropped = Arc::new(AtomicU64::new(0));
+        let control_audio_dropped = audio_dropped.clone();
+        let dgram_audio_dropped = audio_dropped.clone();
         tokio::spawn(async move {
             let mut buf = Vec::with_capacity(256);
             loop {
@@ -423,6 +430,7 @@ impl Peer {
                     // way, so `take_incoming()` never yields a `Msg::Audio`.
                     Ok(Some(m @ Msg::Audio { .. })) => {
                         if control_audio_tx.try_send(m).is_err() {
+                            control_audio_dropped.fetch_add(1, Ordering::Relaxed);
                             debug!("audio channel full; dropping a frame");
                         }
                     }
@@ -447,6 +455,7 @@ impl Peer {
                         // Never block the datagram reader on a slow audio consumer:
                         // a dropped frame is concealed, a stalled reader delays input.
                         if audio_tx.try_send(m).is_err() {
+                            dgram_audio_dropped.fetch_add(1, Ordering::Relaxed);
                             debug!("audio channel full; dropping a frame");
                         }
                     }
@@ -470,6 +479,7 @@ impl Peer {
             sender,
             incoming: Some(rx),
             audio: Some(audio_rx),
+            audio_dropped,
         }
     }
 
@@ -502,6 +512,21 @@ impl Peer {
     /// but not a deadline. Input must never wait behind audio.
     pub fn take_audio(&mut self) -> mpsc::Receiver<Msg> {
         self.audio.take().expect("audio receiver already taken")
+    }
+
+    /// Audio frames dropped because this peer's audio channel was full, cumulative for
+    /// the life of the peer.
+    ///
+    /// `AUDIO_BUFFER` is deliberately shallower than the jitter buffer downstream, so an
+    /// overflow here is real loss that no later counter can see. Spec §2.5.
+    pub fn audio_dropped(&self) -> u64 {
+        self.audio_dropped.load(Ordering::Relaxed)
+    }
+
+    /// The same counter as a handle, for readers that outlive a borrow of the `Peer` —
+    /// the server's stats task reads it through its `Link`.
+    pub fn audio_dropped_counter(&self) -> Arc<AtomicU64> {
+        self.audio_dropped.clone()
     }
 
     pub fn rtt(&self) -> Duration {

@@ -241,3 +241,54 @@ async fn audio_cannot_queue_ahead_of_input() {
         .unwrap();
     server_task.await.unwrap();
 }
+
+/// Spec §2.5: a full audio channel drops the frame being delivered **and counts it**.
+///
+/// This is the one audio loss nothing downstream can attribute — the frame never reaches
+/// the jitter buffer, so its own `dropped` and `overflows` stay clean while the listener
+/// hears a gap. The frames go on the control stream because it is reliable and ordered:
+/// every one of them is certain to arrive, so a missing count is the counter's fault and
+/// not the network's.
+#[tokio::test]
+async fn a_full_audio_channel_counts_the_frames_it_drops() {
+    let s = side("server");
+    let c = side("client");
+    trust_each_other(&s, &c);
+    let server = Endpoint::server("127.0.0.1:0".parse().unwrap(), &s.id, s.trust.clone()).unwrap();
+    let addr: SocketAddr = server.local_addr().unwrap();
+    let client = Endpoint::client(&c.id, c.trust.clone()).unwrap();
+
+    let server_task = tokio::spawn(async move {
+        let Incoming::Peer(peer) = server.accept().await.unwrap() else {
+            panic!("expected peer")
+        };
+        peer
+    });
+
+    let peer = client.connect(addr).await.unwrap();
+    // Nothing ever calls `take_audio` on the server side, so the 32-frame audio channel
+    // fills and stays full.
+    for seq in 0..128 {
+        peer.sender()
+            .send_control(&Msg::Audio {
+                stream: pheme_proto::AudioStream::Mic,
+                seq,
+                ts_us: u64::from(seq) * 5_000,
+                samples: vec![0u8; 960],
+            })
+            .await
+            .unwrap();
+    }
+    let server_peer = server_task.await.unwrap();
+
+    let t = Instant::now();
+    while server_peer.audio_dropped() < 64 && t.elapsed() < Duration::from_secs(5) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        server_peer.audio_dropped() >= 64,
+        "128 frames into a 32-deep channel counted only {} drops",
+        server_peer.audio_dropped()
+    );
+    peer.close("done");
+}

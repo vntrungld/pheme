@@ -334,6 +334,11 @@ async fn session(
                     mic_late = m.late,
                     mic_resets = m.resets,
                     mic_dropped = m.dropped,
+                    // Cumulative for this session, unlike the deltas around it: frames
+                    // the transport dropped because the audio channel was full. That
+                    // loss never reaches the jitter buffer, so no counter beside it can
+                    // account for the gap the listener hears. Spec §2.5.
+                    mic_channel_dropped = peer.audio_dropped(),
                     mic_overflows = m.overflows,
                     active = core.active(),
                     "stats/s"

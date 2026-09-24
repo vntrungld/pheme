@@ -43,6 +43,9 @@ struct Link {
     name: String,
     sender: PeerSender,
     control: mpsc::UnboundedSender<Msg>,
+    /// The peer's own count of audio frames dropped because its audio channel was full.
+    /// Carried here because the stats task outlives no `Peer` borrow of its own.
+    audio_dropped: Arc<AtomicU64>,
 }
 
 #[derive(Default)]
@@ -190,7 +193,13 @@ pub async fn run_server(
                     s.counters.control_sent.load(Ordering::Relaxed),
                     s.counters.datagrams_sent.load(Ordering::Relaxed),
                 );
-                let connected = s.link.lock().unwrap().is_some();
+                // Cumulative for the current session, and zero with no client: a
+                // frame the transport dropped is loss the jitter buffer never sees, so
+                // reporting it beside the deltas is what keeps it attributable.
+                let (connected, audio_channel_dropped) = match s.link.lock().unwrap().as_ref() {
+                    Some(l) => (true, l.audio_dropped.load(Ordering::Relaxed)),
+                    None => (false, 0),
+                };
                 let a = astats.snapshot_delta();
                 let mic_sent = mic_counters.sent.swap(0, Ordering::Relaxed);
                 let mic_suppressed = mic_counters.suppressed.swap(0, Ordering::Relaxed);
@@ -206,6 +215,7 @@ pub async fn run_server(
                     audio_late = a.late,
                     audio_resets = a.resets,
                     audio_dropped = a.dropped,
+                    audio_channel_dropped,
                     audio_overflows = a.overflows,
                     mic_sent,
                     mic_suppressed,
@@ -374,6 +384,7 @@ async fn handle_peer(
             name: name.clone(),
             sender: peer.sender(),
             control: control_tx,
+            audio_dropped: peer.audio_dropped_counter(),
         });
     }
     let actions = shared.core.lock().unwrap().client_connected(&name, screens);
