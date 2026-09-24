@@ -1667,7 +1667,12 @@ struct Session {
     activation: Option<u32>,
 }
 
-async fn establish(edges: &[CaptureEdge]) -> Result<(Session, ei::Context)> {
+/// Creates the session and connects to libei. It deliberately stops there: the portal
+/// specification states that `ConnectToEIS` **must** be invoked before `Enable()`, and
+/// `set_barriers` calls `Enable`. Barriers are therefore declared by `run` (Task 8),
+/// after the libei handshake. A session only needs `ConnectToEIS` once — the connection
+/// survives every later `Disable`/`Enable` pair until the session closes.
+async fn establish() -> Result<(Session, ei::Context)> {
     let portal = Portal::new().await.map_err(pe)?;
     let session = portal
         .create_session2(CreateSession2Options::default())
@@ -1710,7 +1715,6 @@ async fn establish(edges: &[CaptureEdge]) -> Result<(Session, ei::Context)> {
         activation: None,
     };
     s.refresh_zones().await?;
-    s.set_barriers(edges).await?;
 
     let fd = s
         .portal
@@ -1896,7 +1900,7 @@ pub(crate) async fn run(
     edges: Vec<CaptureEdge>,
     ready: std::sync::mpsc::Sender<Result<()>>,
 ) {
-    let (mut sess, ctx) = match establish(&edges).await {
+    let (mut sess, ctx) = match establish().await {
         Ok(v) => {
             let _ = ready.send(Ok(()));
             v
@@ -1948,9 +1952,19 @@ pub(crate) async fn run(
         }
     };
 
+    // Barriers are declared here, not in `establish`: `set_barriers` calls `Enable`, and
+    // the portal specification requires `ConnectToEIS` to happen first. Doing it after the
+    // handshake also closes the window where the session would be armed with no libei
+    // devices bound — an `Activated` in that window would switch to the client with no
+    // input events able to reach it.
+    let mut edges = edges;
+    if let Err(e) = sess.set_barriers(&edges).await {
+        error!("declaring pointer barriers failed: {e}");
+        return;
+    }
+
     let mut motion = Motion::default();
     let mut held = HeldKeys::default();
-    let mut edges = edges;
 
     loop {
         // `or` is biased toward its first argument. Commands come first so a Stop is
