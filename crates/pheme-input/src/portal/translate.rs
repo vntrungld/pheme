@@ -133,6 +133,10 @@ mod tests {
         // 0x02 is Lock (caps), 0x10 is Mod2 (num lock): neither is a Pheme modifier,
         // and neither must produce a stray key press.
         assert!(modifier_keys(0x02 | 0x10).is_empty());
+        // Asserting only the line above would still pass against a `modifier_keys`
+        // that returned nothing for every input, so the name would outrun the test.
+        // Mixing a real modifier in pins selective exclusion, which is the property.
+        assert_eq!(modifier_keys(0x02 | 0x10 | 0x01), vec![KeyCode::LEFT_SHIFT]);
     }
 
     #[test]
