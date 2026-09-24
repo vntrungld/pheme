@@ -586,6 +586,67 @@ async fn failed_grab_leaves_server_local() {
     assert_eq!(cap.mode(), CaptureMode::Observe);
 }
 
+/// A backend that breaks the `InputCapture::stop` contract and keeps an event sender
+/// must not stop the *process* from exiting.
+///
+/// Deliberately not a `#[tokio::test]`: the hazard this guards against is in dropping
+/// the runtime, not in `run_server`. A bounded `spawn_blocking(|| router.join())` lets
+/// `run_server` return on time and still hangs, because tokio's runtime drop waits
+/// forever for a blocking task to return. The runtime is therefore built, used and
+/// dropped inside a thread of its own, and the assertion is that the thread reaches the
+/// far side of that drop.
+#[test]
+fn a_router_thread_that_cannot_finish_does_not_keep_the_process_alive() {
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap();
+        let elapsed = rt.block_on(async {
+            let Pair {
+                server,
+                client,
+                shutdown_tx,
+                cap,
+                inj: _,
+            } = spawn_pair();
+            wait_connected(&cap).await;
+            // From here on `stop()` keeps its sender, so the router thread's
+            // `ev_rx.recv()` never returns -- exactly what `PortalCapture::stop()`
+            // does when it gives up and detaches its session thread.
+            cap.keep_sender_on_stop();
+
+            let t = Instant::now();
+            shutdown_tx.send(true).unwrap();
+            tokio::time::timeout(Duration::from_secs(20), server)
+                .await
+                .expect("run_server did not return at all")
+                .unwrap()
+                .unwrap();
+            let elapsed = t.elapsed();
+            let _ = tokio::time::timeout(Duration::from_secs(5), client).await;
+            elapsed
+        });
+        // The hang the old shape merely relocated: an abandoned `spawn_blocking` task
+        // is still running here, and `Runtime::drop` waits for it forever.
+        drop(rt);
+        let _ = done_tx.send(elapsed);
+    });
+
+    let elapsed = done_rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the runtime never finished dropping: the process would hang on exit");
+    // Proves the test exercised the abandoning path rather than a router thread that
+    // quietly exited: `ROUTER_JOIN_TIMEOUT` is 5 s, and shutdown cannot beat it here.
+    assert!(
+        elapsed >= Duration::from_millis(4_500),
+        "shutdown returned in {elapsed:?}, so the router thread was not stuck and this \
+         test proves nothing"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn run_server_fails_when_the_capture_backend_dies() {
     let Pair {

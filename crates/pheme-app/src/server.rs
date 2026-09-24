@@ -25,6 +25,11 @@ use crate::config::{config_dir, Config};
 /// thread still holding a sender is abandoned instead of hanging the process.
 const ROUTER_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How often the shutdown path asks whether the router thread has finished. Short
+/// enough that a normal shutdown is not visibly delayed, long enough that the wait
+/// costs a few dozen wake-ups rather than a spinning core.
+const ROUTER_JOIN_POLL: Duration = Duration::from_millis(20);
+
 pub struct ServerDeps {
     pub name: String,
     pub capture: Box<dyn InputCapture>,
@@ -394,23 +399,40 @@ pub async fn run_server(
     endpoint.close();
     endpoint.wait_idle().await;
     drop(shared);
-    // Join on a blocking task, and bound the wait: a backend that violates the stop()
-    // contract would hang `router.join()` forever, because the router sits in
+    // Wait for the router thread to end, but never block on it: a backend that violates
+    // the stop() contract would hang `router.join()` forever, because the router sits in
     // `ev_rx.recv()` until the last `Sender` clone is dropped. That is not hypothetical
     // — `PortalCapture::stop()` gives up after 3 s and *detaches* its session thread,
-    // which still owns its `Sender`, so an unbounded join here would simply move the
-    // hang it avoided. Doing it on a blocking task keeps a tokio worker out of it
-    // either way.
-    let join = tokio::task::spawn_blocking(move || router.join());
-    if tokio::time::timeout(ROUTER_JOIN_TIMEOUT, join)
-        .await
-        .is_err()
-    {
+    // which still owns its `Sender`.
+    //
+    // The wait is a poll of `is_finished()` rather than a bounded `spawn_blocking(||
+    // router.join())`, which would not actually let the process leave: tokio's
+    // documentation is explicit that "blocking functions spawned through
+    // `Runtime::spawn_blocking` keep running until they return... The `Drop`
+    // implementation waits forever for this". Abandoning that task only moves the hang
+    // from here into the runtime's drop, after `main` has returned — the same hang, with
+    // a warning in front of it. A `std::thread` left unjoined has no such property, so
+    // dropping this handle really does detach it, exactly as `pheme_audio::device`
+    // detaches a capture thread it could not stop.
+    let joined = tokio::time::timeout(ROUTER_JOIN_TIMEOUT, async {
+        // Polled, not busy-waited: a spin here would burn a core for the whole timeout
+        // on precisely the shutdown path that is already going wrong.
+        while !router.is_finished() {
+            tokio::time::sleep(ROUTER_JOIN_POLL).await;
+        }
+    })
+    .await
+    .is_ok();
+    if joined {
+        // Finished: this returns immediately.
+        let _ = router.join();
+    } else {
         warn!(
             "the router thread did not exit within {ROUTER_JOIN_TIMEOUT:?}; the capture \
-             backend still holds an event sender. Abandoning the join rather than \
+             backend still holds an event sender. Detaching the thread rather than \
              blocking shutdown on it"
         );
+        drop(router);
     }
     outcome
 }

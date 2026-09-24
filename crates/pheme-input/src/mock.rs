@@ -21,6 +21,12 @@ struct CaptureState {
     /// Every `set_edges` call in order, not just the last, so a test can tell "set
     /// once" from "set repeatedly".
     edges: Vec<Vec<CaptureEdge>>,
+    /// When set, `stop()` keeps the event `Sender` instead of dropping it, so nothing
+    /// ever observes the channel closing. See `keep_sender_on_stop`.
+    keep_sender_on_stop: bool,
+    /// Senders `stop()` kept rather than dropped. Held, not leaked, so they die with
+    /// the mock rather than for the life of the test binary.
+    kept: Vec<Sender<CaptureEvent>>,
 }
 
 impl CaptureState {
@@ -98,6 +104,15 @@ impl MockCaptureHandle {
         self.state.lock().unwrap().tx = None;
     }
 
+    /// Makes `stop()` hold on to the event `Sender` instead of dropping it, which is
+    /// what a backend that breaks the `InputCapture::stop` contract does. It is not a
+    /// hypothetical: `PortalCapture::stop()` gives up after 3 s and detaches its
+    /// session thread, which still owns a `Sender`. Anything receiving on that channel
+    /// then waits forever, which is the case the shutdown path has to survive.
+    pub fn keep_sender_on_stop(&self) {
+        self.state.lock().unwrap().keep_sender_on_stop = true;
+    }
+
     /// Every `set_edges` call in order.
     pub fn edge_calls(&self) -> Vec<Vec<CaptureEdge>> {
         self.state.lock().unwrap().edges.clone()
@@ -134,7 +149,12 @@ impl InputCapture for MockCapture {
     }
 
     fn stop(&mut self) {
-        self.state.lock().unwrap().tx = None;
+        let mut st = self.state.lock().unwrap();
+        if let Some(tx) = st.tx.take() {
+            if st.keep_sender_on_stop {
+                st.kept.push(tx);
+            }
+        }
     }
 
     fn release(&mut self, x: i32, y: i32) -> Result<()> {
