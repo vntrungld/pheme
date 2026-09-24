@@ -409,7 +409,12 @@ mod tests {
     }
 
     #[test]
-    fn an_injected_backend_that_fails_to_start_gives_up_quietly() {
+    fn a_failed_start_leaves_the_device_closed_and_stop_still_returns() {
+        // The side does *not* give up: `CaptureSource::Backend` retries every `RETRY`
+        // after a failed start, since the `rebuild` flag was removed from `out_thread`.
+        // What is asserted here is what happens inside that window — the device stays
+        // unstarted — and that `stop()` returns promptly rather than waiting out the
+        // worker's retry nap.
         let (cap, handle) = MockCapture::new();
         handle.fail_next_start();
         let counters = Arc::new(OutCounters::default());
