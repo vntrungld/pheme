@@ -29,11 +29,30 @@ pub struct Hotkeys {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureEvent {
-    MotionAbs { x: i32, y: i32 },
-    MotionRel { dx: i32, dy: i32 },
-    Button { btn: Button, down: bool },
-    Wheel { dx: i32, dy: i32 },
-    Key { code: KeyCode, down: bool },
+    MotionAbs {
+        x: i32,
+        y: i32,
+    },
+    MotionRel {
+        dx: i32,
+        dy: i32,
+    },
+    Button {
+        btn: Button,
+        down: bool,
+    },
+    Wheel {
+        dx: i32,
+        dy: i32,
+    },
+    Key {
+        code: KeyCode,
+        down: bool,
+    },
+    /// The backend stopped capturing without the pointer leaving the client — the
+    /// compositor ended it. Only the Wayland backend produces this; the X11 and
+    /// Windows backends keep capturing until they are told to stop.
+    CaptureEnded,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -144,7 +163,31 @@ impl ServerCore {
         vec![Action::WarpCursor { x, y }]
     }
 
+    /// Returns to Local because the capture ended without the pointer leaving the
+    /// client — the compositor ended it on its own, which the InputCapture portal
+    /// permits at any time.
+    ///
+    /// Unlike `client_disconnected` this sends `Msg::Leave`: the client is still
+    /// connected, and without it every key held at that instant stays held there.
+    /// Unlike `abort_switch` the switch did happen, so `Enter` was already sent.
+    pub fn release_remote(&mut self) -> Vec<Action> {
+        if self.remote.take().is_none() {
+            return Vec::new();
+        }
+        let (x, y) = self.server.center();
+        self.last_pos = Some((x, y));
+        let seq = self.next_seq();
+        debug!("capture ended by the compositor; back to local");
+        vec![
+            Action::SendControl(Msg::Leave { seq }),
+            Action::Ungrab { x, y },
+        ]
+    }
+
     pub fn on_event(&mut self, ev: CaptureEvent) -> Vec<Action> {
+        if let CaptureEvent::CaptureEnded = ev {
+            return self.release_remote();
+        }
         if let CaptureEvent::Key { code, down } = ev {
             if Some(code) == self.hotkeys.lock {
                 if down {
@@ -274,6 +317,9 @@ impl ServerCore {
             CaptureEvent::Key { code, down } => {
                 let seq = self.next_seq();
                 vec![Action::SendControl(Msg::Key { seq, code, down })]
+            }
+            CaptureEvent::CaptureEnded => {
+                unreachable!("on_event handles CaptureEnded before dispatching here")
             }
         }
     }
@@ -565,6 +611,76 @@ mod tests {
             _ => panic!(),
         };
         assert_eq!(seq(&b[0]), seq(&a[0]) + 1);
+    }
+
+    #[test]
+    fn release_remote_tells_the_client_to_let_go() {
+        let mut c = core(Side::Right, (0.0, 1.0));
+        enter_right(&mut c);
+        assert_eq!(c.active(), Active::Remote("lap".into()));
+
+        let actions = c.release_remote();
+
+        assert!(
+            matches!(
+                actions.first(),
+                Some(Action::SendControl(Msg::Leave { .. }))
+            ),
+            "without Leave the client keeps whatever it is holding: {actions:?}"
+        );
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::Ungrab { .. })),
+            "{actions:?}"
+        );
+        assert_eq!(c.active(), Active::Local);
+    }
+
+    #[test]
+    fn release_remote_is_a_no_op_when_already_local() {
+        let mut c = core(Side::Right, (0.0, 1.0));
+        assert!(c.release_remote().is_empty());
+    }
+
+    #[test]
+    fn capture_ended_returns_to_local_with_a_leave() {
+        let mut c = core(Side::Right, (0.0, 1.0));
+        enter_right(&mut c);
+        let actions = c.on_event(CaptureEvent::CaptureEnded);
+        assert!(
+            matches!(
+                actions.first(),
+                Some(Action::SendControl(Msg::Leave { .. }))
+            ),
+            "{actions:?}"
+        );
+        assert_eq!(c.active(), Active::Local);
+    }
+
+    #[test]
+    fn capture_ended_while_local_does_nothing() {
+        let mut c = core(Side::Right, (0.0, 1.0));
+        assert!(c.on_event(CaptureEvent::CaptureEnded).is_empty());
+    }
+
+    #[test]
+    fn a_key_held_across_release_remote_does_not_leak_into_the_next_enter() {
+        let mut c = core(Side::Right, (0.0, 1.0));
+        enter_right(&mut c);
+        c.on_event(CaptureEvent::Key {
+            code: KeyCode::LEFT_SHIFT,
+            down: true,
+        });
+        c.release_remote();
+        // The key-up arrives while local, as it would from any backend that still
+        // observes the keyboard.
+        c.on_event(CaptureEvent::Key {
+            code: KeyCode::LEFT_SHIFT,
+            down: false,
+        });
+
+        c.on_event(CaptureEvent::MotionAbs { x: 1900, y: 540 });
+        let actions = c.on_event(CaptureEvent::MotionAbs { x: 1919, y: 540 });
+        assert_eq!(has_enter(&actions).unwrap().2, Modifiers::default());
     }
 }
 
