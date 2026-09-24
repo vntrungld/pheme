@@ -2,4 +2,5 @@
 //! and libei.
 
 pub mod geometry;
+pub(crate) mod session;
 pub mod translate;
