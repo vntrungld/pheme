@@ -2,7 +2,7 @@
 //! connection, with mock devices on both ends.
 
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -14,8 +14,8 @@ use pheme_audio::{Demand, FRAME_INTERLEAVED};
 use pheme_core::{ClientPlacement, Hotkeys, Side};
 use pheme_input::mock::{MockCapture as MockInputCapture, MockInject};
 use pheme_input::InputCapture;
-use pheme_net::{Endpoint, Identity, SharedTrust, TrustStore};
-use pheme_proto::ScreenInfo;
+use pheme_net::{Endpoint, Identity, Incoming, SharedTrust, TrustStore};
+use pheme_proto::{AudioParams, Msg, ScreenInfo, PROTOCOL_VERSION};
 use tokio::sync::watch;
 
 fn screens(w: u32, h: u32) -> Vec<ScreenInfo> {
@@ -324,6 +324,120 @@ async fn a_client_with_no_virtual_microphone_never_opens_the_server_one() {
     assert!(!pair.server_mic.started());
     assert_eq!(pair.server_mic.start_count(), 0);
     pair.shutdown().await;
+}
+
+/// A counting stand-in for the server: completes the handshake and then tallies what
+/// arrives on the control stream. The test below is about the client's own session loop,
+/// not about anything the real server does with these messages, and a real `run_server`
+/// cannot report how often the client spoke.
+async fn count_control_messages(
+    endpoint: Endpoint,
+    pings: Arc<AtomicU64>,
+    mic_wanted: Arc<AtomicU64>,
+) {
+    let Ok(Incoming::Peer(mut peer)) = endpoint.accept().await else {
+        panic!("the client never connected");
+    };
+    let mut rx = peer.take_incoming();
+    let sender = peer.sender();
+    match rx.recv().await {
+        Some(Msg::Hello { .. }) => {}
+        other => panic!("expected Hello, got {other:?}"),
+    }
+    sender
+        .send_control(&Msg::HelloAck {
+            version: PROTOCOL_VERSION,
+            name: "server".into(),
+            audio: AudioParams::DEFAULT,
+        })
+        .await
+        .unwrap();
+    while let Some(m) = rx.recv().await {
+        match m {
+            Msg::Ping(_) => {
+                pings.fetch_add(1, Ordering::Relaxed);
+            }
+            Msg::MicWanted { .. } => {
+                mic_wanted.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
+    // `peer` is held to here on purpose: dropping it closes the connection, and the
+    // client would reconnect and start the handshake over.
+    drop(peer);
+}
+
+#[tokio::test]
+async fn a_client_with_no_virtual_microphone_still_runs_its_session_loop() {
+    // The other half of `a_client_with_no_virtual_microphone_never_opens_the_server_one`,
+    // which only ever looked at the server. With no virtual microphone there is no
+    // playback worker and so no `watch::Sender` for mic demand unless `RecvSide` holds
+    // one itself; without it `changed()` returns `Err` at once and for ever, its
+    // `select!` arm is permanently ready, and because the arm is ahead of the ping and
+    // the stats tick in a `biased` select it starves both while flooding the control
+    // stream with `MicWanted { wanted: false }`. That is every Windows client today, and
+    // its only symptom is a hot core.
+    let sdir = tempfile::tempdir().unwrap();
+    let cdir = tempfile::tempdir().unwrap();
+    let sid = Identity::load_or_create(sdir.path(), "server").unwrap();
+    let cid = Identity::load_or_create(cdir.path(), "lap").unwrap();
+    let strust = TrustStore::load(sdir.path()).unwrap().shared();
+    let ctrust = TrustStore::load(cdir.path()).unwrap().shared();
+    strust.write().unwrap().add("lap", &cid.fingerprint);
+    ctrust.write().unwrap().add("server", &sid.fingerprint);
+
+    let server_ep = Endpoint::server("127.0.0.1:0".parse().unwrap(), &sid, strust).unwrap();
+    let server_addr = server_ep.local_addr().unwrap();
+    let client_ep = Endpoint::client(&cid, ctrust).unwrap();
+    let (inject, _inj) = MockInject::new(screens(1000, 500));
+
+    let pings = Arc::new(AtomicU64::new(0));
+    let asks = Arc::new(AtomicU64::new(0));
+    let server = tokio::spawn(count_control_messages(
+        server_ep,
+        pings.clone(),
+        asks.clone(),
+    ));
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let client = tokio::spawn(run_client(
+        ClientDeps {
+            name: "lap".into(),
+            inject: Box::new(inject),
+            endpoint: client_ep,
+            server_addr,
+            stats: false,
+            audio: CaptureSource::Disabled,
+            audio_counters: None,
+            mic: PlaybackSource::Disabled,
+            mic_stats: None,
+        },
+        shutdown_rx,
+    ));
+
+    // Long enough for the one-second ping interval to have fired at least twice.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let asked = asks.load(Ordering::Relaxed);
+    let pinged = pings.load(Ordering::Relaxed);
+
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), client)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    server.abort();
+
+    assert!(
+        asked <= 3,
+        "the client asked about the microphone {asked} times in 1.5 s; it has no \
+         virtual microphone, so it should say so once and then stay quiet"
+    );
+    assert!(
+        pinged >= 1,
+        "the client sent no ping in 1.5 s: its session loop is starved"
+    );
 }
 
 #[tokio::test]

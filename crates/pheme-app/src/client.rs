@@ -294,7 +294,14 @@ async fn session(
                 }
                 None => break Ok(()),
             },
-            _ = mic_wanted.changed() => {
+            // `Ok(())`, not `_`: a dropped sender makes `changed()` return `Err`
+            // immediately and for ever, and a `_` pattern would leave this arm
+            // permanently ready. Since the arm sits ahead of the ping and the stats tick
+            // in a `biased` select, that starves both and burns a core, with no symptom
+            // but heat. `RecvSide` now holds its sender open so this cannot happen; the
+            // refutable pattern makes `select!` disable the branch rather than spin if
+            // some future path ever drops one again.
+            Ok(()) = mic_wanted.changed() => {
                 let wanted = *mic_wanted.borrow_and_update();
                 if wanted {
                     // Reset *before* asking, not after the audio starts arriving. While

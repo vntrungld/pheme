@@ -165,6 +165,13 @@ pub struct RecvSide {
     stats: Arc<InStats>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    /// Held only to keep the demand channel open for the life of this side, even when no
+    /// worker was ever spawned (playback disabled, or no backend on this platform). A
+    /// closed channel makes `Receiver::changed()` return `Err` immediately and forever,
+    /// which turns a `select!` arm waiting on it into a busy loop that starves every
+    /// other arm behind it. Pending forever at `false` is the honest answer: nothing is
+    /// consuming, and nothing ever will.
+    _wanted_tx: Arc<watch::Sender<bool>>,
     wanted_rx: watch::Receiver<bool>,
     reset_requested: Arc<AtomicBool>,
 }
@@ -182,6 +189,10 @@ impl RecvSide {
     ) -> RecvSide {
         let stop = Arc::new(AtomicBool::new(false));
         let (wanted_tx, wanted_rx) = watch::channel(false);
+        // Shared rather than moved into the worker: `watch::Sender`'s methods take
+        // `&self`, so both ends can hold it with no lock, and the channel outlives every
+        // path that returns without a worker.
+        let wanted_tx = Arc::new(wanted_tx);
         let reset_requested = Arc::new(AtomicBool::new(false));
         if matches!(source, PlaybackSource::Disabled) {
             return RecvSide {
@@ -189,6 +200,7 @@ impl RecvSide {
                 stats,
                 stop,
                 thread: None,
+                _wanted_tx: wanted_tx,
                 wanted_rx,
                 reset_requested,
             };
@@ -198,6 +210,7 @@ impl RecvSide {
             let stop = stop.clone();
             let stats = stats.clone();
             let reset_requested = reset_requested.clone();
+            let wanted_tx = wanted_tx.clone();
             match std::thread::Builder::new()
                 .name(source.thread_name().into())
                 .spawn(move || {
@@ -215,6 +228,7 @@ impl RecvSide {
             stats,
             stop,
             thread,
+            _wanted_tx: wanted_tx,
             wanted_rx,
             reset_requested,
         }
@@ -270,7 +284,7 @@ fn in_thread(
     rx: Receiver<Frame>,
     stop: Arc<AtomicBool>,
     stats: Arc<InStats>,
-    wanted_tx: watch::Sender<bool>,
+    wanted_tx: Arc<watch::Sender<bool>>,
     linger: Duration,
     reset_requested: Arc<AtomicBool>,
 ) {
