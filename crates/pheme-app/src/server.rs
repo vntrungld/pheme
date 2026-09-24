@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context};
 use pheme_audio::frame::Frame;
 use pheme_core::{Action, CaptureEvent, ClientPlacement, Hotkeys, Layout, ServerCore};
-use pheme_input::{CaptureMode, InputCapture};
+use pheme_input::{CaptureEdge, CaptureMode, InputCapture};
 use pheme_net::pairing::{generate_code, run_server_pairing};
 use pheme_net::{Endpoint, Identity, Incoming, Peer, PeerSender, TrustStore};
 use pheme_proto::{AudioParams, AudioStream, Msg, PROTOCOL_VERSION};
@@ -110,6 +110,25 @@ impl Shared {
         if let Err(e) = f(self.capture.lock().unwrap().as_mut()) {
             error!("capture backend error: {e}");
         }
+    }
+
+    /// Pushes the current edge set to the capture backend. Called whenever the set of
+    /// connected clients changes: barriers are declared only for edges that lead
+    /// somewhere (see `ServerCore::capture_edges`).
+    ///
+    /// Must never be called while a `core` lock guard is still held: the lock is taken
+    /// here just long enough to read the edge set, then dropped before the capture
+    /// backend (a separate lock) is called into.
+    fn publish_edges(&self) {
+        let edges: Vec<CaptureEdge> = self
+            .core
+            .lock()
+            .unwrap()
+            .capture_edges()
+            .into_iter()
+            .map(|(side, span)| CaptureEdge { side, span })
+            .collect();
+        self.capture_call(|c| c.set_edges(&edges));
     }
 }
 
@@ -401,6 +420,7 @@ async fn handle_peer(
     }
     let actions = shared.core.lock().unwrap().client_connected(&name, screens);
     shared.execute(actions);
+    shared.publish_edges();
 
     // Control writer: preserves ordering of Key/Button/Enter/Leave.
     let writer_sender = peer.sender();
@@ -462,6 +482,7 @@ async fn handle_peer(
     shared.mic.set_wanted(false);
     let actions = shared.core.lock().unwrap().client_disconnected(&name);
     shared.execute(actions);
+    shared.publish_edges();
     peer.close("session ended");
     info!(client = %name, "client disconnected");
     result

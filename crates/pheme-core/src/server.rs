@@ -137,6 +137,22 @@ impl ServerCore {
         Vec::new()
     }
 
+    /// The edges a crossing may start a capture on: one per placement whose client is
+    /// currently connected.
+    ///
+    /// Edges without a connected client are deliberately excluded. A backend that
+    /// declares them (the InputCapture portal) would have the compositor stop the
+    /// pointer at that edge, and the core would then decline the switch — so the
+    /// pointer would snag on a screen edge that leads nowhere.
+    pub fn capture_edges(&self) -> Vec<(Side, (f32, f32))> {
+        self.layout
+            .clients
+            .iter()
+            .filter(|p| self.connected.contains_key(&p.name))
+            .map(|p| (p.side, p.span))
+            .collect()
+    }
+
     pub fn client_disconnected(&mut self, name: &str) -> Vec<Action> {
         self.connected.remove(name);
         match &self.remote {
@@ -681,6 +697,43 @@ mod tests {
         c.on_event(CaptureEvent::MotionAbs { x: 1900, y: 540 });
         let actions = c.on_event(CaptureEvent::MotionAbs { x: 1919, y: 540 });
         assert_eq!(has_enter(&actions).unwrap().2, Modifiers::default());
+    }
+
+    #[test]
+    fn capture_edges_covers_only_connected_clients() {
+        let layout = Layout {
+            server_screens: screen(1920, 1080),
+            clients: vec![
+                ClientPlacement {
+                    name: "right".into(),
+                    side: Side::Right,
+                    span: (0.0, 1.0),
+                },
+                ClientPlacement {
+                    name: "left".into(),
+                    side: Side::Left,
+                    span: (0.25, 0.75),
+                },
+            ],
+        };
+        let mut core = ServerCore::new(layout, Hotkeys::default());
+        assert!(
+            core.capture_edges().is_empty(),
+            "an edge with nobody behind it would stop the pointer for nothing"
+        );
+
+        core.client_connected("left", screen(1000, 500));
+        assert_eq!(core.capture_edges(), vec![(Side::Left, (0.25, 0.75))]);
+
+        core.client_connected("right", screen(1000, 500));
+        assert_eq!(
+            core.capture_edges(),
+            vec![(Side::Right, (0.0, 1.0)), (Side::Left, (0.25, 0.75))],
+            "order follows the layout, not the connection order"
+        );
+
+        core.client_disconnected("left");
+        assert_eq!(core.capture_edges(), vec![(Side::Right, (0.0, 1.0))]);
     }
 }
 

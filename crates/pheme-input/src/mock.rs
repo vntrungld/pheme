@@ -6,7 +6,7 @@ use crossbeam_channel::Sender;
 use pheme_core::CaptureEvent;
 use pheme_proto::{Button, KeyCode, ScreenInfo};
 
-use crate::{CaptureMode, Error, InputCapture, InputInject, Result};
+use crate::{CaptureEdge, CaptureMode, Error, InputCapture, InputInject, Result};
 
 #[derive(Default)]
 struct CaptureState {
@@ -18,6 +18,9 @@ struct CaptureState {
     fail_next_grab: bool,
     /// When set, the next `set_mode(Observe)` fails once (and clears this).
     fail_next_ungrab: bool,
+    /// Every `set_edges` call in order, not just the last, so a test can tell "set
+    /// once" from "set repeatedly".
+    edges: Vec<Vec<CaptureEdge>>,
 }
 
 impl CaptureState {
@@ -94,6 +97,11 @@ impl MockCaptureHandle {
     pub fn disconnect(&self) {
         self.state.lock().unwrap().tx = None;
     }
+
+    /// Every `set_edges` call in order.
+    pub fn edge_calls(&self) -> Vec<Vec<CaptureEdge>> {
+        self.state.lock().unwrap().edges.clone()
+    }
 }
 
 impl InputCapture for MockCapture {
@@ -133,6 +141,11 @@ impl InputCapture for MockCapture {
         let mode = self.set_mode(CaptureMode::Observe);
         let warp = self.warp_cursor(x, y);
         mode.and(warp)
+    }
+
+    fn set_edges(&mut self, edges: &[CaptureEdge]) -> Result<()> {
+        self.state.lock().unwrap().edges.push(edges.to_vec());
+        Ok(())
     }
 }
 

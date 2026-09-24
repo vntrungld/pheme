@@ -1,7 +1,7 @@
 //! Input capture (server side) and injection (client side) with per-OS backends.
 
 use crossbeam_channel::Sender;
-use pheme_core::CaptureEvent;
+use pheme_core::{CaptureEvent, Side};
 use pheme_proto::{Button, KeyCode, ScreenInfo};
 
 pub mod keymap;
@@ -22,6 +22,17 @@ pub enum CaptureMode {
     Observe,
     /// Swallow all input, hide and confine the cursor, report relative motion.
     Grab,
+}
+
+/// An edge on which a crossing should start a capture.
+///
+/// Named `CaptureEdge` rather than `Barrier` because the portal backend imports
+/// ashpd's `Barrier` in the same file.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CaptureEdge {
+    pub side: Side,
+    /// Fractions of the edge's length, as in `ClientPlacement::span`.
+    pub span: (f32, f32),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -71,6 +82,18 @@ pub trait InputCapture: Send {
     /// channel is full (never block). `stop()` must stop the backend thread and drop every
     /// clone of the `Sender` before returning, so the receiver observes disconnection.
     fn stop(&mut self);
+    /// Declares the edges on which a crossing should start a capture.
+    ///
+    /// Backends that detect crossings by watching the pointer (X11, Windows) learn
+    /// nothing from this and ignore it. The InputCapture portal cannot work without
+    /// it: the compositor watches the barriers, and an edge that was never declared
+    /// never produces an event.
+    ///
+    /// Called whenever the set of connected clients changes.
+    fn set_edges(&mut self, edges: &[CaptureEdge]) -> Result<()> {
+        let _ = edges;
+        Ok(())
+    }
 }
 
 pub trait InputInject: Send {

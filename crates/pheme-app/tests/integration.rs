@@ -620,3 +620,45 @@ async fn run_server_fails_when_the_capture_backend_dies() {
         .unwrap()
         .unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_capture_backend_learns_which_edges_have_clients() {
+    let Pair {
+        server,
+        client,
+        shutdown_tx,
+        cap,
+        inj: _,
+    } = spawn_pair();
+    wait_connected(&cap).await;
+
+    let calls = cap.edge_calls();
+    let last = calls
+        .last()
+        .expect("connecting a client must declare its edge");
+    assert_eq!(
+        last.len(),
+        1,
+        "exactly the connected client's edge, nothing else: {calls:?}"
+    );
+    assert_eq!(last[0].side, Side::Right);
+
+    // Tear down the client connection the same way other tests do: aborting the task
+    // drops its `Peer`, closing the QUIC connection without a clean Bye.
+    client.abort();
+    assert!(
+        wait_until(
+            || cap.edge_calls().last().is_some_and(|c| c.is_empty()),
+            Duration::from_secs(8)
+        )
+        .await,
+        "edges never cleared after the client vanished"
+    );
+
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
