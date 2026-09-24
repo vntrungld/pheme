@@ -29,6 +29,38 @@ Status: early development — see `docs/superpowers/specs/` for the design.
 
 `ScrollLock` toggles the input lock. `--stats` prints RTT and traffic counters.
 
+## Wayland capture (server)
+
+A Linux **server** running under a Wayland session uses the
+`org.freedesktop.portal.InputCapture` portal instead of X11's XInput2.
+This works on the compositors that implement the portal today —
+**KDE and GNOME**. Wayland is detected and preferred automatically
+over XWayland; an X11 session on the same machine still uses the
+X11 backend, unchanged.
+
+**Hyprland, Sway and other wlroots compositors do not implement the
+InputCapture portal**, so a machine running one of them cannot yet be
+a Wayland server; `pheme server` exits with an error naming the gap.
+Such a machine can still be used as a **client**: a Linux client
+injects input through `uinput`, a kernel interface that works
+identically under X11 and Wayland, and nothing about the client
+changed in this release.
+
+Starting a Wayland server brings up a **permission dialog** asking to
+allow input capture, and it may appear on **every start**: KDE
+returns no restore token even when the request asks to persist the
+grant, so whether the permission survives a restart is untested —
+expect the dialog again on each launch until you've confirmed
+otherwise on your own compositor.
+
+**On Wayland the lock hotkey binding belongs to the desktop, not to
+the configuration file.** Under X11 and Windows, `hotkeys.lock` in
+the config decides the key outright. Under Wayland it is only a
+*preferred trigger*, sent to the compositor through
+`org.freedesktop.portal.GlobalShortcuts`; the compositor may bind a
+different key instead. What actually got bound is logged at startup —
+check the log if the configured hotkey does not do anything.
+
 ## Audio
 
 Audio is always on. Whatever the **client** plays comes out of the **server's**
@@ -136,10 +168,14 @@ sudo dnf install pipewire-devel clang pkgconf
 - One client at a time: the server serves a single client connection; another
   client is not served until that one disconnects.
 - IPv4 only.
-- A Linux **server** needs an X11 session (input capture uses XInput2). A Linux
-  **client** works under X11 or Wayland (injection goes through uinput).
-- Wayland capture and macOS support come in later sub-projects; clipboard
-  forwarding is not implemented yet.
+- A Linux **server** works under X11, or under Wayland on compositors that
+  implement the InputCapture portal (KDE, GNOME) — see "Wayland capture
+  (server)" above. Hyprland, Sway and other wlroots compositors cannot yet
+  be a Wayland server, though they can still be a client. A Linux
+  **client** works under X11 or Wayland on any compositor (injection goes
+  through uinput).
+- macOS support comes in a later sub-project; clipboard forwarding is not
+  implemented yet.
 - A Windows client cannot receive the server's microphone: creating a recording
   device on Windows needs a signed kernel driver (VB-CABLE), which is deferred. A
   Windows server's microphone reaching a Linux client works normally.

@@ -125,3 +125,36 @@ the side receiving playback.
 Note that a level meter counts as a consumer. An open sound-settings input page, or
 `pavucontrol`, holds the server's microphone open — correct behaviour, surprising the
 first time. Close them before running M2 or M3.
+
+## Wayland capture (sub-project 4)
+
+Run with this machine as the Wayland server and the QEMU VM as the
+Windows client, and again Wayland → Linux.
+
+| # | Check | Result |
+|---|---|---|
+| W1 | Crossing the configured edge hands input to the client; crossing back returns it; repeat 20 times without a restart | |
+| W2 | Hold Shift across the edge — the client types uppercase | |
+| W3 | Compositor's own escape binding ends the capture: back to local, no key stuck on the client | |
+| W4 | Connect a second client on another edge mid-session — its barrier appears without restarting | |
+| W5 | Disconnect a client while it holds the input — the server recovers the pointer in under 5 s | |
+| W6 | The lock hotkey toggles the lock, and toggles it back | |
+| W7 | Edges with no connected client do **not** snag the pointer | |
+| W8 | Change the monitor layout mid-session (`ZonesChanged`) — barriers follow | |
+| W9 | Restart the server: does the permission dialog appear again? (§15) | |
+| W10 | Run the same build in an X11 session — unchanged behaviour | |
+| W11 | 100 keystrokes across the edge, no stuck key; input RTT under 1 ms over cable | |
+| W12 | During an **active** capture on Wayland, press the configured lock hotkey once. It must toggle the lock exactly once, not twice | |
+
+W9 is the open question the design records: KDE returned no restore token
+even when the session asked to persist the grant, so whether the
+permission survives a restart is untested.
+
+W12 exists because of a real open question, not a guess in the code: while
+a capture is active, the lock hotkey reaches the core through libei, and
+it may *also* reach the compositor's own GlobalShortcuts binding, which
+would toggle the lock twice for one keypress. Whether a compositor
+delivers a global shortcut while an application holds an InputCapture
+grab is compositor-defined and can only be settled by running it. A
+failure here shows up as the lock ending up back where it started (or an
+extra toggle) instead of flipping exactly once.
