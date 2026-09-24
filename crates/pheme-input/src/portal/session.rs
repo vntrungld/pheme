@@ -51,12 +51,28 @@ struct Session {
     activation: Option<u32>,
 }
 
-async fn establish(edges: &[CaptureEdge]) -> Result<(Session, ei::Context)> {
-    let portal = Portal::new().await.map_err(pe)?;
+/// Creates the session, starts it, fetches the zones and connects to libei —
+/// and stops there, declaring no barriers.
+///
+/// The specification is explicit that `ConnectToEIS` "must be invoked before
+/// `org.freedesktop.portal.InputCapture.Enable()`", and `set_barriers` is
+/// what calls `Enable`. Calling it from here, before `connect_to_eis`, would
+/// violate that ordering: the session could be armed and a barrier crossed
+/// before any libei device exists to carry the resulting input, so the
+/// crossing would switch to the client with nothing able to reach it. The
+/// specification also says the EIS connection this function opens is
+/// durable — "the same connection can be re-used until the session is
+/// closed" across `Disable`/`Enable` — so there is nothing to lose by
+/// opening it once, here, and leaving `set_barriers` for `run` (Task 8) to
+/// call after the libei handshake has bound the seat's capabilities.
+async fn establish() -> Result<(Session, ei::Context)> {
+    let portal = Portal::new()
+        .await
+        .map_err(|e| pe("connecting to the InputCapture portal", e))?;
     let session = portal
         .create_session2(CreateSession2Options::default())
         .await
-        .map_err(pe)?;
+        .map_err(|e| pe("CreateSession2", e))?;
 
     let start = portal
         .start(
@@ -67,9 +83,9 @@ async fn establish(edges: &[CaptureEdge]) -> Result<(Session, ei::Context)> {
                 .set_persist_mode(PersistMode::ExplicitlyRevoked),
         )
         .await
-        .map_err(pe)?
+        .map_err(|e| pe("Start", e))?
         .response()
-        .map_err(pe)?;
+        .map_err(|e| pe("Start", e))?;
 
     // Read what was GRANTED, not what was asked for. KDE advertises Touchscreen and
     // does not grant it; a backend that assumes the request was honoured would wait
@@ -94,23 +110,27 @@ async fn establish(edges: &[CaptureEdge]) -> Result<(Session, ei::Context)> {
         activation: None,
     };
     s.refresh_zones().await?;
-    s.set_barriers(edges).await?;
 
     let fd = s
         .portal
         .connect_to_eis(&s.session, ConnectToEISOptions::default())
         .await
-        .map_err(pe)?;
+        .map_err(|e| pe("ConnectToEIS", e))?;
     let stream = UnixStream::from(fd);
     stream
         .set_nonblocking(true)
-        .map_err(|e| Error::Backend(e.to_string()))?;
-    let ctx = ei::Context::new(stream).map_err(|e| Error::Backend(e.to_string()))?;
+        .map_err(|e| pe("making the EIS connection non-blocking", e))?;
+    let ctx = ei::Context::new(stream).map_err(|e| pe("ei::Context::new", e))?;
     Ok((s, ctx))
 }
 
-fn pe(e: impl std::fmt::Display) -> Error {
-    Error::Backend(format!("portal: {e}"))
+/// Wraps a D-Bus or libei failure with the name of the call that produced it.
+///
+/// `ashpd::Error`'s `Display` never names the method in flight, so without
+/// `call` a `CreateSession2` failure and a `ConnectToEIS` failure would
+/// produce identical text and the log would give no clue which step broke.
+fn pe(call: &'static str, e: impl std::fmt::Display) -> Error {
+    Error::Backend(format!("portal {call}: {e}"))
 }
 
 impl Session {
@@ -119,9 +139,9 @@ impl Session {
             .portal
             .zones(&self.session, GetZonesOptions::default())
             .await
-            .map_err(pe)?
+            .map_err(|e| pe("GetZones", e))?
             .response()
-            .map_err(pe)?;
+            .map_err(|e| pe("GetZones", e))?;
         self.zones = z
             .regions()
             .iter()
@@ -157,9 +177,9 @@ impl Session {
                 SetPointerBarriersOptions::default(),
             )
             .await
-            .map_err(pe)?
+            .map_err(|e| pe("SetPointerBarriers", e))?
             .response()
-            .map_err(pe)?;
+            .map_err(|e| pe("SetPointerBarriers", e))?;
 
         // A rejected barrier is reported ONLY here: the call succeeds, Enable
         // succeeds, and the session then never activates. Never swallow this.
@@ -186,13 +206,13 @@ impl Session {
             self.portal
                 .disable(&self.session, DisableOptions::default())
                 .await
-                .map_err(pe)?;
+                .map_err(|e| pe("Disable", e))?;
             return Ok(());
         }
         self.portal
             .enable(&self.session, EnableOptions::default())
             .await
-            .map_err(pe)
+            .map_err(|e| pe("Enable", e))
     }
 }
 
