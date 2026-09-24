@@ -17,6 +17,14 @@ use tracing::{error, info, warn};
 use crate::audio::{CaptureSource, InStats, OutCounters, PlaybackSource, RecvSide, SendSide};
 use crate::config::{config_dir, Config};
 
+/// How long shutdown waits for the router thread to notice that every `CaptureEvent`
+/// sender has been dropped.
+///
+/// Comfortably more than `PortalCapture::stop()`'s own 3 s bound, so a backend that
+/// shuts down slowly but correctly is still joined normally; a backend that detaches a
+/// thread still holding a sender is abandoned instead of hanging the process.
+const ROUTER_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub struct ServerDeps {
     pub name: String,
     pub capture: Box<dyn InputCapture>,
@@ -382,10 +390,24 @@ pub async fn run_server(
     endpoint.close();
     endpoint.wait_idle().await;
     drop(shared);
-    // Join on a blocking task: a backend that violates the stop() contract (event thread
-    // still running, sender clone still alive) would hang `router.join()` forever, and doing
-    // that directly here would stall a tokio worker instead of just this shutdown path.
-    let _ = tokio::task::spawn_blocking(move || router.join()).await;
+    // Join on a blocking task, and bound the wait: a backend that violates the stop()
+    // contract would hang `router.join()` forever, because the router sits in
+    // `ev_rx.recv()` until the last `Sender` clone is dropped. That is not hypothetical
+    // — `PortalCapture::stop()` gives up after 3 s and *detaches* its session thread,
+    // which still owns its `Sender`, so an unbounded join here would simply move the
+    // hang it avoided. Doing it on a blocking task keeps a tokio worker out of it
+    // either way.
+    let join = tokio::task::spawn_blocking(move || router.join());
+    if tokio::time::timeout(ROUTER_JOIN_TIMEOUT, join)
+        .await
+        .is_err()
+    {
+        warn!(
+            "the router thread did not exit within {ROUTER_JOIN_TIMEOUT:?}; the capture \
+             backend still holds an event sender. Abandoning the join rather than \
+             blocking shutdown on it"
+        );
+    }
     outcome
 }
 
