@@ -2049,8 +2049,13 @@ The modifier mask arrives separately, as a `KeyboardModifiers` libei event right
                     for k in held.flush() {
                         let _ = tx.try_send(CaptureEvent::Key { code: k, down: false });
                     }
-                    // The caller turns this into ServerCore::release_remote().
-                    let _ = tx.try_send(CaptureEvent::CaptureEnded);
+                    // The caller turns this into ServerCore::release_remote(). This is the
+                    // only signal that tells the core the compositor ended the capture, so a
+                    // silent drop leaves the core in Remote with input going nowhere and
+                    // nothing saying why. Blocking is forbidden; logging is not.
+                    if tx.try_send(CaptureEvent::CaptureEnded).is_err() {
+                        error!("dropped CaptureEnded; the core still believes it is capturing");
+                    }
                 }
             }
             Step::Portal(PortalEvent::Disabled) => {
