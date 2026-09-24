@@ -2,3 +2,4 @@
 //! and libei.
 
 pub mod geometry;
+pub mod translate;
