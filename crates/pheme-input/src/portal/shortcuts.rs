@@ -52,6 +52,10 @@ pub struct LockShortcut {
 ///    one — and is passed through untouched, so a user can write `CTRL+ALT+l` and get
 ///    precisely that.
 /// 2. A pheme key name whose keysym spelling differs is translated (the table below).
+///    The comparison ignores case, because `keymap::key_by_name` — which is what decides
+///    whether `hotkeys.lock` is valid configuration at all — lower-cases its input. Two
+///    functions disagreeing about case would make `lock = "scrolllock"` a valid setting
+///    that reaches the portal untranslated, as a name no keysym table has.
 /// 3. A single letter becomes its lower-case keysym (`A` → `a`).
 /// 4. Anything else is passed through: the names that are already identical in both
 ///    languages (`F1`, `Home`, `Escape`, the digits), and any keysym a user wrote by
@@ -116,7 +120,10 @@ pub fn portal_trigger(configured: &str) -> String {
     if configured.contains('+') {
         return configured.to_string();
     }
-    if let Some((_, keysym)) = RENAMED.iter().find(|(name, _)| *name == configured) {
+    if let Some((_, keysym)) = RENAMED
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(configured))
+    {
         return (*keysym).to_string();
     }
     let mut chars = configured.chars();
@@ -364,6 +371,16 @@ mod tests {
         assert_eq!(portal_trigger("PageUp"), "Page_Up");
         assert_eq!(portal_trigger("LeftGui"), "Super_L");
         assert_eq!(portal_trigger("KP5"), "KP_5");
+    }
+
+    #[test]
+    fn a_differently_cased_name_is_translated_like_the_canonical_spelling() {
+        // `keymap::key_by_name` lower-cases what it is given, so `lock = "scrolllock"`
+        // is valid configuration. A case-sensitive rename table would leave exactly
+        // that value untranslated and hand the portal a name no keysym table has.
+        assert_eq!(portal_trigger("scrolllock"), "Scroll_Lock");
+        assert_eq!(portal_trigger("PAGEUP"), "Page_Up");
+        assert_eq!(portal_trigger("leftGui"), "Super_L");
     }
 
     #[test]
