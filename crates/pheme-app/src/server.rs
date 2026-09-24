@@ -176,10 +176,10 @@ pub async fn run_server(
     if stats {
         let s = shared.clone();
         let astats = audio_stats.clone();
+        let mic_counters = mic_counters.clone();
         let mut stats_shutdown = shutdown.clone();
         tokio::spawn(async move {
             let mut last = (0u64, 0u64, 0u64);
-            let mut alast = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(1)) => {}
@@ -191,30 +191,28 @@ pub async fn run_server(
                     s.counters.datagrams_sent.load(Ordering::Relaxed),
                 );
                 let connected = s.link.lock().unwrap().is_some();
-                let anow = (
-                    astats.lost.load(Ordering::Relaxed),
-                    astats.underruns.load(Ordering::Relaxed),
-                    astats.late.load(Ordering::Relaxed),
-                    astats.resets.load(Ordering::Relaxed),
-                    astats.dropped.load(Ordering::Relaxed),
-                    astats.overflows.load(Ordering::Relaxed),
-                );
+                let a = astats.snapshot_delta();
+                let mic_sent = mic_counters.sent.swap(0, Ordering::Relaxed);
+                let mic_suppressed = mic_counters.suppressed.swap(0, Ordering::Relaxed);
+                let mic_open = s.mic.is_open();
                 info!(
                     events = now.0 - last.0,
                     control = now.1 - last.1,
                     datagrams = now.2 - last.2,
                     connected,
                     audio_depth_ms = astats.depth_ms.load(Ordering::Relaxed),
-                    audio_lost = anow.0 - alast.0,
-                    audio_underruns = anow.1 - alast.1,
-                    audio_late = anow.2 - alast.2,
-                    audio_resets = anow.3 - alast.3,
-                    audio_dropped = anow.4 - alast.4,
-                    audio_overflows = anow.5 - alast.5,
+                    audio_lost = a.lost,
+                    audio_underruns = a.underruns,
+                    audio_late = a.late,
+                    audio_resets = a.resets,
+                    audio_dropped = a.dropped,
+                    audio_overflows = a.overflows,
+                    mic_sent,
+                    mic_suppressed,
+                    mic_open,
                     "stats/s"
                 );
                 last = now;
-                alast = anow;
             }
         });
     }

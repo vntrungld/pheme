@@ -83,6 +83,53 @@ pub struct InStats {
     /// than zero means the playback device is consuming persistently slower than the
     /// sender produces, by more than the drift controller is allowed to correct.
     pub overflows: AtomicU64,
+    /// The values `snapshot_delta` saw last time, so the counters themselves can stay
+    /// cumulative and a caller that never asks for a delta still reads totals.
+    last: InLast,
+}
+
+/// One interval's worth of counters.
+#[derive(Default, Clone, Copy)]
+pub struct InDelta {
+    pub lost: u64,
+    pub late: u64,
+    pub underruns: u64,
+    pub resets: u64,
+    pub dropped: u64,
+    pub overflows: u64,
+}
+
+/// The values `snapshot_delta` saw last time, so the counters themselves can stay
+/// cumulative and a caller that never asks for a delta still reads totals.
+#[derive(Default)]
+struct InLast {
+    lost: AtomicU64,
+    late: AtomicU64,
+    underruns: AtomicU64,
+    resets: AtomicU64,
+    dropped: AtomicU64,
+    overflows: AtomicU64,
+}
+
+/// The change in one counter since the last call, and the new high-water mark.
+fn step(now: &AtomicU64, last: &AtomicU64) -> u64 {
+    let now = now.load(Ordering::Relaxed);
+    now - last.swap(now, Ordering::Relaxed)
+}
+
+impl InStats {
+    /// The change since the last call. Exactly one caller per `InStats`, because each
+    /// call consumes the interval it reports.
+    pub fn snapshot_delta(&self) -> InDelta {
+        InDelta {
+            lost: step(&self.lost, &self.last.lost),
+            late: step(&self.late, &self.last.late),
+            underruns: step(&self.underruns, &self.last.underruns),
+            resets: step(&self.resets, &self.last.resets),
+            dropped: step(&self.dropped, &self.last.dropped),
+            overflows: step(&self.overflows, &self.last.overflows),
+        }
+    }
 }
 
 /// Owns a playback backend and the worker that feeds it.
@@ -406,6 +453,21 @@ mod tests {
     use pheme_audio::FRAME_US;
     use std::time::Duration;
     use std::time::Instant;
+
+    #[test]
+    fn a_delta_reports_each_interval_once() {
+        let stats = InStats::default();
+        stats.lost.store(10, Ordering::Relaxed);
+        assert_eq!(stats.snapshot_delta().lost, 10);
+        assert_eq!(stats.snapshot_delta().lost, 0, "nothing new since");
+        stats.lost.store(13, Ordering::Relaxed);
+        assert_eq!(stats.snapshot_delta().lost, 3);
+        assert_eq!(
+            stats.lost.load(Ordering::Relaxed),
+            13,
+            "the counter itself stays cumulative"
+        );
+    }
 
     /// The tone's amplitude, measured robustly.
     ///

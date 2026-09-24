@@ -64,6 +64,11 @@ pub struct SendSide {
     peer: Arc<Mutex<Option<PeerSender>>>,
     stop: Arc<AtomicBool>,
     wanted: Arc<AtomicBool>,
+    /// True only while a backend is actually started. False both while the gate is shut
+    /// and while a wanted device has failed to open, which is what lets `is_open`
+    /// distinguish "closed because nothing is recording" from "closed because it
+    /// failed" from outside.
+    open: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -88,15 +93,20 @@ impl SendSide {
         let peer = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
         let wanted = Arc::new(AtomicBool::new(wanted));
+        // No backend has started yet, whatever the gate says: a store made here is not
+        // guaranteed to be seen before the worker thread's first read, so this can only
+        // ever be false at birth.
+        let open = Arc::new(AtomicBool::new(false));
         let thread = match source {
             CaptureSource::Disabled => None,
             src => {
                 let peer = peer.clone();
                 let stop = stop.clone();
                 let wanted = wanted.clone();
+                let open = open.clone();
                 match std::thread::Builder::new()
                     .name(stream.thread_name().into())
-                    .spawn(move || out_thread(src, stream, peer, stop, counters, wanted))
+                    .spawn(move || out_thread(src, stream, peer, stop, counters, wanted, open))
                 {
                     Ok(t) => Some(t),
                     Err(e) => {
@@ -110,6 +120,7 @@ impl SendSide {
             peer,
             stop,
             wanted,
+            open,
             thread,
         }
     }
@@ -127,6 +138,13 @@ impl SendSide {
     /// calls this on stays open, which is what the client's speaker capture wants.
     pub fn set_wanted(&self, wanted: bool) {
         self.wanted.store(wanted, Ordering::SeqCst);
+    }
+
+    /// Whether a capture backend is actually running right now. This is the demand gate
+    /// made visible from outside: it reads false both while the gate is shut and while a
+    /// wanted device has failed to open, so a caller cannot mistake one for the other.
+    pub fn is_open(&self) -> bool {
+        self.open.load(Ordering::Relaxed)
     }
 
     pub fn stop(&mut self) {
@@ -150,6 +168,7 @@ fn out_thread(
     stop: Arc<AtomicBool>,
     counters: Arc<OutCounters>,
     wanted: Arc<AtomicBool>,
+    open: Arc<AtomicBool>,
 ) {
     let (device, mut injected) = match source {
         CaptureSource::Detect(d) => (d, None),
@@ -162,6 +181,7 @@ fn out_thread(
             return;
         }
         if !wanted.load(Ordering::SeqCst) {
+            open.store(false, Ordering::SeqCst);
             if !nap(GATE_POLL, &stop) {
                 return;
             }
@@ -199,6 +219,7 @@ fn out_thread(
             rtrb::RingBuffer::<i16>::new(FRAME_INTERLEAVED * CAPTURE_RING_FRAMES);
         if let Err(e) = backend.start(producer) {
             failures.report(format!("{} failed to start: {e}", stream.subject()));
+            open.store(false, Ordering::SeqCst);
             if !nap(RETRY, &stop) {
                 return;
             }
@@ -206,8 +227,10 @@ fn out_thread(
         }
         failures.cleared();
         info!(device = %backend.device_name(), "audio capture started");
+        open.store(true, Ordering::SeqCst);
         let end = pump_out(backend, stream, consumer, &peer, &stop, &counters, &wanted);
         backend.stop();
+        open.store(false, Ordering::SeqCst);
         match end {
             PumpEnd::Stopped => return,
             // The gate closed. Go straight back to the top: reopening must be prompt,
@@ -399,6 +422,33 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         assert!(!handle.started());
         out.stop(); // must not hang
+    }
+
+    #[test]
+    fn is_open_reflects_the_device_not_the_gates_intent() {
+        // A gate that is open while the device is failing to start must not read as
+        // open: `mic_open` in the stats line exists to tell "closed because nothing is
+        // recording" apart from "closed because it failed", and a flag that just echoed
+        // the gate would collapse that distinction.
+        let (cap, handle) = MockCapture::new();
+        handle.fail_next_start();
+        let counters = Arc::new(OutCounters::default());
+        let mut audio = SendSide::spawn(
+            CaptureSource::Backend(Box::new(cap)),
+            AudioStream::Mic,
+            counters,
+            true,
+        );
+        assert!(!audio.is_open(), "the gate is open but the device is not");
+        assert!(
+            wait_until(|| handle.started(), SETTLE),
+            "the retry cycle must bring the microphone up"
+        );
+        assert!(wait_until(|| audio.is_open(), SETTLE));
+
+        audio.set_wanted(false);
+        assert!(wait_until(|| !audio.is_open(), SETTLE));
+        audio.stop();
     }
 
     #[test]

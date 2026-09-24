@@ -64,6 +64,7 @@ struct SessionAudio<'a> {
     audio: &'a SendSide,
     counters: &'a OutCounters,
     mic: &'a RecvSide,
+    mic_stats: &'a InStats,
 }
 
 fn apply(inject: &mut dyn InputInject, a: InjectAction) {
@@ -155,6 +156,7 @@ pub async fn run_client(
                         audio: &audio,
                         counters: &counters,
                         mic: &mic,
+                        mic_stats: &mic_stats,
                     },
                     &mut shutdown,
                 )
@@ -198,6 +200,7 @@ async fn session(
         audio,
         counters,
         mic,
+        mic_stats,
     } = audio;
     let screens = inject.screens();
     let mut rx = peer.take_incoming();
@@ -253,11 +256,11 @@ async fn session(
 
     let mut core = ClientCore::new(screens);
     let mut ping = tokio::time::interval(Duration::from_secs(1));
+    let mut stats_tick = tokio::time::interval(Duration::from_secs(1));
     let mut ping_seq = 0u64;
     let mut received = 0u64;
     let mut lost = 0u64;
     let mut last_seq: Option<u32> = None;
-    let mut last_stats = Instant::now();
     let result = loop {
         tokio::select! {
             biased;
@@ -307,22 +310,29 @@ async fn session(
             _ = ping.tick() => {
                 ping_seq += 1;
                 let _ = sender.send_control(&Msg::Ping(ping_seq)).await;
-                if stats && last_stats.elapsed() >= Duration::from_secs(1) {
-                    let sent = counters.sent.swap(0, Ordering::Relaxed);
-                    let suppressed = counters.suppressed.swap(0, Ordering::Relaxed);
-                    info!(
-                        rtt_us = peer.rtt().as_micros(),
-                        received,
-                        lost,
-                        audio_sent = sent,
-                        audio_suppressed = suppressed,
-                        active = core.active(),
-                        "stats/s"
-                    );
-                    received = 0;
-                    lost = 0;
-                    last_stats = Instant::now();
-                }
+            }
+            _ = stats_tick.tick(), if stats => {
+                let sent = counters.sent.swap(0, Ordering::Relaxed);
+                let suppressed = counters.suppressed.swap(0, Ordering::Relaxed);
+                let m = mic_stats.snapshot_delta();
+                info!(
+                    rtt_us = peer.rtt().as_micros(),
+                    received,
+                    lost,
+                    audio_sent = sent,
+                    audio_suppressed = suppressed,
+                    mic_depth_ms = mic_stats.depth_ms.load(Ordering::Relaxed),
+                    mic_lost = m.lost,
+                    mic_underruns = m.underruns,
+                    mic_late = m.late,
+                    mic_resets = m.resets,
+                    mic_dropped = m.dropped,
+                    mic_overflows = m.overflows,
+                    active = core.active(),
+                    "stats/s"
+                );
+                received = 0;
+                lost = 0;
             }
         }
     };
