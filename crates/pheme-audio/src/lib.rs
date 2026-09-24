@@ -184,23 +184,16 @@ pub fn detect_playback(device: Option<&str>) -> Result<Box<dyn AudioPlayback>> {
 
 /// Picks the client's virtual-microphone backend for this OS.
 ///
-/// `device` is accepted for symmetry with the other detectors and is unused on Linux,
-/// where we create the node rather than choosing one.
-pub fn detect_virtual_mic(device: Option<&str>) -> Result<Box<dyn AudioPlayback>> {
+/// `device` is accepted for symmetry with the other detectors and is never used: on
+/// Linux we create the node rather than choosing one, and no other platform has a
+/// virtual microphone at all. There is no config key that could set it.
+pub fn detect_virtual_mic(_device: Option<&str>) -> Result<Box<dyn AudioPlayback>> {
     #[cfg(target_os = "linux")]
     {
-        if let Some(d) = device {
-            tracing::warn!(
-                device = d,
-                "audio.virtual_mic_device is ignored on Linux; applications select \
-                 \"Pheme Mic\" instead"
-            );
-        }
         Ok(Box::new(linux_pipewire::PipewireVirtualSource::new()))
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = device;
         // Windows has no user-mode API that creates an audio endpoint, so a virtual
         // microphone there needs a signed kernel driver (VB-CABLE). Deferred; see §13 of
         // the sub-project 3 spec. Returning `Unsupported` is what makes a client without
