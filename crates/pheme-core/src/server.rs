@@ -3,7 +3,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use pheme_proto::{Button, KeyCode, Modifiers, Msg, ScreenInfo};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::geometry::{
     edge_segment, on_edge, project_entry, project_exit, EdgeSegment, Rect, Side,
@@ -116,6 +116,10 @@ pub struct ServerCore {
     held: BTreeSet<KeyCode>,
     pub(crate) locked: bool,
     seq: u32,
+    /// How many activations in a row the core has declined (see
+    /// `on_capture_activated`). Reset by the next activation it accepts. Only the
+    /// reporting of a declined activation depends on it; nothing else reads it.
+    declined_activations: u32,
 }
 
 impl ServerCore {
@@ -131,6 +135,7 @@ impl ServerCore {
             held: BTreeSet::new(),
             locked: false,
             seq: 0,
+            declined_activations: 0,
         }
     }
 
@@ -283,6 +288,7 @@ impl ServerCore {
         }
         let actions = self.on_local_event(CaptureEvent::MotionAbs { x, y });
         if actions.iter().any(|a| matches!(a, Action::Grab)) {
+            self.declined_activations = 0;
             return actions;
         }
         let (rx, ry) = self.just_inside(x, y);
@@ -291,7 +297,38 @@ impl ServerCore {
         // slide along it, so one declined activation would decline the next one too.
         // The pointer is about to be put at (rx, ry); that is where it is.
         self.last_pos = Some((rx, ry));
-        debug!(x, y, rx, ry, "activation declined; releasing the capture");
+        // A declined activation is abnormal: the compositor captured the pointer and
+        // this core had nothing to do with it. At `debug!` — below the default filter
+        // — the one failure mode nobody has been able to rule out, a compositor that
+        // re-tests the barrier at release and so activates again immediately, would
+        // show a snagging pointer and an empty log. So it is a `warn!`.
+        //
+        // That same failure mode is a tight loop, which must not flood a log the user
+        // may be leaving open for hours, so only the 1st, 2nd, 4th, 8th ... in a run
+        // are reported, each carrying the running count: a loop announces itself at
+        // once, keeps announcing itself, and costs a logarithmic number of lines. The
+        // ones in between stay at `debug!`, so `-v` still shows every single release.
+        // The count is a plain counter rather than a clock because this crate does not
+        // call the OS, and it resets on the next activation the core accepts.
+        self.declined_activations = self.declined_activations.saturating_add(1);
+        let declined = self.declined_activations;
+        if declined.is_power_of_two() {
+            warn!(
+                x,
+                y,
+                rx,
+                ry,
+                declined,
+                "the compositor started a capture this server will not use; releasing \
+                 it. A run of these means the pointer is snagging on a barrier that \
+                 leads nowhere"
+            );
+        } else {
+            debug!(
+                x,
+                y, rx, ry, declined, "activation declined; releasing the capture"
+            );
+        }
         vec![Action::Ungrab { x: rx, y: ry }]
     }
 
@@ -945,6 +982,31 @@ mod tests {
         let mut c = ServerCore::new(layout, Hotkeys::default());
         let a = c.on_event(CaptureEvent::CaptureActivated { x: 1919, y: 540 });
         assert!(ungrab_of(&a).is_some(), "{a:?}");
+    }
+
+    #[test]
+    fn a_run_of_declined_activations_is_counted_and_an_accepted_one_clears_it() {
+        // The count is what keeps the `warn!` for a declined activation from flooding
+        // while still reporting the first one: a run is announced at 1, 2, 4, 8 ...
+        // A count that never reset would make a single decline hours ago silence the
+        // report of a fresh one; a count that never grew would flood.
+        let mut c = core(Side::Right, (0.0, 1.0));
+        c.locked = true;
+        for n in 1..=5 {
+            let a = c.on_event(CaptureEvent::CaptureActivated { x: 1919, y: 540 });
+            assert!(ungrab_of(&a).is_some(), "{a:?}");
+            assert_eq!(c.declined_activations, n, "a run of declines must count up");
+        }
+        c.locked = false;
+        let a = c.on_event(CaptureEvent::CaptureActivated { x: 1919, y: 540 });
+        assert!(
+            has_enter(&a).is_some(),
+            "the activation must be accepted: {a:?}"
+        );
+        assert_eq!(
+            c.declined_activations, 0,
+            "an accepted activation ends the run, so the next decline is reported"
+        );
     }
 
     #[test]
