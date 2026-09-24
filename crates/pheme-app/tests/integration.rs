@@ -5,7 +5,7 @@ use pheme_app::server::{run_server, ServerDeps};
 use pheme_core::{CaptureEvent, ClientPlacement, Hotkeys, Side};
 use pheme_input::mock::{InjectCall, MockCapture, MockCaptureHandle, MockInject, MockInjectLog};
 use pheme_input::CaptureMode;
-use pheme_net::{Endpoint, Identity, TrustStore};
+use pheme_net::{Endpoint, Identity, SharedTrust, TrustStore};
 use pheme_proto::{KeyCode, ScreenInfo};
 use tokio::sync::watch;
 
@@ -28,6 +28,31 @@ async fn wait_until(mut f: impl FnMut() -> bool, timeout: Duration) -> bool {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     f()
+}
+
+/// Binds a server endpoint to `addr`, retrying until the socket is free.
+///
+/// Awaiting the previous server's task is not the same as the operating system having
+/// released its socket: quinn's endpoint driver can hold it for a moment after
+/// `run_server` returns, and a rebind that loses that race fails with `AddrInUse`. The
+/// test is asserting that a client reconnects to a restarted server, not that sockets are
+/// released instantly, so waiting for the port is part of restarting the server.
+async fn bind_server_retrying(
+    addr: std::net::SocketAddr,
+    id: &Identity,
+    trust: SharedTrust,
+) -> Endpoint {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match Endpoint::server(addr, id, trust.clone()) {
+            Ok(ep) => return ep,
+            Err(e) if Instant::now() < deadline => {
+                let _ = e;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(e) => panic!("could not rebind {addr} within 10 s: {e}"),
+        }
+    }
 }
 
 /// A paired server + client on loopback with mock backends, both already spawned.
@@ -351,7 +376,7 @@ async fn client_reconnects_after_server_restart() {
     server1.await.unwrap().unwrap();
 
     // Restart the server on the same port; the client must come back on its own.
-    let server_ep2 = Endpoint::server(server_addr, &sid, strust).unwrap();
+    let server_ep2 = bind_server_retrying(server_addr, &sid, strust).await;
     let (stop2_tx, stop2_rx) = watch::channel(false);
     let (server2, handle2) = run_once(server_ep2, stop2_rx);
     assert!(wait_until(|| handle2.is_started(), Duration::from_secs(5)).await);

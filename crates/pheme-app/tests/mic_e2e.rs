@@ -39,6 +39,27 @@ async fn wait_until(mut f: impl FnMut() -> bool, timeout: Duration) -> bool {
     f()
 }
 
+/// Binds a server endpoint to `addr`, retrying until the socket is free.
+///
+/// Awaiting the previous server's task is not the same as the operating system having
+/// released its socket: quinn's endpoint driver can hold it for a moment after
+/// `run_server` returns, and a rebind that loses that race fails with `AddrInUse`. The
+/// test is asserting that a client reconnects to a restarted server, not that sockets are
+/// released instantly, so waiting for the port is part of restarting the server.
+async fn bind_server_retrying(addr: SocketAddr, id: &Identity, trust: SharedTrust) -> Endpoint {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match Endpoint::server(addr, id, trust.clone()) {
+            Ok(ep) => return ep,
+            Err(e) if Instant::now() < deadline => {
+                let _ = e;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(e) => panic!("could not rebind {addr} within 10 s: {e}"),
+        }
+    }
+}
+
 fn sine_frame(i: usize) -> Vec<i16> {
     let mut out = Vec::with_capacity(FRAME_INTERLEAVED);
     for n in 0..pheme_audio::FRAME_SAMPLES {
@@ -120,12 +141,12 @@ impl MicPair {
             .unwrap()
             .unwrap();
 
-        let server_ep = Endpoint::server(
+        let server_ep = bind_server_retrying(
             self.server_addr,
             &self.server_identity,
             self.server_trust.clone(),
         )
-        .unwrap();
+        .await;
         let (input_capture, _input_cap) = MockInputCapture::new(screens(1920, 1080));
         let (mic_backend, mic) = MockCapture::new();
         let (server, kill) = spawn_server_instance(
