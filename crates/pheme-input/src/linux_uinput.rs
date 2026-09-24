@@ -12,11 +12,11 @@ use tracing::{info, warn};
 use crate::keymap::{hid_to_evdev, table::TABLE};
 use crate::{Error, InputInject, Result};
 
-const BTN_LEFT: u16 = 0x110;
-const BTN_RIGHT: u16 = 0x111;
-const BTN_MIDDLE: u16 = 0x112;
-const BTN_SIDE: u16 = 0x113;
-const BTN_EXTRA: u16 = 0x114;
+pub(crate) const BTN_LEFT: u16 = 0x110;
+pub(crate) const BTN_RIGHT: u16 = 0x111;
+pub(crate) const BTN_MIDDLE: u16 = 0x112;
+pub(crate) const BTN_SIDE: u16 = 0x113;
+pub(crate) const BTN_EXTRA: u16 = 0x114;
 
 pub struct UinputInject {
     dev: VirtualDevice,
@@ -109,7 +109,7 @@ impl UinputInject {
     }
 }
 
-fn button_code(b: Button) -> u16 {
+pub(crate) fn button_code(b: Button) -> u16 {
     match b {
         Button::Left => BTN_LEFT,
         Button::Right => BTN_RIGHT,

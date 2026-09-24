@@ -1,7 +1,12 @@
 //! Translating portal and libei events into `CaptureEvent`.
 
+use std::collections::BTreeSet;
+
 use pheme_core::Rect;
-use pheme_proto::KeyCode;
+use pheme_proto::{Button, KeyCode};
+
+use crate::keymap;
+use crate::linux_uinput::{BTN_EXTRA, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN_SIDE};
 
 /// Brings an `Activated` cursor position inside `rect`.
 ///
@@ -47,6 +52,83 @@ pub fn modifier_keys(depressed: u32) -> Vec<KeyCode> {
         }
     }
     out
+}
+
+/// libei key codes are **raw evdev**, unlike X11's, which offset evdev by 8.
+///
+/// Measured twice: 42 while Shift was held (`KEY_LEFTSHIFT`) and 30 for the letter A
+/// (`KEY_A`). Under the X11 convention those would decode as `KEY_G` and `KEY_Y`. The
+/// libei keyboard device does carry an XKB keymap, so borrowing the X11 path's
+/// `- 8` looks reasonable and shifts every key by eight positions.
+pub fn key_from_evdev(code: u32) -> Option<KeyCode> {
+    keymap::evdev_to_hid(u16::try_from(code).ok()?)
+}
+
+/// The inverse of `linux_uinput::button_code`, which owns this mapping.
+pub fn button_from_evdev(code: u32) -> Option<Button> {
+    Some(match u16::try_from(code).ok()? {
+        BTN_LEFT => Button::Left,
+        BTN_RIGHT => Button::Right,
+        BTN_MIDDLE => Button::Middle,
+        BTN_SIDE => Button::Back,
+        BTN_EXTRA => Button::Forward,
+        _ => return None,
+    })
+}
+
+/// libei's discrete scroll is already in the 120-per-notch unit `CaptureEvent::Wheel`
+/// uses, and that the X11 backend emits.
+pub fn wheel_from_discrete(dx: i32, dy: i32) -> (i32, i32) {
+    (dx, dy)
+}
+
+/// Accumulates libei's `f32` relative motion into whole pixels.
+///
+/// Truncating each event independently loses slow movement entirely: a steady
+/// 0.4 px per event would never move the pointer at all.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Motion {
+    rem_x: f32,
+    rem_y: f32,
+}
+
+impl Motion {
+    /// Returns the whole pixels to emit, carrying the remainder into the next call.
+    pub fn push(&mut self, dx: f32, dy: f32) -> (i32, i32) {
+        let x = self.rem_x + dx;
+        let y = self.rem_y + dy;
+        let (ix, iy) = (x.trunc(), y.trunc());
+        self.rem_x = x - ix;
+        self.rem_y = y - iy;
+        (ix as i32, iy as i32)
+    }
+}
+
+/// Tracks which keys this backend has seen pressed and not released.
+///
+/// A Wayland server sees the keyboard only while capturing. Hold Shift, cross the
+/// edge, come back, then release Shift: the key-up goes to the compositor and never
+/// reaches this backend, so `ServerCore`'s `held` set keeps Shift forever and every
+/// later `Enter` reports a modifier nobody is pressing. `flush` is what prevents it.
+#[derive(Debug, Default)]
+pub struct HeldKeys(BTreeSet<u16>);
+
+impl HeldKeys {
+    pub fn saw(&mut self, code: KeyCode, down: bool) {
+        if down {
+            self.0.insert(code.0);
+        } else {
+            self.0.remove(&code.0);
+        }
+    }
+
+    /// The keys still held, clearing the set. Emit a key-up for each.
+    pub fn flush(&mut self) -> Vec<KeyCode> {
+        std::mem::take(&mut self.0)
+            .into_iter()
+            .map(KeyCode)
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -144,5 +226,123 @@ mod tests {
         use pheme_proto::Modifiers;
         let m = Modifiers::from_held(modifier_keys(0x01 | 0x08));
         assert_eq!(m, Modifiers(Modifiers::SHIFT | Modifiers::ALT));
+    }
+
+    #[test]
+    fn key_codes_are_evdev_and_are_not_shifted_by_eight() {
+        // Measured: 42 while Shift was held, 30 for the letter A. Under the X11
+        // convention these would be KEY_G and KEY_Y.
+        assert_eq!(key_from_evdev(42), Some(KeyCode::LEFT_SHIFT));
+        assert_eq!(key_from_evdev(30), crate::keymap::evdev_to_hid(30));
+        assert_ne!(
+            key_from_evdev(30),
+            crate::keymap::evdev_to_hid(30 - 8),
+            "subtracting 8 is the X11 convention and is wrong here"
+        );
+    }
+
+    #[test]
+    fn an_unknown_key_code_is_dropped_rather_than_guessed() {
+        assert_eq!(key_from_evdev(0xFFFF), None);
+    }
+
+    #[test]
+    fn button_codes_round_trip_against_the_uinput_mapping() {
+        use pheme_proto::Button;
+        for b in [
+            Button::Left,
+            Button::Right,
+            Button::Middle,
+            Button::Back,
+            Button::Forward,
+        ] {
+            let code = crate::linux_uinput::button_code(b);
+            assert_eq!(
+                button_from_evdev(code as u32),
+                Some(b),
+                "{b:?} does not survive the round trip"
+            );
+        }
+        // The measured value, named explicitly so the round trip cannot pass by
+        // agreeing with itself on a wrong constant.
+        assert_eq!(button_from_evdev(272), Some(Button::Left));
+    }
+
+    #[test]
+    fn an_unknown_button_is_dropped() {
+        assert_eq!(button_from_evdev(999), None);
+    }
+
+    #[test]
+    fn one_scroll_notch_is_one_hundred_and_twenty() {
+        assert_eq!(wheel_from_discrete(0, 120), (0, 120));
+        assert_eq!(wheel_from_discrete(0, -120), (0, -120));
+        assert_eq!(wheel_from_discrete(-120, 0), (-120, 0));
+    }
+
+    #[test]
+    fn slow_motion_is_accumulated_rather_than_truncated_away() {
+        let mut m = Motion::default();
+        let mut total = 0;
+        for _ in 0..8 {
+            let (dx, _) = m.push(0.4, 0.0);
+            total += dx;
+        }
+        assert_eq!(total, 3, "0.4 x 8 is 3.2 px; truncating each event gives 0");
+    }
+
+    #[test]
+    fn the_remainder_does_not_drift_over_a_long_run() {
+        let mut m = Motion::default();
+        let mut total = 0;
+        for _ in 0..1000 {
+            let (dx, _) = m.push(1.5, 0.0);
+            total += dx;
+        }
+        assert_eq!(total, 1500);
+    }
+
+    #[test]
+    fn negative_motion_accumulates_symmetrically() {
+        let mut m = Motion::default();
+        let mut total = 0;
+        for _ in 0..8 {
+            let (dx, _) = m.push(-0.4, 0.0);
+            total += dx;
+        }
+        assert_eq!(total, -3);
+    }
+
+    #[test]
+    fn held_keys_are_released_when_capture_ends() {
+        let mut h = HeldKeys::default();
+        h.saw(KeyCode::LEFT_SHIFT, true);
+        h.saw(KeyCode(0x04), true); // the letter A
+        h.saw(KeyCode(0x04), false);
+        assert_eq!(h.flush(), vec![KeyCode::LEFT_SHIFT]);
+    }
+
+    #[test]
+    fn flushing_twice_releases_nothing_the_second_time() {
+        let mut h = HeldKeys::default();
+        h.saw(KeyCode::LEFT_SHIFT, true);
+        assert_eq!(h.flush().len(), 1);
+        assert!(
+            h.flush().is_empty(),
+            "a second flush would send a key-up for a key nobody is holding"
+        );
+    }
+
+    #[test]
+    fn a_key_held_across_a_release_does_not_leak_into_the_next_capture() {
+        // Hold Shift, cross, come back, release Shift while local. The key-up goes to
+        // the compositor and this backend never sees it, so without the flush `held`
+        // in ServerCore would keep Shift forever and every later Enter would be wrong.
+        let mut h = HeldKeys::default();
+        for k in modifier_keys(0x1) {
+            h.saw(k, true);
+        }
+        assert_eq!(h.flush(), vec![KeyCode::LEFT_SHIFT]);
+        assert!(h.flush().is_empty());
     }
 }
