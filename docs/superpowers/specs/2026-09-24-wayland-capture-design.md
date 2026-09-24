@@ -373,6 +373,19 @@ exists. `BindShortcuts` is called with the configured hotkey as
 `preferred_trigger`; the compositor shows the user a dialog and owns the
 final binding. `Activated` on that portal toggles the lock.
 
+`preferred_trigger` is written in the **XDG shortcuts specification's**
+syntax — an XKB keysym name with `CTRL+`, `SHIFT+`, `ALT+` and `SUPER+`
+prefixes — not in pheme's key-table names. The default `hotkeys.lock`
+value, `"ScrollLock"`, is a pheme name; the keysym is `Scroll_Lock`, and
+sent verbatim the request names no key at all. `hotkeys.lock` is
+therefore translated from pheme's names to keysyms before it is sent, and
+a value containing `+` is passed through untouched so a full trigger can
+be written by hand. The portal's returned array "includes the set of all
+shortcuts and the empty set", so a bind that bound nothing still
+succeeds: the absence of the lock shortcut in the response must be logged
+as a warning naming the requested trigger, or the user has no way to
+learn the hotkey is dead.
+
 This is a real behavioural difference from X11 and Windows, where the
 configuration file decides the key outright. The README must say so: on
 Wayland, `hotkeys.lock` is a *request*, and the binding that ends up in

@@ -33,10 +33,12 @@ pub struct ServerDeps {
     pub hotkeys: Hotkeys,
     /// The raw `hotkeys.lock` string from the configuration, before `Config::hotkeys()`
     /// converts it to a `KeyCode`. Used only on Wayland, to bind the lock hotkey
-    /// through the GlobalShortcuts portal as a `preferred_trigger` -- the portal wants
-    /// the trigger syntax, not a `KeyCode`, and the compositor may bind something else
-    /// entirely. `None` when no lock hotkey is configured, or on X11/Windows where the
-    /// existing key-watching path already reaches `ServerCore::toggle_lock()`.
+    /// through the GlobalShortcuts portal -- the portal wants a trigger, not a
+    /// `KeyCode`, and in its own syntax rather than pheme's key-table names, which
+    /// `portal::shortcuts::portal_trigger` translates. The compositor may still bind
+    /// something else entirely. `None` when no lock hotkey is configured, or on
+    /// X11/Windows where the existing key-watching path already reaches
+    /// `ServerCore::toggle_lock()`.
     pub lock_hotkey_trigger: Option<String>,
     pub stats: bool,
     /// Where audio received from the client is played.
@@ -165,7 +167,7 @@ impl Shared {
 /// it unbinds the shortcut and stops its thread.
 #[cfg(target_os = "linux")]
 fn bind_lock_shortcut(
-    trigger: Option<String>,
+    configured: Option<String>,
     shared: &Arc<Shared>,
 ) -> Option<pheme_input::portal::shortcuts::LockShortcut> {
     if !pheme_input::is_wayland_session() {
@@ -173,9 +175,11 @@ fn bind_lock_shortcut(
         // `on_event`; binding the portal shortcut too would double-toggle.
         return None;
     }
-    let trigger = trigger?;
+    let configured = configured?;
     let (toggle_tx, toggle_rx) = crossbeam_channel::bounded(4);
-    let shortcut = pheme_input::portal::shortcuts::LockShortcut::bind(trigger, toggle_tx);
+    // The raw configuration value: `bind` translates it into the portal's trigger
+    // syntax, because the two name their keys differently.
+    let shortcut = pheme_input::portal::shortcuts::LockShortcut::bind(configured, toggle_tx);
     let toggle_shared = shared.clone();
     if let Err(e) = std::thread::Builder::new()
         .name("pheme-lock-toggle".into())
@@ -197,7 +201,7 @@ fn bind_lock_shortcut(
 /// Wayland, and therefore the GlobalShortcuts portal, exists only on Linux. The
 /// key-watching path already handles the lock hotkey on every other platform.
 #[cfg(not(target_os = "linux"))]
-fn bind_lock_shortcut(_trigger: Option<String>, _shared: &Arc<Shared>) -> Option<()> {
+fn bind_lock_shortcut(_configured: Option<String>, _shared: &Arc<Shared>) -> Option<()> {
     None
 }
 

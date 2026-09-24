@@ -155,13 +155,38 @@ impl Config {
         toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
     }
 
+    /// The hotkeys as key codes.
+    ///
+    /// `hotkeys.lock` is a name from pheme's key table. A value containing `+` is
+    /// instead a shortcut *trigger* in the syntax
+    /// `org.freedesktop.portal.GlobalShortcuts` uses — `"CTRL+ALT+l"` — which names no
+    /// single key and so produces no `KeyCode`. That is only meaningful on a Wayland
+    /// server, where the lock hotkey is bound through that portal rather than by
+    /// watching the keyboard; anywhere else it leaves the machine with no lock hotkey
+    /// at all, which is an error rather than a silent loss.
     pub fn hotkeys(&self) -> anyhow::Result<Hotkeys> {
         let lock = match self.hotkeys.lock.as_deref() {
             None | Some("") => None,
-            Some(name) => Some(
-                key_by_name(name)
-                    .ok_or_else(|| anyhow!("unknown key name for hotkeys.lock: {name:?}"))?,
-            ),
+            Some(name) => match key_by_name(name) {
+                Some(code) => Some(code),
+                None if name.contains('+') && pheme_input::is_wayland_session() => {
+                    tracing::info!(
+                        trigger = %name,
+                        "hotkeys.lock is a portal shortcut trigger, not a key name: it is \
+                         sent to the GlobalShortcuts portal as written, and no key is \
+                         watched for it"
+                    );
+                    None
+                }
+                None if name.contains('+') => {
+                    bail!(
+                        "hotkeys.lock: {name:?} is a portal shortcut trigger, which only a \
+                         Wayland server can use. Name a single key from pheme's key table \
+                         instead (for example \"ScrollLock\")"
+                    )
+                }
+                None => bail!("unknown key name for hotkeys.lock: {name:?}"),
+            },
         };
         Ok(Hotkeys { lock })
     }
@@ -291,6 +316,27 @@ side = "top"
             toml::from_str("[[clients]]\nname = \"x\"\nside = \"left\"\nspan = [0.0, 0.5]")
                 .unwrap();
         assert_eq!(c.placements().unwrap()[0].span, (0.0, 0.5));
+    }
+
+    #[test]
+    fn a_portal_trigger_is_not_a_key_name() {
+        // Only a Wayland server can use one, and this test binary is not guaranteed to
+        // be running in a Wayland session -- so assert the half that holds either way:
+        // it never becomes a KeyCode, and off Wayland it is refused outright.
+        let c: Config = toml::from_str("[hotkeys]\nlock = \"CTRL+ALT+l\"").unwrap();
+        match c.hotkeys() {
+            Ok(h) => {
+                assert!(pheme_input::is_wayland_session());
+                assert_eq!(h.lock, None, "a trigger names no single key");
+            }
+            Err(e) => {
+                assert!(!pheme_input::is_wayland_session());
+                assert!(
+                    e.to_string().contains("only a Wayland server can use"),
+                    "unhelpful error: {e}"
+                );
+            }
+        }
     }
 
     #[test]
