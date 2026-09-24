@@ -187,7 +187,9 @@ fn set_edges(&mut self, edges: &[CaptureEdge]) -> Result<()> { let _ = edges; Ok
 
 `pheme-app`'s server calls it whenever the set of connected clients
 changes, with one `CaptureEdge` per placement that currently has a
-connected client. Barriers are **not** declared for edges without a connected
+connected client — and whenever the lock changes, because locking
+removes the barriers (§7): while locked the set is empty, and unlocking
+puts it back. Barriers are **not** declared for edges without a connected
 client: the compositor would stop the pointer at those edges, and the
 core would then decline the switch, so the pointer would snag on every
 screen edge for no reason.
@@ -261,19 +263,41 @@ Activated { barrier_id, cursor_position, activation_id }
   (x, y) = clamp(cursor_position, server_rect) // §3.2 — required, not defensive
   for each modifier in depressed mask:
       emit CaptureEvent::Key { code, down: true }
-  emit CaptureEvent::MotionAbs { x, y }
+  emit CaptureEvent::CaptureActivated { x, y }
 ```
 
-The synthesized `MotionAbs` puts the core on its ordinary
-`on_local_event` path. `last_pos` is never on an edge when this happens
-— the backend feeds no motion while local, so `last_pos` holds either
-nothing or the interior position of the previous return — so the
-slide-along-the-edge rule is satisfied rather than bypassed.
+`CaptureActivated` is a portal-only event and it is deliberately not a
+`MotionAbs`. It puts the core on its ordinary `on_local_event` path, but
+it also **requires an answer**: `ServerCore::on_event` returns either the
+switch (`Grab`, `WarpCursor`, `Enter`) or, when the local path produced
+no `Grab`, an `Action::Ungrab { x, y }` that releases the capture.
 
-The core answers with `Grab`, `WarpCursor` and `Enter`. For this backend
-`set_mode(Grab)` is an acknowledgement with nothing to do — the
-compositor is already capturing — and `warp_cursor` is a no-op, because
-a captured pointer is hidden and parked by the compositor.
+Silence is not an available answer, and this is the correction to the
+first draft of this section, which assumed it was. Under X11 and Windows
+a declined `MotionAbs` costs nothing, because the backend was only
+watching. Under the portal the compositor is *already capturing* by the
+time the event arrives: the core sitting in `Local` discards `MotionRel`,
+`Key`, `Button` and `Wheel`, the pointer stays parked and hidden, and
+only the compositor's own escape binding — which KDE has and GNOME is
+untested for — can end it. The draft's claim that "`last_pos` is never on
+an edge when this happens" is also false: `project_exit` returns a point
+one pixel inside the *crossed* edge, which for a span reaching a corner
+lies exactly on the neighbouring edge, so the next crossing of that
+neighbour is declined as a slide along it. The lock (§7), a client
+disconnecting as an activation races it, and a monitor change (§9) all
+reach the same declined state by other routes.
+
+The release position is the activation position moved one pixel inside
+every edge it sits on — the same convention `project_exit` uses for the
+ordinary return from a client. Releasing *at* the barrier would hand the
+pointer straight back to the barrier that just fired. `last_pos` is set
+to that release point too, or a declined activation would leave it on
+the edge and decline the next one for the same reason.
+
+For an accepted activation, `set_mode(Grab)` is an acknowledgement with
+nothing to do — the compositor is already capturing — and `warp_cursor`
+is a no-op, because a captured pointer is hidden and parked by the
+compositor.
 
 ### 5.4 Release
 

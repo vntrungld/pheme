@@ -53,6 +53,21 @@ pub enum CaptureEvent {
     /// compositor ended it. Only the Wayland backend produces this; the X11 and
     /// Windows backends keep capturing until they are told to stop.
     CaptureEnded,
+    /// The backend has *already started* capturing, at `(x, y)`, and is waiting to be
+    /// told whether that was wanted. Only the Wayland backend produces this: the
+    /// compositor activates a pointer barrier on its own and swallows every event
+    /// until the capture is released.
+    ///
+    /// It is deliberately not a `MotionAbs`. A `MotionAbs` the core declines costs
+    /// nothing under X11 and Windows, where the backend was only watching; the same
+    /// silence under the portal leaves the compositor capturing with the core in
+    /// `Local`, which discards every key and every relative motion — keyboard and
+    /// mouse both gone with no way back. `on_event` therefore answers this event
+    /// either with a switch or with an explicit `Ungrab` (see `on_capture_activated`).
+    CaptureActivated {
+        x: i32,
+        y: i32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -152,7 +167,17 @@ impl ServerCore {
     /// declares them (the InputCapture portal) would have the compositor stop the
     /// pointer at that edge, and the core would then decline the switch — so the
     /// pointer would snag on a screen edge that leads nowhere.
+    ///
+    /// A lock excludes *every* edge for the same reason, one step further: while
+    /// locked nothing may leave, so every declared edge leads nowhere. Under the
+    /// portal a barrier that is still armed while locked is worse than a snag — the
+    /// compositor starts capturing, the core declines, and the user's keyboard and
+    /// mouse are inside a capture nobody wants. The caller must therefore publish the
+    /// edge set again when the lock changes, in both directions.
     pub fn capture_edges(&self) -> Vec<(Side, (f32, f32))> {
+        if self.locked {
+            return Vec::new();
+        }
         self.layout
             .clients
             .iter()
@@ -212,6 +237,9 @@ impl ServerCore {
         if let CaptureEvent::CaptureEnded = ev {
             return self.release_remote();
         }
+        if let CaptureEvent::CaptureActivated { x, y } = ev {
+            return self.on_capture_activated(x, y);
+        }
         if let CaptureEvent::Key { code, down } = ev {
             if Some(code) == self.hotkeys.lock {
                 if down {
@@ -235,6 +263,53 @@ impl ServerCore {
     fn next_seq(&mut self) -> u32 {
         self.seq = self.seq.wrapping_add(1);
         self.seq
+    }
+
+    /// Answers a capture the backend has already started at `(x, y)`.
+    ///
+    /// The ordinary local path decides: if it switches to a client the capture was
+    /// wanted and its actions stand. If it does not — the lock is on, the edge leads
+    /// nowhere, the crossing looks like a slide along the edge, the barrier set and
+    /// the core disagree after a monitor change — then nothing else in this type would
+    /// ever tell the backend to stop, and the capture would run on with every event
+    /// being discarded here. The answer to an unwanted capture is an explicit
+    /// `Ungrab`, never silence.
+    fn on_capture_activated(&mut self, x: i32, y: i32) -> Vec<Action> {
+        if self.remote.is_some() {
+            // Already capturing on purpose: whatever this activation is, releasing
+            // would strand the core in `Remote` with no capture behind it.
+            debug!(x, y, "ignoring an activation while already remote");
+            return Vec::new();
+        }
+        let actions = self.on_local_event(CaptureEvent::MotionAbs { x, y });
+        if actions.iter().any(|a| matches!(a, Action::Grab)) {
+            return actions;
+        }
+        let (rx, ry) = self.just_inside(x, y);
+        // `on_local_event` left `last_pos` on the edge, where the activation happened.
+        // Left there it would make the next crossing of that same edge look like a
+        // slide along it, so one declined activation would decline the next one too.
+        // The pointer is about to be put at (rx, ry); that is where it is.
+        self.last_pos = Some((rx, ry));
+        debug!(x, y, rx, ry, "activation declined; releasing the capture");
+        vec![Action::Ungrab { x: rx, y: ry }]
+    }
+
+    /// `(x, y)` moved one pixel inside any server edge it sits on.
+    ///
+    /// The pointer must not be handed back *on* the barrier that just fired: the next
+    /// movement in the same direction — or none at all, on a compositor that re-tests
+    /// immediately — would activate it again, and a declined activation would become a
+    /// loop. One pixel in is the same convention `project_exit` uses for the ordinary
+    /// return from a client, so both ways back from an edge leave the pointer in the
+    /// same place relative to it. A rect narrower or shorter than three pixels has no
+    /// inside, and the position is then left as it is.
+    fn just_inside(&self, x: i32, y: i32) -> (i32, i32) {
+        let inset = |v: i32, lo: i32, hi: i32| if lo <= hi { v.clamp(lo, hi) } else { v };
+        (
+            inset(x, self.server.x + 1, self.server.x + self.server.w - 2),
+            inset(y, self.server.y + 1, self.server.y + self.server.h - 2),
+        )
     }
 
     fn on_local_event(&mut self, ev: CaptureEvent) -> Vec<Action> {
@@ -341,8 +416,17 @@ impl ServerCore {
                 let seq = self.next_seq();
                 vec![Action::SendControl(Msg::Key { seq, code, down })]
             }
-            CaptureEvent::CaptureEnded => {
-                unreachable!("on_event handles CaptureEnded before dispatching here")
+            // `on_event` handles both of these before dispatching here, so neither is
+            // reachable today. They are not a panic: this runs on the thread that owns
+            // the user's keyboard and mouse, and a refactor that let one through would
+            // take the whole daemon down rather than drop one event. The assertion
+            // fails the test suite instead, which is where it should be noticed.
+            CaptureEvent::CaptureEnded | CaptureEvent::CaptureActivated { .. } => {
+                debug_assert!(
+                    false,
+                    "on_event handles {ev:?} before dispatching to on_remote_event"
+                );
+                Vec::new()
             }
         }
     }
@@ -740,6 +824,160 @@ mod tests {
         c.on_event(CaptureEvent::MotionAbs { x: 1900, y: 540 });
         let actions = c.on_event(CaptureEvent::MotionAbs { x: 1919, y: 540 });
         assert_eq!(has_enter(&actions).unwrap().2, Modifiers::default());
+    }
+
+    /// A core with a client on the right and another on the top, both connected.
+    fn core_right_and_top() -> ServerCore {
+        let layout = Layout {
+            server_screens: screen(1920, 1080),
+            clients: vec![
+                ClientPlacement {
+                    name: "right".into(),
+                    side: Side::Right,
+                    span: (0.0, 1.0),
+                },
+                ClientPlacement {
+                    name: "top".into(),
+                    side: Side::Top,
+                    span: (0.0, 1.0),
+                },
+            ],
+        };
+        let mut c = ServerCore::new(layout, Hotkeys { lock: Some(LOCK) });
+        c.client_connected("right", screen(1000, 500));
+        c.client_connected("top", screen(1000, 500));
+        c
+    }
+
+    fn ungrab_of(actions: &[Action]) -> Option<(i32, i32)> {
+        actions.iter().find_map(|a| match a {
+            Action::Ungrab { x, y } => Some((*x, *y)),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn an_activation_the_core_accepts_switches_instead_of_releasing() {
+        let mut c = core(Side::Right, (0.0, 1.0));
+        let a = c.on_event(CaptureEvent::CaptureActivated { x: 1919, y: 540 });
+        assert!(matches!(a[0], Action::Grab), "{a:?}");
+        assert!(has_enter(&a).is_some(), "{a:?}");
+        assert_eq!(ungrab_of(&a), None, "an accepted capture is not released");
+        assert_eq!(c.active(), Active::Remote("lap".into()));
+    }
+
+    #[test]
+    fn an_activation_declined_because_of_the_lock_is_released() {
+        // The trigger that costs the user everything: the compositor is capturing,
+        // the core is Local and locked, and `on_local_event` drops every key and
+        // every motion. Without an answer here nothing ever calls `release()`.
+        let mut c = core(Side::Right, (0.0, 1.0));
+        c.on_event(CaptureEvent::Key {
+            code: LOCK,
+            down: true,
+        });
+        assert!(c.locked());
+
+        let a = c.on_event(CaptureEvent::CaptureActivated { x: 1919, y: 540 });
+
+        let (x, y) =
+            ungrab_of(&a).unwrap_or_else(|| panic!("a declined activation must release: {a:?}"));
+        assert_eq!(c.active(), Active::Local);
+        assert!(
+            on_edge(&c.server, Side::Right, x, y).is_none(),
+            "releasing at ({x}, {y}) puts the pointer back on the barrier that just fired"
+        );
+        assert!(
+            c.server.contains(x, y),
+            "the pointer must come back inside the screen, not at ({x}, {y})"
+        );
+    }
+
+    #[test]
+    fn an_activation_declined_as_a_slide_along_the_edge_is_released() {
+        // Leaving a right-edge client at its very top puts `last_pos` at (1918, 0),
+        // which is *on* the Top edge. The next crossing of the Top barrier then looks
+        // like a slide along that edge and is declined — with the compositor already
+        // capturing.
+        let mut c = core_right_and_top();
+        c.on_event(CaptureEvent::CaptureActivated { x: 1919, y: 540 });
+        assert_eq!(c.active(), Active::Remote("right".into()));
+        let a = c.on_event(CaptureEvent::MotionRel {
+            dx: -5000,
+            dy: -5000,
+        });
+        assert_eq!(
+            ungrab_of(&a),
+            Some((1918, 0)),
+            "the exit point this case depends on: {a:?}"
+        );
+
+        let a = c.on_event(CaptureEvent::CaptureActivated { x: 960, y: 0 });
+
+        let (x, y) =
+            ungrab_of(&a).unwrap_or_else(|| panic!("a declined activation must release: {a:?}"));
+        assert_eq!(c.active(), Active::Local, "no switch happened: {a:?}");
+        assert!(
+            on_edge(&c.server, Side::Top, x, y).is_none(),
+            "releasing at ({x}, {y}) puts the pointer back on the barrier that just fired"
+        );
+        // And the decline must not compound: the release point is where the pointer is
+        // now, so the next crossing of that same edge is a crossing, not a slide.
+        let a = c.on_event(CaptureEvent::CaptureActivated { x: 960, y: 0 });
+        assert!(
+            has_enter(&a).is_some(),
+            "a declined activation left last_pos on the edge, declining the next one too: {a:?}"
+        );
+    }
+
+    #[test]
+    fn an_activation_with_nowhere_to_go_is_released() {
+        let layout = Layout {
+            server_screens: screen(1920, 1080),
+            clients: vec![ClientPlacement {
+                name: "lap".into(),
+                side: Side::Right,
+                span: (0.0, 1.0),
+            }],
+        };
+        // Nobody connected: the edge leads nowhere, as it does in the window between a
+        // client disconnecting and the barriers being withdrawn.
+        let mut c = ServerCore::new(layout, Hotkeys::default());
+        let a = c.on_event(CaptureEvent::CaptureActivated { x: 1919, y: 540 });
+        assert!(ungrab_of(&a).is_some(), "{a:?}");
+    }
+
+    #[test]
+    fn an_activation_while_already_remote_is_not_released() {
+        let mut c = core(Side::Right, (0.0, 1.0));
+        enter_right(&mut c);
+        let a = c.on_event(CaptureEvent::CaptureActivated { x: 1919, y: 540 });
+        assert!(
+            a.is_empty(),
+            "releasing here would leave the core Remote with no capture: {a:?}"
+        );
+        assert_eq!(c.active(), Active::Remote("lap".into()));
+    }
+
+    #[test]
+    fn capture_edges_are_withdrawn_while_locked() {
+        // Spec §7: "locking removes the barriers". A barrier left armed while locked
+        // hands the compositor a capture the core is guaranteed to decline.
+        let mut c = core(Side::Right, (0.0, 1.0));
+        assert_eq!(c.capture_edges(), vec![(Side::Right, (0.0, 1.0))]);
+
+        c.toggle_lock();
+        assert!(
+            c.capture_edges().is_empty(),
+            "an armed barrier while locked starts a capture nothing wants"
+        );
+
+        c.toggle_lock();
+        assert_eq!(
+            c.capture_edges(),
+            vec![(Side::Right, (0.0, 1.0))],
+            "unlocking must put the barriers back"
+        );
     }
 
     #[test]

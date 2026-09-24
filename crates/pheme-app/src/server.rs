@@ -108,7 +108,15 @@ impl Shared {
                 }
                 Action::Ungrab { x, y } => self.capture_call(|c| c.release(x, y)),
                 Action::WarpCursor { x, y } => self.capture_call(|c| c.warp_cursor(x, y)),
-                Action::SetLocked(locked) => info!(locked, "input lock toggled"),
+                Action::SetLocked(locked) => {
+                    info!(locked, "input lock toggled");
+                    // Spec §7: locking removes the barriers, and unlocking puts them
+                    // back. `capture_edges()` already answers with nothing while
+                    // locked; without this call nothing would ever ask it again, and
+                    // on Wayland the compositor would go on capturing at an edge the
+                    // core is now guaranteed to decline.
+                    self.publish_edges();
+                }
             }
         }
     }

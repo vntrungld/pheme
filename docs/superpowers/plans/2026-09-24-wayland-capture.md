@@ -2529,9 +2529,9 @@ MSG
 **Interfaces:**
 - Produces: `portal::shortcuts::LockShortcut`, delivering a toggle over a channel.
 
-A Wayland server receives no keyboard events while local, so the lock hotkey cannot be observed the way X11 observes it. Worse, it cannot be undone: locking removes nothing, but with the pointer never crossing there is no capture in which the key could be pressed again. A lock that cannot be released is worse than no lock.
+A Wayland server receives no keyboard events while local, so the lock hotkey cannot be observed the way X11 observes it. Worse, it cannot be undone: locking removes the barriers (design §7), and with no barriers there is nothing left to activate a capture in which the key could be pressed again. A lock that cannot be released is worse than no lock.
 
-`org.freedesktop.portal.GlobalShortcuts` is the only mechanism that exists. The compositor owns the final binding; the configured hotkey is only a `preferred_trigger`.
+`org.freedesktop.portal.GlobalShortcuts` is the only mechanism that exists. The compositor owns the final binding; the configured hotkey is only a `preferred_trigger`, and it must be translated into the portal's own syntax first — XKB keysym names with `CTRL+`/`SHIFT+`/`ALT+`/`SUPER+` prefixes, so the default `"ScrollLock"` goes out as `Scroll_Lock` (design §7).
 
 - [ ] **Step 1: Implement the shortcut session**
 

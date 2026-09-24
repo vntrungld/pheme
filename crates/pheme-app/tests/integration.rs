@@ -65,6 +65,11 @@ struct Pair {
 }
 
 fn spawn_pair() -> Pair {
+    spawn_pair_with_hotkeys(Hotkeys::default())
+}
+
+/// As `spawn_pair`, but with a lock hotkey the mock capture backend can press.
+fn spawn_pair_with_hotkeys(hotkeys: Hotkeys) -> Pair {
     let sdir = tempfile::tempdir().unwrap();
     let cdir = tempfile::tempdir().unwrap();
     let sid = Identity::load_or_create(sdir.path(), "server").unwrap();
@@ -92,7 +97,7 @@ fn spawn_pair() -> Pair {
                 side: Side::Right,
                 span: (0.0, 1.0),
             }],
-            hotkeys: Hotkeys::default(),
+            hotkeys,
             lock_hotkey_trigger: None,
             stats: false,
             audio: pheme_app::audio::PlaybackSource::Disabled,
@@ -659,6 +664,71 @@ async fn the_capture_backend_learns_which_edges_have_clients() {
         "edges never cleared after the client vanished"
     );
 
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn locking_withdraws_the_edges_and_unlocking_puts_them_back() {
+    // Spec §7: "locking removes the barriers". On Wayland an edge left declared while
+    // locked is not a harmless snag -- the compositor starts capturing, the core
+    // declines, and the user is inside a capture that swallows every key.
+    const LOCK: KeyCode = KeyCode(0x47); // ScrollLock
+    let Pair {
+        server,
+        client,
+        shutdown_tx,
+        cap,
+        inj: _,
+    } = spawn_pair_with_hotkeys(Hotkeys { lock: Some(LOCK) });
+    wait_connected(&cap).await;
+    assert_eq!(
+        cap.edge_calls().last().map(|c| c.len()),
+        Some(1),
+        "the connected client's edge: {:?}",
+        cap.edge_calls()
+    );
+
+    cap.push(CaptureEvent::Key {
+        code: LOCK,
+        down: true,
+    });
+    assert!(
+        wait_until(
+            || cap.edge_calls().last().is_some_and(|c| c.is_empty()),
+            Duration::from_secs(5)
+        )
+        .await,
+        "locking left the edges declared: {:?}",
+        cap.edge_calls()
+    );
+
+    cap.push(CaptureEvent::Key {
+        code: LOCK,
+        down: false,
+    });
+    cap.push(CaptureEvent::Key {
+        code: LOCK,
+        down: true,
+    });
+    assert!(
+        wait_until(
+            || cap
+                .edge_calls()
+                .last()
+                .is_some_and(|c| c.len() == 1 && c[0].side == Side::Right),
+            Duration::from_secs(5)
+        )
+        .await,
+        "unlocking did not put the edges back: {:?}",
+        cap.edge_calls()
+    );
+
+    client.abort();
     shutdown_tx.send(true).unwrap();
     tokio::time::timeout(Duration::from_secs(5), server)
         .await

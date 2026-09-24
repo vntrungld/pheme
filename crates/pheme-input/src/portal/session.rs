@@ -503,11 +503,28 @@ pub(crate) async fn run(
                         // matches no edge and the switch silently never happens.
                         let (cx, cy) = clamp_into(&screen, x, y);
                         debug!(?id, ?barrier, reported = ?(x, y), clamped = ?(cx, cy), "capture activated");
+                        // `CaptureActivated`, not `MotionAbs`: the compositor is
+                        // already capturing, so the core has to answer — with a switch
+                        // or with a release. A `MotionAbs` it decided against would be
+                        // answered with nothing, and nothing leaves the user inside a
+                        // capture that swallows every key and every motion.
                         if tx
-                            .try_send(CaptureEvent::MotionAbs { x: cx, y: cy })
+                            .try_send(CaptureEvent::CaptureActivated { x: cx, y: cy })
                             .is_err()
                         {
-                            warn!("dropped the activation event");
+                            // The core will never answer an event it never received,
+                            // so the capture would run on unreleased. Release it here
+                            // instead, at the position the core would have chosen.
+                            // The centre rather than the reported position: no core
+                            // state depends on where this lands, and the centre is
+                            // the one point guaranteed not to be on the barrier that
+                            // just fired.
+                            let (rx, ry) = screen.center();
+                            error!("dropped the activation event; releasing the capture");
+                            if let Err(e) = release_capture(&mut sess, &mut held, &tx, rx, ry).await
+                            {
+                                error!("releasing the dropped activation failed: {e}");
+                            }
                         }
                     }
                     // Without a position the core cannot tell which edge was
