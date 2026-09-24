@@ -136,15 +136,27 @@ Windows client, and again Wayland → Linux.
 | W1 | Crossing the configured edge hands input to the client; crossing back returns it; repeat 20 times without a restart | |
 | W2 | Hold Shift across the edge — the client types uppercase | |
 | W3 | Compositor's own escape binding ends the capture: back to local, no key stuck on the client | |
-| W4 | Connect a second client on another edge mid-session — its barrier appears without restarting | |
+| W4 | Disconnect a client and connect a different one placed on another edge, without restarting the server — the old barrier goes away and the new edge's barrier appears | |
 | W5 | Disconnect a client while it holds the input — the server recovers the pointer in under 5 s | |
-| W6 | The lock hotkey toggles the lock, and toggles it back | |
+| W6 | The lock hotkey toggles the lock, and toggles it back. While locked, pushing the pointer at the configured edge must **not** start a capture — the barriers are withdrawn (design §7), so the pointer simply stops at the edge and the keyboard keeps working. After unlocking, the edge switches again | |
 | W7 | Edges with no connected client do **not** snag the pointer | |
-| W8 | Change the monitor layout mid-session (`ZonesChanged`) — barriers follow | |
+| W8 | Change the monitor layout mid-session (`ZonesChanged`) — barriers follow, and the log says the server must be restarted to pick the new layout up (see below) | |
 | W9 | Restart the server: does the permission dialog appear again? (§15) | |
 | W10 | Run the same build in an X11 session — unchanged behaviour | |
 | W11 | 100 keystrokes across the edge, no stuck key; input RTT under 1 ms over cable | |
 | W12 | During an **active** capture on Wayland, press the configured lock hotkey once. It must toggle the lock exactly once, not twice | |
+
+W4 is worded the way it is because the server handles **one** client at a
+time (see the README's limitations): a second client cannot be connected
+alongside the first, so the test is a swap rather than an addition.
+
+W8 only checks the half that shipped. `ZonesChanged` re-declares the
+barriers against the new zones, but the screen list the core matches
+edges against is fixed when the server starts, so after a monitor change
+the two disagree and a crossing may stop working. The server warns
+("the display layout changed and no longer matches the screen list this
+session started with") and the fix is to restart it; refreshing the
+core's layout mid-session is separate work (design §15).
 
 W9 is the open question the design records: KDE returned no restore token
 even when the session asked to persist the grant, so whether the

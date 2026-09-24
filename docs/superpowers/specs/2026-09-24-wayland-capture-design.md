@@ -496,7 +496,7 @@ Windows client, and again Wayland → Linux.
 | W1 | Crossing the configured edge hands input to the client; crossing back returns it; repeat 20 times without a restart |
 | W2 | Hold Shift across the edge — the client types uppercase |
 | W3 | Compositor's own escape binding ends the capture: back to local, no key stuck on the client |
-| W4 | Connect a second client on another edge mid-session — its barrier appears without restarting |
+| W4 | Disconnect a client and connect a different one placed on another edge, without restarting the server — the old barrier goes away and the new edge's barrier appears. (The server handles one client at a time, so this is a swap, not a second connection) |
 | W5 | Disconnect a client while it holds the input — the server recovers the pointer in under 5 s |
 | W6 | The lock hotkey toggles the lock, and toggles it back |
 | W7 | Edges with no connected client do **not** snag the pointer |

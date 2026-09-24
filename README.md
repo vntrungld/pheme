@@ -59,13 +59,57 @@ grant, so whether the permission survives a restart is untested —
 expect the dialog again on each launch until you've confirmed
 otherwise on your own compositor.
 
+A **monitor added or removed while the server runs** needs a restart.
+The pointer barriers follow the new layout, but the screen list the
+server matches edges against is read once at startup, so after a
+layout change the two can disagree and the edge switch may stop
+working. The log says so ("the display layout changed and no longer
+matches the screen list this session started with"); restart `pheme
+server` to pick the new layout up.
+
 **On Wayland the lock hotkey binding belongs to the desktop, not to
 the configuration file.** Under X11 and Windows, `hotkeys.lock` in
 the config decides the key outright. Under Wayland it is only a
 *preferred trigger*, sent to the compositor through
 `org.freedesktop.portal.GlobalShortcuts`; the compositor may bind a
-different key instead. What actually got bound is logged at startup —
-check the log if the configured hotkey does not do anything.
+different key instead. What actually got bound is logged at startup,
+and so is a bind that bound *nothing* — check the log if the
+configured hotkey does not do anything.
+
+That portal names keys in its own syntax: XKB keysym names, with
+`CTRL+`, `SHIFT+`, `ALT+` and `SUPER+` prefixes, which is not how
+`hotkeys.lock` names them elsewhere. pheme translates the key names it
+knows — the default `ScrollLock` is sent as the keysym `Scroll_Lock` —
+and passes anything containing a `+` through untouched, so a full
+trigger can be written by hand:
+
+```toml
+[hotkeys]
+lock = "CTRL+ALT+l"      # portal syntax, used as written on Wayland
+# lock = "ScrollLock"    # pheme's own name; sent to the portal as Scroll_Lock
+```
+
+A value with a `+` in it is **only** meaningful on Wayland, where the
+portal owns the binding. X11 and Windows watch the keyboard for one
+named key instead, so the same config there refuses to start with a
+message saying so rather than quietly leaving you without a lock. Use
+a plain key name unless the machine is a Wayland server.
+
+While the input lock is on, the barriers are withdrawn: the pointer
+stops at the screen edge like any other window edge instead of
+handing input to the client. That is what makes the lock releasable —
+with a barrier still armed the compositor would start a capture the
+lock is bound to refuse.
+
+One open question, still unanswered: pressing the lock hotkey **during
+an active capture** may toggle the lock twice. While a capture is
+running the keypress reaches pheme through libei, and it may *also*
+fire the compositor's own global-shortcut binding. Whether a
+compositor delivers a global shortcut while an application holds an
+InputCapture grab is compositor-defined, and this has not been
+measured on either KDE or GNOME. If the lock appears not to respond
+while you are controlling the client, press it once more from the
+server's own screen.
 
 ## Audio
 
