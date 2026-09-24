@@ -348,6 +348,9 @@ pub(crate) async fn run(
     // Startup reports its first failure to whoever called `start()`, so a refused
     // permission or a rejected barrier surfaces there instead of leaving a thread
     // that quietly did nothing.
+    //
+    // This one is for a failure of `establish` itself, which leaves no session
+    // behind to close. Every failure *after* it must use `bail_started!`.
     macro_rules! bail {
         ($e:expr) => {{
             let _ = ready.send(Err($e));
@@ -360,12 +363,33 @@ pub(crate) async fn run(
         Err(e) => bail!(e),
     };
 
+    // Once `establish` has returned there is a created, started, EIS-connected
+    // session, and `ashpd::desktop::Session` has no `Drop` that closes it. Leaving
+    // without `shutdown` would hand it to the compositor forever. `set_barriers` is
+    // the dangerous one: it can fail *from its own `Enable` call*, on a request the
+    // compositor already applied, which arms the barriers and then loses the only
+    // thread that reads the libei stream -- the state where the user's keyboard
+    // stops coming back.
+    //
+    // The error goes out before the close, so `start()` is not left waiting on two
+    // untimed D-Bus calls.
+    macro_rules! bail_started {
+        ($sess:expr, $e:expr) => {{
+            let _ = ready.send(Err($e));
+            shutdown(&mut $sess).await;
+            return;
+        }};
+    }
+
     let (conn, mut events) = match ctx
         .handshake_async_io("pheme", ei::handshake::ContextType::Receiver)
         .await
     {
         Ok(v) => v,
-        Err(e) => bail!(Error::Backend(format!("the libei handshake failed: {e}"))),
+        Err(e) => bail_started!(
+            sess,
+            Error::Backend(format!("the libei handshake failed: {e}"))
+        ),
     };
     // The handshake hands back a connection handle. The event stream holds a clone
     // of its own, so dropping this one would break nothing; it is kept for the life
@@ -381,23 +405,23 @@ pub(crate) async fn run(
     let portal = Rc::clone(&sess.portal);
     let mut activated = match portal.receive_activated().await {
         Ok(s) => Box::pin(s),
-        Err(e) => bail!(pe("subscribing to Activated", e)),
+        Err(e) => bail_started!(sess, pe("subscribing to Activated", e)),
     };
     let mut deactivated = match portal.receive_deactivated().await {
         Ok(s) => Box::pin(s),
-        Err(e) => bail!(pe("subscribing to Deactivated", e)),
+        Err(e) => bail_started!(sess, pe("subscribing to Deactivated", e)),
     };
     let mut disabled = match portal.receive_disabled().await {
         Ok(s) => Box::pin(s),
-        Err(e) => bail!(pe("subscribing to Disabled", e)),
+        Err(e) => bail_started!(sess, pe("subscribing to Disabled", e)),
     };
     let mut zones_changed = match portal.receive_zones_changed().await {
         Ok(s) => Box::pin(s),
-        Err(e) => bail!(pe("subscribing to ZonesChanged", e)),
+        Err(e) => bail_started!(sess, pe("subscribing to ZonesChanged", e)),
     };
 
     if let Err(e) = sess.set_barriers(&edges).await {
-        bail!(e);
+        bail_started!(sess, e);
     }
     let _ = ready.send(Ok(()));
 
@@ -497,18 +521,33 @@ pub(crate) async fn run(
                     // The key-ups for anything still held go to the compositor from
                     // here on, so the core would keep them held forever.
                     for k in held.flush() {
-                        let _ = tx.try_send(CaptureEvent::Key {
-                            code: k,
-                            down: false,
-                        });
+                        if tx
+                            .try_send(CaptureEvent::Key {
+                                code: k,
+                                down: false,
+                            })
+                            .is_err()
+                        {
+                            warn!(?k, "dropped a key-up; the core will hold this key");
+                        }
                     }
-                    // The caller turns this into ServerCore::release_remote().
-                    let _ = tx.try_send(CaptureEvent::CaptureEnded);
+                    // The caller turns this into ServerCore::release_remote(). It is
+                    // the only thing that tells the core the compositor ended the
+                    // capture, so a drop here is not recoverable the way a dropped
+                    // motion event is: the core would stay Remote with the input
+                    // going nowhere and nothing saying why.
+                    if tx.try_send(CaptureEvent::CaptureEnded).is_err() {
+                        error!("dropped CaptureEnded; the core still believes it is capturing");
+                    }
                 } else {
                     debug!(?id, current = ?sess.activation, "ignoring a Deactivated for another activation");
                 }
             }
             Step::Portal(PortalEvent::Disabled) => {
+                // No activation to clear and no keys to flush here: the portal
+                // specification says of this signal that "if input capturing is
+                // currently ongoing, the Deactivated signal is emitted before this
+                // signal", and that arm has already done both.
                 warn!("the compositor disabled the session; re-enabling");
                 if let Err(e) = sess.set_barriers(&edges).await {
                     error!("re-enabling after Disabled failed: {e}");
@@ -523,8 +562,12 @@ pub(crate) async fn run(
                     error!("re-declaring barriers after a zone change failed: {e}");
                 }
             }
-            Step::Portal(PortalEvent::Closed) | Step::Ei(None) => {
-                error!("the input capture session ended");
+            Step::Portal(PortalEvent::Closed) => {
+                error!("a portal signal stream ended: the session or the D-Bus connection is gone");
+                break;
+            }
+            Step::Ei(None) => {
+                error!("the libei event stream ended: no further input can arrive");
                 break;
             }
             Step::Ei(Some(Err(e))) => {
@@ -585,10 +628,12 @@ pub(crate) async fn run(
         }
     }
 
-    shutdown(&mut sess).await;
-    // Dropping `tx` here is what lets the receiver observe disconnection, which the
-    // trait's `stop()` contract requires.
+    // Dropping `tx` is what lets the receiver observe disconnection, which the
+    // trait's `stop()` contract requires -- and it happens *before* `shutdown`,
+    // whose two D-Bus calls have no timeout: `stop()` joins this thread, so an
+    // unresponsive portal must not hold the sender open past that budget.
     drop(tx);
+    shutdown(&mut sess).await;
 }
 
 /// Ends any running capture and closes the portal session.
@@ -627,10 +672,15 @@ async fn release_capture(
     // Keys held when the capture ends are never seen being released: the key-up goes
     // to the compositor. Without this the core keeps them held forever.
     for k in held.flush() {
-        let _ = tx.try_send(CaptureEvent::Key {
-            code: k,
-            down: false,
-        });
+        if tx
+            .try_send(CaptureEvent::Key {
+                code: k,
+                down: false,
+            })
+            .is_err()
+        {
+            warn!(?k, "dropped a key-up; the core will hold this key");
+        }
     }
     // The id must be the activation being ended: the specification says a compositor
     // ignores a `Release` for an id that is no longer active, so a stale one would
