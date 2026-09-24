@@ -71,6 +71,8 @@ fn spawn_pair() -> Pair {
             stats: false,
             audio: pheme_app::audio::PlaybackSource::Disabled,
             audio_stats: None,
+            mic: pheme_app::audio::CaptureSource::Disabled,
+            mic_counters: None,
         },
         shutdown_rx.clone(),
     ));
@@ -156,6 +158,8 @@ async fn server_and_client_exchange_input_over_quic() {
             stats: false,
             audio: pheme_app::audio::PlaybackSource::Disabled,
             audio_stats: None,
+            mic: pheme_app::audio::CaptureSource::Disabled,
+            mic_counters: None,
         },
         shutdown_rx.clone(),
     ));
@@ -321,6 +325,8 @@ async fn client_reconnects_after_server_restart() {
                 stats: false,
                 audio: pheme_app::audio::PlaybackSource::Disabled,
                 audio_stats: None,
+                mic: pheme_app::audio::CaptureSource::Disabled,
+                mic_counters: None,
             },
             stop,
         ));
@@ -405,6 +411,8 @@ async fn server_releases_grab_when_client_vanishes_silently() {
             stats: false,
             audio: pheme_app::audio::PlaybackSource::Disabled,
             audio_stats: None,
+            mic: pheme_app::audio::CaptureSource::Disabled,
+            mic_counters: None,
         },
         shutdown_rx.clone(),
     ));

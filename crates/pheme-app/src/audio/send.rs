@@ -164,7 +164,10 @@ fn out_thread(
         let mut fresh: Option<Box<dyn AudioCapture>>;
         let backend: &mut dyn AudioCapture = match injected.as_deref_mut() {
             Some(b) => b,
-            None => match pheme_audio::detect_capture(device.as_deref()) {
+            None => match match stream {
+                AudioStream::Playback => pheme_audio::detect_capture(device.as_deref()),
+                AudioStream::Mic => pheme_audio::detect_mic(device.as_deref()),
+            } {
                 Ok(b) => {
                     fresh = Some(b);
                     fresh.as_deref_mut().expect("just assigned")

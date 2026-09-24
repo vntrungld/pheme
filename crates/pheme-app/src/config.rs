@@ -78,6 +78,10 @@ pub struct AudioCfg {
     /// `None` means the default output. Ignored on Linux, where applications select
     /// the "Pheme Speaker" sink instead.
     pub capture_device: Option<String>,
+    /// Server side: which microphone to capture and send to the client. `None` means the
+    /// platform default. There is no key to turn the microphone on or off: it opens only
+    /// while the client reports that something is recording.
+    pub mic_device: Option<String>,
 }
 
 fn default_name() -> String {
@@ -357,5 +361,28 @@ side = "top"
             e.to_string().contains("enabled"),
             "audio is always on; there is no enable flag: {e}"
         );
+    }
+
+    #[test]
+    fn the_microphone_device_is_read_from_the_config() {
+        let cfg: Config = toml::from_str(
+            r#"
+            role = "server"
+            name = "desk"
+            [audio]
+            mic_device = "alsa_input.usb-Blue_Yeti"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.audio.mic_device.as_deref(),
+            Some("alsa_input.usb-Blue_Yeti")
+        );
+    }
+
+    #[test]
+    fn an_absent_microphone_device_means_the_platform_default() {
+        let cfg: Config = toml::from_str("role = \"server\"\nname = \"desk\"\n").unwrap();
+        assert_eq!(cfg.audio.mic_device, None);
     }
 }

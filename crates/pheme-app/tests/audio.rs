@@ -124,6 +124,8 @@ fn spawn_pair(fail_capture: bool) -> Pair {
             stats: false,
             audio: PlaybackSource::Backend(Box::new(speaker_backend)),
             audio_stats: Some(heard.clone()),
+            mic: CaptureSource::Disabled,
+            mic_counters: None,
         },
         shutdown_rx.clone(),
     ));

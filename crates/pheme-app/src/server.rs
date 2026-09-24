@@ -14,7 +14,7 @@ use pheme_proto::{AudioParams, AudioStream, Msg, PROTOCOL_VERSION};
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
-use crate::audio::{InStats, PlaybackSource, RecvSide};
+use crate::audio::{CaptureSource, InStats, OutCounters, PlaybackSource, RecvSide, SendSide};
 use crate::config::{config_dir, Config};
 
 pub struct ServerDeps {
@@ -31,6 +31,10 @@ pub struct ServerDeps {
     /// and buffer depth, which is the only way to tell a working audio path from one
     /// that discards most of what arrives and still sounds roughly right.
     pub audio_stats: Option<Arc<InStats>>,
+    /// Where the audio sent to the client's virtual microphone comes from.
+    pub mic: CaptureSource,
+    /// Counters the mic packer thread publishes. `None` allocates a private set.
+    pub mic_counters: Option<Arc<OutCounters>>,
 }
 
 /// The currently connected client, as seen by the router thread.
@@ -54,6 +58,7 @@ struct Shared {
     link: Mutex<Option<Link>>,
     counters: Counters,
     audio: RecvSide,
+    mic: SendSide,
 }
 
 impl Shared {
@@ -117,9 +122,16 @@ pub async fn run_server(
         stats,
         audio,
         audio_stats,
+        mic,
+        mic_counters,
     } = deps;
     let audio_stats = audio_stats.unwrap_or_default();
     let audio_in = RecvSide::spawn(audio, audio_stats.clone());
+    let mic_counters = mic_counters.unwrap_or_default();
+    let mic = SendSide::spawn(mic, AudioStream::Mic, mic_counters.clone());
+    // Closed until a client says something is recording. A server with no client has no
+    // consumer, so there is nothing for an open microphone to be open for.
+    mic.set_wanted(false);
     let (ev_tx, ev_rx) = crossbeam_channel::bounded::<CaptureEvent>(4096);
     capture.start(ev_tx).context("starting input capture")?;
     let screens = capture.screens();
@@ -137,6 +149,7 @@ pub async fn run_server(
         link: Mutex::new(None),
         counters: Counters::default(),
         audio: audio_in,
+        mic,
     });
 
     // Router thread: blocking receive from the capture backend, no async hop for datagrams.
@@ -267,6 +280,26 @@ pub async fn run_server(
     outcome
 }
 
+/// The playback frame in `m`, if it is one this server should play.
+///
+/// A server receives `AudioStream::Playback` and sends `AudioStream::Mic`; a frame tagged
+/// the other way is not ours.
+fn playback_frame(m: &Msg) -> Option<Frame> {
+    match m {
+        Msg::Audio {
+            stream: AudioStream::Playback,
+            seq,
+            ts_us,
+            samples,
+        } if samples.len() == pheme_audio::FRAME_BYTES => Some(Frame {
+            seq: *seq,
+            ts_us: *ts_us,
+            bytes: samples.clone(),
+        }),
+        _ => None,
+    }
+}
+
 /// Runs one client session to completion (disconnect or shutdown).
 async fn handle_peer(
     mut peer: Peer,
@@ -291,7 +324,7 @@ async fn handle_peer(
         name,
         os,
         screens,
-        audio: _,
+        audio,
     }) = hello
     else {
         peer.close("expected Hello");
@@ -318,6 +351,19 @@ async fn handle_peer(
         })
         .await?;
     info!(client = %name, ?os, addr = %peer.remote_addr(), "client connected");
+
+    let audio_ok = audio == AudioParams::DEFAULT;
+    if !audio_ok {
+        error!(
+            ?audio,
+            client = %name,
+            "the client speaks an audio format pheme does not; running this session \
+             without audio in either direction"
+        );
+    }
+    if audio_ok {
+        shared.mic.set_peer(Some(peer.sender()));
+    }
 
     let (control_tx, mut control_rx) = mpsc::unbounded_channel::<Msg>();
     {
@@ -350,24 +396,22 @@ async fn handle_peer(
             msg = rx.recv() => match msg {
                 Some(Msg::Ping(n)) => { let _ = peer.sender().send_control(&Msg::Pong(n)).await; }
                 Some(Msg::Bye { reason }) => { info!(%reason, "client said bye"); break Ok(()); }
+                Some(Msg::MicWanted { wanted }) => {
+                    if audio_ok {
+                        shared.mic.set_wanted(wanted);
+                    }
+                }
                 Some(other) => tracing::debug!(?other, "ignoring message from client"),
                 None => break Ok(()),
             },
-            // Temporary: Task 14 rewrites this arm with a stream-tag check and a format
-            // gate. For now the `Msg::Audio` handling just moved here unchanged, since
-            // `take_incoming()` no longer carries audio at all.
-            msg = audio_rx.recv() => match msg {
-                Some(Msg::Audio {
-                    stream: AudioStream::Playback,
-                    seq,
-                    ts_us,
-                    samples,
-                }) => shared.audio.push(Frame {
-                    seq,
-                    ts_us,
-                    bytes: samples,
-                }),
-                Some(other) => tracing::debug!(?other, "ignoring message from client"),
+            m = audio_rx.recv() => match m {
+                Some(m) => {
+                    if audio_ok {
+                        if let Some(f) = playback_frame(&m) {
+                            shared.audio.push(f);
+                        }
+                    }
+                }
                 None => break Ok(()),
             },
             _ = shutdown.changed() => {
@@ -390,6 +434,10 @@ async fn handle_peer(
             *link = None;
         }
     }
+    shared.mic.set_peer(None);
+    // No client means no consumer. Clearing the peer alone would leave the device open
+    // for the life of the process, with its indicator lit and nothing listening.
+    shared.mic.set_wanted(false);
     let actions = shared.core.lock().unwrap().client_disconnected(&name);
     shared.execute(actions);
     peer.close("session ended");
@@ -443,8 +491,34 @@ pub async fn main(cfg: Config, pair: bool, stats: bool) -> anyhow::Result<()> {
             stats,
             audio: PlaybackSource::Detect(cfg.audio.playback_device.clone()),
             audio_stats: None,
+            mic: CaptureSource::Detect(cfg.audio.mic_device.clone()),
+            mic_counters: None,
         },
         shutdown_rx,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_playback_frame_is_not_for_the_server_to_send() {
+        // Review Focus 3, the server's half: it receives Playback and sends Mic.
+        assert!(playback_frame(&Msg::Audio {
+            stream: AudioStream::Playback,
+            seq: 1,
+            ts_us: 0,
+            samples: vec![0; 960],
+        })
+        .is_some());
+        assert!(playback_frame(&Msg::Audio {
+            stream: AudioStream::Mic,
+            seq: 1,
+            ts_us: 0,
+            samples: vec![0; 960],
+        })
+        .is_none());
+    }
 }
