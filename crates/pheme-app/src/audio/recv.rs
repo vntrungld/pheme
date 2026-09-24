@@ -112,9 +112,17 @@ struct InLast {
 }
 
 /// The change in one counter since the last call, and the new high-water mark.
+///
+/// Saturating, because these counters can go *backwards*: `publish` stores the current
+/// jitter buffer's absolute values, and a backend that fails is rebuilt with a fresh
+/// buffer whose counters start at zero. That is the ordinary five-second retry path, not
+/// an exotic one. A plain subtraction would panic in a debug build and wrap to a number
+/// near `u64::MAX` in a release one — and on the client this runs inline in the session
+/// loop, where a panic would take down the keyboard and mouse with it. Saturating loses
+/// at most the one interval that spans a rebuild, which is honest and bounded.
 fn step(now: &AtomicU64, last: &AtomicU64) -> u64 {
     let now = now.load(Ordering::Relaxed);
-    now - last.swap(now, Ordering::Relaxed)
+    now.saturating_sub(last.swap(now, Ordering::Relaxed))
 }
 
 impl InStats {
@@ -467,6 +475,25 @@ mod tests {
             13,
             "the counter itself stays cumulative"
         );
+    }
+
+    #[test]
+    fn a_counter_that_goes_backwards_reports_no_change_rather_than_panicking() {
+        // A rebuilt backend gets a fresh jitter buffer whose counters start at zero, and
+        // `publish` stores absolutes — so this is the ordinary retry path, not a
+        // contrived one. Before this was saturating it panicked in a debug build and
+        // wrapped to roughly u64::MAX in a release one.
+        let stats = InStats::default();
+        stats.lost.store(7, Ordering::Relaxed);
+        assert_eq!(stats.snapshot_delta().lost, 7);
+        stats.lost.store(0, Ordering::Relaxed);
+        assert_eq!(
+            stats.snapshot_delta().lost,
+            0,
+            "no change, not an underflow"
+        );
+        stats.lost.store(3, Ordering::Relaxed);
+        assert_eq!(stats.snapshot_delta().lost, 3, "and it recovers afterwards");
     }
 
     /// The tone's amplitude, measured robustly.

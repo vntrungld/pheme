@@ -3639,9 +3639,17 @@ struct InLast {
 }
 
 /// The change in one counter since the last call, and the new high-water mark.
+///
+/// Saturating, because these counters can go *backwards*: `publish` stores the current
+/// jitter buffer's absolute values, and a backend that fails is rebuilt with a fresh
+/// buffer whose counters start at zero. That is the ordinary five-second retry path, not
+/// an exotic one. A plain subtraction would panic in a debug build and wrap to a number
+/// near `u64::MAX` in a release one — and on the client this runs inline in the session
+/// loop, where a panic would take down the keyboard and mouse with it. Saturating loses
+/// at most the one interval that spans a rebuild, which is honest and bounded.
 fn step(now: &AtomicU64, last: &AtomicU64) -> u64 {
     let now = now.load(Ordering::Relaxed);
-    now - last.swap(now, Ordering::Relaxed)
+    now.saturating_sub(last.swap(now, Ordering::Relaxed))
 }
 
 impl InStats {
@@ -3660,7 +3668,9 @@ impl InStats {
 }
 ```
 
-Add `last: InLast` to `InStats`, private to the module. The counters only ever grow, so `step`'s subtraction cannot underflow.
+Add `last: InLast` to `InStats`, private to the module.
+
+**The counters do not only grow**, which an earlier draft of this plan asserted and was wrong about. `publish` stores absolutes from whichever `JitterBuffer` currently exists, and a rebuilt backend gets a fresh one starting at zero — so a delta spanning a device failure is negative. That is why `step` saturates.
 
 - [ ] **Step 3: Use it on the server and add the mic counters there**
 

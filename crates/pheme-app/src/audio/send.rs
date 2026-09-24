@@ -429,7 +429,11 @@ mod tests {
         // A gate that is open while the device is failing to start must not read as
         // open: `mic_open` in the stats line exists to tell "closed because nothing is
         // recording" apart from "closed because it failed", and a flag that just echoed
-        // the gate would collapse that distinction.
+        // the gate would collapse that distinction. The assertion below has to land in
+        // that exact window, not before the worker has run at all: `fail_next_start`
+        // fails the very first attempt almost immediately, and the worker then naps for
+        // the five-second retry delay before trying again, which is a wide, reliably
+        // observable gap between "gate open, device failed" and "gate open, device up".
         let (cap, handle) = MockCapture::new();
         handle.fail_next_start();
         let counters = Arc::new(OutCounters::default());
@@ -439,7 +443,20 @@ mod tests {
             counters,
             true,
         );
-        assert!(!audio.is_open(), "the gate is open but the device is not");
+        // Long enough for the failed attempt to have already happened — it is the very
+        // first thing the worker does once it sees the gate open — and well short of
+        // the five-second retry delay it is now napping through.
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !handle.started(),
+            "the device really did fail to start by now"
+        );
+        assert!(
+            !audio.is_open(),
+            "the gate is open and the device failed to start; is_open must not read \
+             true while the worker is still waiting to retry"
+        );
+
         assert!(
             wait_until(|| handle.started(), SETTLE),
             "the retry cycle must bring the microphone up"
