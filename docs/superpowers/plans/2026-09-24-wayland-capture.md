@@ -20,6 +20,12 @@
 - **Windows cross-compilation cannot be checked locally** — `ring` (via quinn/rustls) needs `x86_64-w64-mingw32-gcc`, which is not installed and needs root. For tasks that touch Windows code, the local gate is:
   `RUSTUP_HOME=$HOME/.rustup-standalone CARGO_HOME=$HOME/.cargo-standalone PATH=$HOME/.cargo-standalone/bin:$PATH cargo clippy -p pheme-audio -p pheme-input --target x86_64-pc-windows-gnu --all-targets -- -D warnings`
   CI is the real gate.
+  **`pheme-app` cannot be covered by that command at all** — it depends on quinn/rustls
+  and therefore on `ring`. Any `#[cfg(not(target_os = "linux"))]` code added to
+  `pheme-app` is verified locally by temporarily inverting its `cfg` predicate so the
+  non-Linux arm compiles on this host, and by CI otherwise. A report claiming "the
+  Windows lint is green" for a change in `pheme-app` is claiming something that
+  command does not check.
 - **No new dependency beyond the four named above.** All four are already in `ashpd`'s own dependency graph, so declaring them adds nothing to the build. In particular, do not add `xkbcommon`; §6 of the spec explains why the modifier mask uses a fixed layout.
 - **The portal is never mocked.** Logic that can be a pure function must be one, and must be unit-tested. Session lifecycle is verified by the manual matrix and by the ignored live test in Task 12.
 - **Every constant taken from the spec's §3 is a measurement, not a guess.** Do not "simplify" them. `x0 + W` for a far edge, evdev key codes with no `- 8`, and the `flush()` after binding capabilities are each load-bearing, and each fails silently when wrong.
