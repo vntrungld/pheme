@@ -101,6 +101,13 @@ handing input to the client. That is what makes the lock releasable —
 with a barrier still armed the compositor would start a capture the
 lock is bound to refuse.
 
+Locking while the input is already **on the client** is the one
+exception: the barriers stay as they are until the input comes back,
+and are withdrawn then. Nothing is lost by waiting, because only a
+pointer on the server screen can reach a barrier — and withdrawing
+them there would mean disabling a capture the compositor is running,
+while the lock's own rule is that the input stays where it is.
+
 One open question, still unanswered: pressing the lock hotkey **during
 an active capture** may toggle the lock twice. While a capture is
 running the keypress reaches pheme through libei, and it may *also*

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context};
 use pheme_audio::frame::Frame;
-use pheme_core::{Action, CaptureEvent, ClientPlacement, Hotkeys, Layout, ServerCore};
+use pheme_core::{Action, Active, CaptureEvent, ClientPlacement, Hotkeys, Layout, ServerCore};
 use pheme_input::{CaptureEdge, CaptureMode, InputCapture};
 use pheme_net::pairing::{generate_code, run_server_pairing};
 use pheme_net::{Endpoint, Identity, Incoming, Peer, PeerSender, TrustStore};
@@ -84,16 +84,36 @@ struct Shared {
     counters: Counters,
     audio: RecvSide,
     mic: SendSide,
+    /// Set when an edge set could not be pushed to the backend because the core was
+    /// remote, and cleared by the push that finally happens on the way back to local.
+    /// Always locked *inside* `core`, never the other way round, so the "is the core
+    /// local?" test and the decision it leads to are one atomic step.
+    edges_deferred: Mutex<bool>,
 }
 
 impl Shared {
-    /// Executes a list of actions in order. A failed `Grab` aborts the switch: the core
-    /// is reset to Local, its recovery actions run instead, and the rest of the list
-    /// (`WarpCursor{centre}`, `SendControl(Enter)`) is dropped so the client never hears
-    /// of a switch that did not happen. A failed `Ungrab` is logged and the list
-    /// continues; `InputCapture::release`'s contract guarantees the pointer is still
-    /// warped back even when the underlying ungrab failed.
+    /// Executes a list of actions in order, then pushes any edge set that was deferred
+    /// while the core was remote.
+    ///
+    /// A failed `Grab` aborts the switch: the core is reset to Local, its recovery
+    /// actions run instead, and the rest of the list (`WarpCursor{centre}`,
+    /// `SendControl(Enter)`) is dropped so the client never hears of a switch that did
+    /// not happen. A failed `Ungrab` is logged and the list continues;
+    /// `InputCapture::release`'s contract guarantees the pointer is still warped back
+    /// even when the underlying ungrab failed.
     fn execute(&self, actions: Vec<Action>) {
+        self.run_actions(actions);
+        // Every return to local passes through here. The core has exactly four ways
+        // back — `client_disconnected`, `release_remote`, `abort_switch` and the
+        // leaving branch of `on_remote_event` — each answers the transition with a
+        // non-empty action list, and every one of those lists is executed here
+        // (`abort_switch`'s through the recursive call below). A deferred withdrawal
+        // therefore cannot be missed on any of them, which a guard placed on one path
+        // would not guarantee.
+        self.publish_deferred_edges();
+    }
+
+    fn run_actions(&self, actions: Vec<Action>) {
         if actions.is_empty() {
             return;
         }
@@ -130,6 +150,13 @@ impl Shared {
                     // locked; without this call nothing would ever ask it again, and
                     // on Wayland the compositor would go on capturing at an edge the
                     // core is now guaranteed to decline.
+                    //
+                    // While the core is remote this is *deferred* rather than done —
+                    // see `sync_edges`. The whole point of §7 is a lock taken on the
+                    // server screen that could otherwise never be undone; a lock taken
+                    // while the input is on the client is not that, and withdrawing
+                    // the barriers there would `Disable()` a capture the compositor is
+                    // actively running.
                     self.publish_edges();
                 }
             }
@@ -143,21 +170,66 @@ impl Shared {
     }
 
     /// Pushes the current edge set to the capture backend. Called whenever the set of
-    /// connected clients changes: barriers are declared only for edges that lead
-    /// somewhere (see `ServerCore::capture_edges`).
+    /// connected clients changes, and whenever the lock changes: barriers are declared
+    /// only for edges that lead somewhere (see `ServerCore::capture_edges`).
+    ///
+    /// Deferred to the return to local if the core is remote right now.
     ///
     /// Must never be called while a `core` lock guard is still held: the lock is taken
-    /// here just long enough to read the edge set, then dropped before the capture
+    /// inside just long enough to read the edge set, then dropped before the capture
     /// backend (a separate lock) is called into.
     fn publish_edges(&self) {
-        let edges: Vec<CaptureEdge> = self
-            .core
-            .lock()
-            .unwrap()
-            .capture_edges()
-            .into_iter()
-            .map(|(side, span)| CaptureEdge { side, span })
-            .collect();
+        self.sync_edges(false);
+    }
+
+    /// The other half of `publish_edges`: pushes the edge set only if a push was
+    /// deferred while the core was remote, and only once it is local again. Called at
+    /// the end of every `execute`.
+    fn publish_deferred_edges(&self) {
+        self.sync_edges(true);
+    }
+
+    /// Pushes the current edge set, unless the core is remote.
+    ///
+    /// The exclusion is the point. Declaring or withdrawing barriers is not a passive
+    /// bookkeeping call on every backend: under the InputCapture portal, an empty set
+    /// means `SetPointerBarriers([])` followed by `Disable()`, and the specification
+    /// lets the compositor answer a `Disable` during an active capture by ending it.
+    /// That would surface as `Deactivated` → `CaptureEnded` → `release_remote()`, so a
+    /// lock pressed while the pointer is on the client would dump the user back on the
+    /// server screen — where the core's own documented semantics (`ServerCore`'s
+    /// `lock_blocks_switching_and_leaving`: "only the datagram; no Leave while locked")
+    /// are to stay exactly where they are, as X11 and Windows do.
+    ///
+    /// Nothing is lost by waiting. A barrier only matters while local, because only a
+    /// local pointer can reach one; the deferred push happens on the way back, so a
+    /// lock that outlives the return still withdraws the barriers then.
+    ///
+    /// `only_deferred` is what distinguishes the end-of-`execute` call, which must do
+    /// nothing unless a push is actually outstanding, from a caller asking for a push
+    /// now.
+    fn sync_edges(&self, only_deferred: bool) {
+        let edges: Vec<CaptureEdge> = {
+            // `core` first, then `edges_deferred`, always in this order (the only place
+            // the two are held together). Taking both is what makes the state test and
+            // the flag update atomic: with two independent locks, a push deferred by
+            // one thread could land just after another thread had already checked the
+            // flag on its way back to local, and stay deferred until the next batch.
+            let core = self.core.lock().unwrap();
+            let mut deferred = self.edges_deferred.lock().unwrap();
+            if only_deferred && !*deferred {
+                return;
+            }
+            if !matches!(core.active(), Active::Local) {
+                *deferred = true;
+                return;
+            }
+            *deferred = false;
+            core.capture_edges()
+                .into_iter()
+                .map(|(side, span)| CaptureEdge { side, span })
+                .collect()
+        };
         self.capture_call(|c| c.set_edges(&edges));
     }
 }
@@ -253,6 +325,7 @@ pub async fn run_server(
         counters: Counters::default(),
         audio: audio_in,
         mic,
+        edges_deferred: Mutex::new(false),
     });
 
     // Binds the lock hotkey through the GlobalShortcuts portal on Wayland, where no
@@ -386,8 +459,8 @@ pub async fn run_server(
         let mut core = shared.core.lock().unwrap();
         let active = core.active();
         match active {
-            pheme_core::Active::Remote(n) => core.client_disconnected(&n),
-            pheme_core::Active::Local => Vec::new(),
+            Active::Remote(n) => core.client_disconnected(&n),
+            Active::Local => Vec::new(),
         }
     };
     shared.execute(actions);

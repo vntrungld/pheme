@@ -747,6 +747,19 @@ async fn locking_withdraws_the_edges_and_unlocking_puts_them_back() {
         inj: _,
     } = spawn_pair_with_hotkeys(Hotkeys { lock: Some(LOCK) });
     wait_connected(&cap).await;
+    // `wait_connected` proves the client is there by crossing the edge, which leaves
+    // the input on the client. Come back first: withdrawing the barriers is what a
+    // lock does on the *server* screen, and the lock taken while remote is the
+    // neighbouring test's subject, not this one's.
+    cap.push(CaptureEvent::MotionRel { dx: -20_000, dy: 0 });
+    assert!(
+        wait_until(
+            || cap.mode() == CaptureMode::Observe,
+            Duration::from_secs(5)
+        )
+        .await,
+        "never came back from the client"
+    );
     assert_eq!(
         cap.edge_calls().last().map(|c| c.len()),
         Some(1),
@@ -787,6 +800,99 @@ async fn locking_withdraws_the_edges_and_unlocking_puts_them_back() {
         .await,
         "unlocking did not put the edges back: {:?}",
         cap.edge_calls()
+    );
+
+    client.abort();
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn locking_while_remote_waits_for_the_return_before_withdrawing_the_edges() {
+    // The other half of spec §7. Withdrawing the barriers matters only while the
+    // pointer is local, because only a local pointer can reach one. Doing it while the
+    // input is on the client means `SetPointerBarriers([])` and `Disable()` against a
+    // capture the compositor is actively running, which it may answer by ending the
+    // capture -- dumping the user back on the server screen at the very moment the
+    // core's own rule (`lock_blocks_switching_and_leaving`) says to stay put.
+    //
+    // So: locking while remote changes nothing at the backend, and the withdrawal
+    // happens on the way back to local, for a lock that outlives the return.
+    const LOCK: KeyCode = KeyCode(0x47); // ScrollLock
+    let Pair {
+        server,
+        client,
+        shutdown_tx,
+        cap,
+        inj,
+    } = spawn_pair_with_hotkeys(Hotkeys { lock: Some(LOCK) });
+    wait_connected(&cap).await;
+    let before = cap.edge_calls();
+    assert_eq!(
+        before.last().map(|c| c.len()),
+        Some(1),
+        "the connected client's edge: {before:?}"
+    );
+
+    cap.push(CaptureEvent::Key {
+        code: LOCK,
+        down: true,
+    });
+    cap.push(CaptureEvent::Key {
+        code: LOCK,
+        down: false,
+    });
+    // A button pressed after the lock key. The router thread takes events from one
+    // channel in order and runs each event's actions before the next, so seeing this
+    // button arrive at the client means the lock's own actions have already run: the
+    // edge calls below are then a settled fact rather than a race.
+    cap.push(CaptureEvent::Button {
+        btn: pheme_proto::Button::Left,
+        down: true,
+    });
+    assert!(
+        wait_until(
+            || inj
+                .calls()
+                .contains(&InjectCall::Button(pheme_proto::Button::Left, true)),
+            Duration::from_secs(5)
+        )
+        .await,
+        "the button never reached the client, so the lock may not have been handled yet"
+    );
+    assert_eq!(
+        cap.edge_calls(),
+        before,
+        "locking while remote touched the barriers; on Wayland that is a Disable() \
+         against a running capture"
+    );
+    assert_eq!(
+        cap.mode(),
+        CaptureMode::Grab,
+        "the input must stay on the client while locked"
+    );
+
+    // The compositor ends the capture on its own (spec §4.3), which is one of the four
+    // ways back to local. The lock is still on, so the withdrawal deferred above is now
+    // due -- and this path never touches the lock, so only the deferral can deliver it.
+    cap.push(CaptureEvent::CaptureEnded);
+    assert!(
+        wait_until(
+            || cap.edge_calls().last().is_some_and(|c| c.is_empty()),
+            Duration::from_secs(5)
+        )
+        .await,
+        "the return to local did not withdraw the edges the lock had asked for: {:?}",
+        cap.edge_calls()
+    );
+    assert_eq!(
+        cap.mode(),
+        CaptureMode::Observe,
+        "back on the server screen"
     );
 
     client.abort();

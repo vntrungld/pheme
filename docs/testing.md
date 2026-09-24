@@ -144,7 +144,7 @@ Windows client, and again Wayland → Linux.
 | W9 | Restart the server: does the permission dialog appear again? (§15) | |
 | W10 | Run the same build in an X11 session — unchanged behaviour | |
 | W11 | 100 keystrokes across the edge, no stuck key; input RTT under 1 ms over cable | |
-| W12 | During an **active** capture on Wayland, press the configured lock hotkey once. It must toggle the lock exactly once, not twice | |
+| W12 | During an **active** capture on Wayland, press the configured lock hotkey once. It must toggle the lock exactly once, not twice — and the capture must keep running: the input stays on the client, and the barriers are withdrawn only once it is back on the server screen | |
 
 W4 is worded the way it is because the server handles **one** client at a
 time (see the README's limitations): a second client cannot be connected
