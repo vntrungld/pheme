@@ -38,6 +38,12 @@ This works on the compositors that implement the portal today —
 over XWayland; an X11 session on the same machine still uses the
 X11 backend, unchanged.
 
+KDE is verified: this backend was built and measured against it in a
+live session. GNOME implements the same portal through mutter, so it
+is expected to work, but it has not been run there — everything here
+was developed against KDE. Treat GNOME as untested rather than
+supported, and if you try it, a report of what happened is welcome.
+
 **Hyprland, Sway and other wlroots compositors do not implement the
 InputCapture portal**, so a machine running one of them cannot yet be
 a Wayland server; `pheme server` exits with an error naming the gap.
