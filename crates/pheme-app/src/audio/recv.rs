@@ -68,6 +68,25 @@ struct DemandGate<'a> {
     reset_requested: &'a AtomicBool,
 }
 
+/// Publishes `wanted` on `tx`, notifying receivers only if it actually changed.
+///
+/// `pump_in` calls this every `TICK` for as long as the backend reports `Wanted` or
+/// `Idle` past the linger, not only on the edges — but `watch::Sender::send` marks the
+/// channel changed on *every* call, even with an unchanged value. A receiver that reacts
+/// to `changed()` — `client.rs::session`'s `mic_wanted` arm resets the jitter buffer and
+/// resends `MicWanted` on every wakeup — would then fire on every tick for as long as a
+/// session stays connected, restarting the buffer roughly every 2 ms and discarding
+/// audio before it ever accumulates enough to play. `send_if_modified` is the difference
+/// between "this is still true" and "this became true", and only the latter is a demand
+/// change worth waking anyone for.
+fn set_wanted(tx: &watch::Sender<bool>, wanted: bool) {
+    let _ = tx.send_if_modified(|w| {
+        let changed = *w != wanted;
+        *w = wanted;
+        changed
+    });
+}
+
 /// Cumulative counters; the stats line reports the difference per interval.
 #[derive(Default)]
 pub struct InStats {
@@ -411,12 +430,12 @@ fn pump_in(
                     idle_since = Some(Instant::now());
                 }
                 if idle_since.is_some_and(|t| t.elapsed() >= gate.linger) {
-                    let _ = gate.wanted_tx.send(false);
+                    set_wanted(gate.wanted_tx, false);
                 }
             }
             Demand::Wanted | Demand::Unknown => {
                 idle_since = None;
-                let _ = gate.wanted_tx.send(true);
+                set_wanted(gate.wanted_tx, true);
             }
         }
         publish(stats, jitter.stats());
