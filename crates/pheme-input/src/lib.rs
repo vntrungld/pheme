@@ -53,6 +53,17 @@ pub trait InputCapture: Send {
     /// unchanged.
     fn set_mode(&mut self, mode: CaptureMode) -> Result<()>;
     fn warp_cursor(&mut self, x: i32, y: i32) -> Result<()>;
+    /// Stops capturing and places the pointer at (x, y).
+    ///
+    /// **Synchronous**, under the same contract as `set_mode`: returns only once the
+    /// backend has applied the change or failed to, with a 1 s internal timeout mapped
+    /// to `Error::Backend("mode change timed out")`.
+    ///
+    /// A backend that implements this as an ungrab followed by a warp must attempt the
+    /// warp **even when the ungrab fails**, and report the first error. The caller logs
+    /// the error and continues, and a pointer left outside the screen because an ungrab
+    /// failed is worse than a pointer that came back under a stale grab.
+    fn release(&mut self, x: i32, y: i32) -> Result<()>;
     fn screens(&self) -> Vec<ScreenInfo>;
     /// Stops the backend thread.
     ///

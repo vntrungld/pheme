@@ -164,6 +164,15 @@ impl InputCapture for X11Capture {
         self.screens.clone()
     }
 
+    /// Ungrab, then warp. Both are attempted even if the first fails: the previous
+    /// `Ungrab` + `WarpCursor` pair kept going after a failed ungrab, and dropping the
+    /// warp would leave the pointer wherever the grab had parked it.
+    fn release(&mut self, x: i32, y: i32) -> Result<()> {
+        let ungrab = self.set_mode(CaptureMode::Observe);
+        let warp = self.warp_cursor(x, y);
+        ungrab.and(warp)
+    }
+
     fn stop(&mut self) {
         let _ = self.cmd_tx.send(Cmd::Stop);
         match self.wake() {

@@ -16,6 +16,8 @@ struct CaptureState {
     warps: Vec<((i32, i32), CaptureMode)>,
     /// When set, the next `set_mode(Grab)` fails once (and clears this).
     fail_next_grab: bool,
+    /// When set, the next `set_mode(Observe)` fails once (and clears this).
+    fail_next_ungrab: bool,
 }
 
 impl CaptureState {
@@ -81,6 +83,12 @@ impl MockCaptureHandle {
         self.state.lock().unwrap().fail_next_grab = true;
     }
 
+    /// Makes the next `set_mode(Observe)` fail with `Error::Backend("mock ungrab
+    /// failure")`, leaving the mode unchanged; the flag is cleared by that failing call.
+    pub fn fail_next_ungrab(&self) {
+        self.state.lock().unwrap().fail_next_ungrab = true;
+    }
+
     /// Simulates the backend thread dying: drops the event `Sender` so the receiver
     /// observes disconnection, as a real backend's event loop exiting would.
     pub fn disconnect(&self) {
@@ -99,6 +107,9 @@ impl InputCapture for MockCapture {
         if mode == CaptureMode::Grab && std::mem::take(&mut st.fail_next_grab) {
             return Err(Error::Backend("mock grab failure".into()));
         }
+        if mode == CaptureMode::Observe && std::mem::take(&mut st.fail_next_ungrab) {
+            return Err(Error::Backend("mock ungrab failure".into()));
+        }
         st.mode = Some(mode);
         Ok(())
     }
@@ -116,6 +127,12 @@ impl InputCapture for MockCapture {
 
     fn stop(&mut self) {
         self.state.lock().unwrap().tx = None;
+    }
+
+    fn release(&mut self, x: i32, y: i32) -> Result<()> {
+        let mode = self.set_mode(CaptureMode::Observe);
+        let warp = self.warp_cursor(x, y);
+        mode.and(warp)
     }
 }
 
@@ -262,6 +279,34 @@ mod tests {
                 ((2, 2), CaptureMode::Grab),
                 ((3, 3), CaptureMode::Observe),
             ]
+        );
+    }
+
+    #[test]
+    fn release_observes_and_warps() {
+        let (mut cap, handle) = MockCapture::new(screens());
+        cap.set_mode(CaptureMode::Grab).unwrap();
+        cap.release(7, 8).unwrap();
+        assert_eq!(handle.mode(), CaptureMode::Observe);
+        assert_eq!(
+            handle.warps_with_mode(),
+            vec![((7, 8), CaptureMode::Observe)],
+            "the warp must be recorded after the mode drops, or a real backend would \
+             still be clipping the pointer when it warps"
+        );
+    }
+
+    #[test]
+    fn a_failed_ungrab_still_warps() {
+        let (mut cap, handle) = MockCapture::new(screens());
+        cap.set_mode(CaptureMode::Grab).unwrap();
+        handle.fail_next_ungrab();
+        let r = cap.release(7, 8);
+        assert!(r.is_err(), "the error must still be reported");
+        assert_eq!(
+            handle.warps(),
+            vec![(7, 8)],
+            "dropping the warp when the ungrab fails strands the pointer off-screen"
         );
     }
 

@@ -41,8 +41,18 @@ pub enum Action {
     SendControl(Msg),
     SendDatagram(Msg),
     Grab,
-    Ungrab,
-    WarpCursor { x: i32, y: i32 },
+    /// Stop capturing and put the pointer at (x, y). The position is part of the
+    /// action because it always was: every `Ungrab` was followed by a `WarpCursor`
+    /// with these exact coordinates, and a backend that releases by naming a
+    /// position (the InputCapture portal) cannot depend on that pairing silently.
+    Ungrab {
+        x: i32,
+        y: i32,
+    },
+    WarpCursor {
+        x: i32,
+        y: i32,
+    },
     SetLocked(bool),
 }
 
@@ -115,7 +125,7 @@ impl ServerCore {
                 self.remote = None;
                 let (x, y) = self.server.center();
                 self.last_pos = Some((x, y));
-                vec![Action::Ungrab, Action::WarpCursor { x, y }]
+                vec![Action::Ungrab { x, y }]
             }
             _ => Vec::new(),
         }
@@ -241,8 +251,7 @@ impl ServerCore {
                     let seq = self.next_seq();
                     actions.insert(0, Action::SendControl(Msg::Leave { seq }));
                     actions.truncate(1);
-                    actions.push(Action::Ungrab);
-                    actions.push(Action::WarpCursor { x, y });
+                    actions.push(Action::Ungrab { x, y });
                 } else {
                     r.vx = r.vx.clamp(0, r.client.w - 1);
                     r.vy = r.vy.clamp(0, r.client.h - 1);
@@ -405,8 +414,7 @@ mod tests {
         // cross back through the client's left edge at vy = 0 → server (1918, 0)
         let a = c.on_event(CaptureEvent::MotionRel { dx: -20, dy: 0 });
         assert!(matches!(a[0], Action::SendControl(Msg::Leave { .. })));
-        assert!(matches!(a[1], Action::Ungrab));
-        assert!(matches!(a[2], Action::WarpCursor { x: 1918, y: 0 }));
+        assert!(matches!(a[1], Action::Ungrab { x: 1918, y: 0 }));
         assert_eq!(c.active(), Active::Local);
         // the warp point counts as the previous position, so the next edge hit is a fresh crossing
         let a = c.on_event(CaptureEvent::MotionAbs { x: 1919, y: 0 });
@@ -501,10 +509,7 @@ mod tests {
         let mut c = core(Side::Right, (0.0, 1.0));
         enter_right(&mut c);
         let a = c.client_disconnected("lap");
-        assert!(matches!(
-            a[..],
-            [Action::Ungrab, Action::WarpCursor { x: 960, y: 540 }]
-        ));
+        assert!(matches!(a[..], [Action::Ungrab { x: 960, y: 540 }]));
         assert_eq!(c.active(), Active::Local);
         assert!(enter_right(&mut c).is_empty(), "client is gone");
     }
@@ -523,6 +528,30 @@ mod tests {
         assert!(matches!(a[0], Action::Grab));
         assert!(has_enter(&a).is_some());
         assert_eq!(c.active(), Active::Remote("lap".into()));
+    }
+
+    #[test]
+    fn leaving_a_client_ungrabs_at_the_reentry_point() {
+        let mut c = core(Side::Right, (0.0, 1.0));
+        enter_right(&mut c); // virtual position (0, 250), entered at server y = 540
+                             // Walk back past the client's left edge without moving vertically, so the
+                             // re-entry point stays at server y = 540.
+        let actions = c.on_event(CaptureEvent::MotionRel { dx: -5000, dy: 0 });
+        let ungrab = actions
+            .iter()
+            .find_map(|a| match a {
+                Action::Ungrab { x, y } => Some((*x, *y)),
+                _ => None,
+            })
+            .expect("leaving a client must ungrab");
+        // The ungrab carries the re-entry point itself, not a separate WarpCursor.
+        assert_eq!(ungrab, (1918, 540));
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::WarpCursor { .. })),
+            "the position travels on Ungrab now: {actions:?}"
+        );
     }
 
     #[test]
@@ -574,7 +603,7 @@ mod props {
                 for a in core.on_event(e) {
                     match a {
                         Action::Grab => { prop_assert!(!grabbed); grabbed = true; }
-                        Action::Ungrab => { prop_assert!(grabbed); grabbed = false; }
+                        Action::Ungrab { .. } => { prop_assert!(grabbed); grabbed = false; }
                         _ => {}
                     }
                 }

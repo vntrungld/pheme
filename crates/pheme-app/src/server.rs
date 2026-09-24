@@ -68,8 +68,9 @@ impl Shared {
     /// Executes a list of actions in order. A failed `Grab` aborts the switch: the core
     /// is reset to Local, its recovery actions run instead, and the rest of the list
     /// (`WarpCursor{centre}`, `SendControl(Enter)`) is dropped so the client never hears
-    /// of a switch that did not happen. A failed `Ungrab` is logged and the list continues
-    /// (the pointer is still warped back).
+    /// of a switch that did not happen. A failed `Ungrab` is logged and the list
+    /// continues; `InputCapture::release`'s contract guarantees the pointer is still
+    /// warped back even when the underlying ungrab failed.
     fn execute(&self, actions: Vec<Action>) {
         if actions.is_empty() {
             return;
@@ -98,7 +99,7 @@ impl Shared {
                         self.counters.datagrams_sent.fetch_add(1, Ordering::Relaxed);
                     }
                 }
-                Action::Ungrab => self.capture_call(|c| c.set_mode(CaptureMode::Observe)),
+                Action::Ungrab { x, y } => self.capture_call(|c| c.release(x, y)),
                 Action::WarpCursor { x, y } => self.capture_call(|c| c.warp_cursor(x, y)),
                 Action::SetLocked(locked) => info!(locked, "input lock toggled"),
             }
