@@ -287,7 +287,7 @@ fn in_thread(
     loop {
         // Between backends nothing can be playing to anyone, so the gate is shut: before
         // a backend is built, after one stops, and on every return below.
-        let _ = wanted_tx.send(false);
+        set_wanted(&wanted_tx, false);
         if stop.load(Ordering::SeqCst) {
             return;
         }
@@ -328,7 +328,7 @@ fn in_thread(
         };
         let end = pump_in(backend.as_ref(), producer, &rx, &stop, &stats, rate, &gate);
         backend.stop();
-        let _ = wanted_tx.send(false);
+        set_wanted(&wanted_tx, false);
         match end {
             PumpEnd::Stopped => return,
             // `pump_in` has no gate of its own to close; the enum is shared with
@@ -877,6 +877,51 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
             assert!(*w.borrow(), "the microphone must not flap");
         }
+        audio.stop();
+    }
+
+    #[test]
+    fn steady_demand_notifies_the_gate_only_once() {
+        // Regression for the bug task 16's end-to-end tests found: `pump_in` used to
+        // call `wanted_tx.send(true)` unconditionally every `TICK`, and `watch::Sender
+        // ::send` marks a channel changed on *every* call, even an unchanged value. A
+        // consumer that reacts to `changed()` — `client.rs::session`'s `mic_wanted` arm
+        // — woke on every tick for as long as demand held steady, resetting the jitter
+        // buffer roughly every 2 ms and discarding audio before it ever accumulated
+        // enough to play. Every other test in this file only ever reads `*w.borrow()`,
+        // a snapshot, which cannot see this: it is the repeated *notification* that is
+        // the defect, not the value. This test reacts to `changed()` the way a real
+        // consumer does, so reverting `set_wanted` to a plain `send` turns it red.
+        let (play, handle) = MockPlayback::new(48_000);
+        handle.set_demand(Demand::Wanted);
+        let stats = Arc::new(InStats::default());
+        let mut audio = RecvSide::spawn_with_linger(
+            PlaybackSource::Backend(Box::new(play)),
+            stats,
+            FAST_LINGER,
+        );
+        let mut w = audio.wanted();
+        assert!(
+            wait_until(|| *w.borrow(), SETTLE),
+            "the gate must open once"
+        );
+        // The gate's one real transition (false -> true) has already happened; catch up
+        // to it so only *further* notifications are counted below.
+        w.borrow_and_update();
+
+        let mut extra_changes = 0;
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(2));
+            if w.has_changed().unwrap_or(false) {
+                extra_changes += 1;
+                w.borrow_and_update();
+            }
+        }
+        assert_eq!(
+            extra_changes, 0,
+            "demand held steady at Wanted but the gate notified {extra_changes} more \
+             times over ~100 ticks; each one resets a live session's jitter buffer"
+        );
         audio.stop();
     }
 
