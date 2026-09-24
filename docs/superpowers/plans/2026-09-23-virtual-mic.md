@@ -1139,10 +1139,19 @@ Move `FailureLog` (with its doc comment verbatim) and `nap` into `mod.rs` and ma
 impl SendSide {
     /// `stream` tags every datagram this side sends: `Playback` on a client, `Mic` on a
     /// server. It is the only thing that distinguishes the two directions here.
+    ///
+    /// `wanted` is the gate's initial state, applied *before* the worker thread exists.
+    /// It is a parameter rather than something the caller corrects after `spawn` returns
+    /// because there is no happens-before relationship between a spawned thread's first
+    /// read and a later store by the parent: a side created open and closed a moment
+    /// afterwards can still have opened its device, which for a microphone means its
+    /// indicator lights at every server start. The client's speaker capture passes true;
+    /// the server's microphone passes false and waits to be asked.
     pub fn spawn(
         source: CaptureSource,
         stream: AudioStream,
         counters: Arc<OutCounters>,
+        wanted: bool,
     ) -> SendSide {
         // …as `AudioOut::spawn`, passing `stream` through to `out_thread`…
     }
@@ -1311,7 +1320,7 @@ Nothing in the suite bounds the amplitude of what comes out, so a regression in 
 In `crates/pheme-app/src/client.rs`: `use crate::audio::{CaptureSource, OutCounters, SendSide};`, the field type becomes `SendSide`, and construction becomes
 
 ```rust
-    let mut audio = SendSide::spawn(audio, AudioStream::Playback, counters.clone());
+    let mut audio = SendSide::spawn(audio, AudioStream::Playback, counters.clone(), true);
 ```
 
 with `AudioStream` added to the `pheme_proto` import. The `session` parameter `audio: &AudioOut` becomes `audio: &SendSide`.
@@ -3411,10 +3420,10 @@ in `out_thread`, which already receives `stream` from Task 6. No new variant is 
 
 ```rust
     let mic_counters = mic_counters.unwrap_or_default();
-    let mic = SendSide::spawn(mic, AudioStream::Mic, mic_counters.clone());
-    // Closed until a client says something is recording. A server with no client has no
-    // consumer, so there is nothing for an open microphone to be open for.
-    mic.set_wanted(false);
+    // Closed from the moment it exists, not closed a moment after being created open: a
+    // server with no client has no consumer, and a microphone that opens even briefly at
+    // every start defeats the point of the gate.
+    let mic = SendSide::spawn(mic, AudioStream::Mic, mic_counters.clone(), false);
 ```
 
 and the routing helper beside it:
