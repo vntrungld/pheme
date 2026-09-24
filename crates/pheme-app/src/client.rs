@@ -260,6 +260,9 @@ async fn session(
     let mut ping_seq = 0u64;
     let mut received = 0u64;
     let mut lost = 0u64;
+    // Shadow of the peer's monotonic count of audio frames the transport dropped, so the
+    // stats line can report the change since the last one rather than a lifetime total.
+    let mut last_mic_channel_dropped = 0u64;
     let mut last_seq: Option<u32> = None;
     let result = loop {
         tokio::select! {
@@ -322,6 +325,10 @@ async fn session(
                 let sent = counters.sent.swap(0, Ordering::Relaxed);
                 let suppressed = counters.suppressed.swap(0, Ordering::Relaxed);
                 let m = mic_stats.snapshot_delta();
+                let total_mic_channel_dropped = peer.audio_dropped();
+                let mic_channel_dropped =
+                    total_mic_channel_dropped.saturating_sub(last_mic_channel_dropped);
+                last_mic_channel_dropped = total_mic_channel_dropped;
                 info!(
                     rtt_us = peer.rtt().as_micros(),
                     received,
@@ -334,11 +341,11 @@ async fn session(
                     mic_late = m.late,
                     mic_resets = m.resets,
                     mic_dropped = m.dropped,
-                    // Cumulative for this session, unlike the deltas around it: frames
-                    // the transport dropped because the audio channel was full. That
-                    // loss never reaches the jitter buffer, so no counter beside it can
-                    // account for the gap the listener hears. Spec §2.5.
-                    mic_channel_dropped = peer.audio_dropped(),
+                    // Its own field, not folded into `mic_dropped`: a frame the
+                    // transport drops never reaches the jitter buffer, so no counter
+                    // beside it can account for the gap the listener hears. Spec §2.5.
+                    // Differenced like the rest of the line, which is per second.
+                    mic_channel_dropped,
                     mic_overflows = m.overflows,
                     active = core.active(),
                     "stats/s"
