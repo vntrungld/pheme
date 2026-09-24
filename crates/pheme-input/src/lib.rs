@@ -108,10 +108,43 @@ pub trait InputInject: Send {
     fn screens(&self) -> Vec<ScreenInfo>;
 }
 
+/// True when these values describe a Wayland session.
+///
+/// Takes the two values instead of reading the environment itself, so the decision
+/// is a pure function and its test needs no process-wide mutation. Every
+/// `cargo test` binary is multithreaded and `std::env::set_var` is unsound there —
+/// which is why the 2024 edition made it `unsafe`.
+///
+/// This is checked **before** X11. A Wayland session also sets `DISPLAY` for
+/// XWayland, so an X11 connection succeeds, XInput2 and XTest install without
+/// error, and the backend then captures nothing but XWayland clients. Nothing at
+/// any layer reports it.
+#[cfg(target_os = "linux")]
+fn is_wayland(wayland_display: Option<&std::ffi::OsStr>, session_type: Option<&str>) -> bool {
+    wayland_display.is_some() || session_type.is_some_and(|v| v.eq_ignore_ascii_case("wayland"))
+}
+
 /// Picks the capture backend for this OS and session.
 pub fn detect_capture() -> Result<Box<dyn InputCapture>> {
     #[cfg(target_os = "linux")]
     {
+        let session_type = std::env::var("XDG_SESSION_TYPE").ok();
+        if is_wayland(
+            std::env::var_os("WAYLAND_DISPLAY").as_deref(),
+            session_type.as_deref(),
+        ) {
+            return portal::PortalCapture::new()
+                .map(|c| Box::new(c) as Box<dyn InputCapture>)
+                .map_err(|e| match e {
+                    Error::Backend(m) | Error::Unsupported(m) => Error::Unsupported(format!(
+                        "Wayland capture needs a compositor that implements the InputCapture \
+                         portal (KDE, GNOME): {m}. wlroots compositors such as Hyprland and \
+                         Sway are not supported yet; this machine can still be used as a \
+                         client."
+                    )),
+                    other => other,
+                });
+        }
         linux_x11::X11Capture::new().map(|c| Box::new(c) as Box<dyn InputCapture>)
     }
     #[cfg(target_os = "windows")]
@@ -137,5 +170,36 @@ pub fn detect_inject() -> Result<Box<dyn InputInject>> {
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         Err(Error::Unsupported("not yet implemented".into()))
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod selection_tests {
+    use std::ffi::OsStr;
+
+    #[test]
+    fn a_wayland_session_is_detected_even_when_x11_is_also_available() {
+        // Under XWayland both are set. Checking X11 first would connect happily and
+        // then capture nothing but XWayland clients, with no error anywhere.
+        assert!(super::is_wayland(Some(OsStr::new("wayland-0")), None));
+        assert!(super::is_wayland(
+            Some(OsStr::new("wayland-0")),
+            Some("x11")
+        ));
+    }
+
+    #[test]
+    fn the_session_type_alone_is_enough() {
+        assert!(super::is_wayland(None, Some("wayland")));
+        assert!(
+            super::is_wayland(None, Some("Wayland")),
+            "the comparison ignores case"
+        );
+    }
+
+    #[test]
+    fn an_x11_session_is_not_mistaken_for_wayland() {
+        assert!(!super::is_wayland(None, Some("x11")));
+        assert!(!super::is_wayland(None, None));
     }
 }

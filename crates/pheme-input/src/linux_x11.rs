@@ -50,11 +50,6 @@ fn be(e: impl std::fmt::Display) -> Error {
 
 impl X11Capture {
     pub fn new() -> Result<X11Capture> {
-        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-            return Err(Error::Unsupported(
-                "Wayland capture is not supported yet (sub-project 4); use an X11 session or run this machine as a client".into(),
-            ));
-        }
         let (ctl, screen_num) = x11rb::connect(None).map_err(be)?;
         let root = ctl.setup().roots[screen_num].root;
         let screens = x11_screens(&ctl, root)?;

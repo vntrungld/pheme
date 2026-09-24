@@ -27,15 +27,17 @@ use crate::{CaptureEdge, Error, Result};
 /// Commands the backend thread accepts. Each carries an acknowledgement channel, so
 /// the trait's synchronous contract is met by waiting for the thread to answer.
 ///
-/// `run` matches on all three, but only Task 9's `PortalCapture` ever builds one,
-/// so until then they are "never constructed".
-#[allow(dead_code)]
+/// The acknowledgement travels on `std::sync::mpsc`, not `async_channel`: the
+/// trait's contract needs a *timed* receive, which `std::sync::mpsc::Receiver`
+/// has natively (`recv_timeout`) and `async_channel` 2.x does not expose. The
+/// command direction stays on `async_channel` because the loop below awaits it
+/// inside the executor alongside the portal and libei streams.
 pub(crate) enum Cmd {
-    SetEdges(Vec<CaptureEdge>, async_channel::Sender<Result<()>>),
+    SetEdges(Vec<CaptureEdge>, std::sync::mpsc::Sender<Result<()>>),
     Release {
         x: i32,
         y: i32,
-        ack: async_channel::Sender<Result<()>>,
+        ack: std::sync::mpsc::Sender<Result<()>>,
     },
     Stop,
 }
@@ -334,10 +336,6 @@ async fn next_portal(
 /// `ConnectToEIS`, the libei handshake runs here, the signal subscriptions go up
 /// before anything can be missed, and only then does `set_barriers` — the one
 /// call that ever reaches `Enable` — arm the session.
-// Task 9 adds the caller: `PortalCapture::start` spawns this on its own thread.
-// Until then nothing in the crate reaches it, and every item it uses would be
-// reported dead with it.
-#[allow(dead_code)]
 pub(crate) async fn run(
     tx: EventSender<CaptureEvent>,
     cmds: async_channel::Receiver<Cmd>,
@@ -466,14 +464,16 @@ pub(crate) async fn run(
                 if let Err(e) = &r {
                     error!("declaring the new edges failed: {e}");
                 }
-                let _ = ack.send(r).await;
+                // A caller that timed out and dropped its receiver is not an
+                // error here; there is nobody left to tell.
+                let _ = ack.send(r);
             }
             Step::Cmd(Some(Cmd::Release { x, y, ack })) => {
                 let r = release_capture(&mut sess, &mut held, &tx, x, y).await;
                 if let Err(e) = &r {
                     error!("releasing the capture failed: {e}");
                 }
-                let _ = ack.send(r).await;
+                let _ = ack.send(r);
             }
             Step::Portal(PortalEvent::Activated {
                 id,
