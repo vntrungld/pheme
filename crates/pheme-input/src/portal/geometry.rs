@@ -57,12 +57,26 @@ fn union(zones: &[Zone]) -> Option<(i32, i32, i32, i32)> {
 /// Maps capture edges onto portal barriers, splitting each edge across the zones that
 /// touch it. Returns barriers with ids starting at 1; the order is stable so tests can
 /// name positions.
+///
+/// The "union" computed here is deliberately the same bounding box
+/// `pheme_core::Rect::bounds` gives the core, not the true union of the zones' pixels.
+/// On a staggered layout — a 1920x1080 laptop at (0, 0) beside a 2560x1440 monitor at
+/// (1920, 0) — the laptop's own bottom edge at y = 1079 lies *inside* that bounding box,
+/// so it gets no barrier here, and that is intentional: `pheme_core`'s `on_edge` also
+/// recognises switch edges only against the bounding box. A barrier at y = 1079 would
+/// let the compositor capture the pointer at a spot the core does not treat as an edge,
+/// so the crossing would go nowhere — the pointer would simply stop working there. Spans
+/// are resolved against this same bounding box for the same reason (`edge_segment`
+/// resolves them the same way), keeping the two consistent by construction. Widening
+/// this to the true per-zone union needs `pheme_core`'s geometry widened first, since
+/// both `Rect::bounds` and `on_edge` would need it, and the X11 backend has the
+/// identical bounding-box limitation today.
 pub fn barriers(zones: &[Zone], edges: &[CaptureEdge]) -> Vec<PortalBarrier> {
     let Some((ux0, uy0, ux1, uy1)) = union(zones) else {
         return Vec::new();
     };
     let mut out = Vec::new();
-    let mut next_id = 1u32;
+    let mut next_id = NonZeroU32::MIN;
     for e in edges {
         let vertical = matches!(e.side, Side::Left | Side::Right);
         // The fixed coordinate of this edge, and the span of the union along it.
@@ -99,10 +113,10 @@ pub fn barriers(zones: &[Zone], edges: &[CaptureEdge]) -> Vec<PortalBarrier> {
             if hi <= lo {
                 continue;
             }
-            let Some(id) = NonZeroU32::new(next_id) else {
-                continue;
-            };
-            next_id += 1;
+            let id = next_id;
+            next_id = next_id
+                .checked_add(1)
+                .expect("fewer than u32::MAX barriers are ever produced");
             // `hi` is exclusive; the barrier's far end is the last pixel (rule 1).
             out.push(if vertical {
                 PortalBarrier {
@@ -180,14 +194,17 @@ mod tests {
     #[test]
     fn a_horizontal_edge_stops_at_the_last_pixel_along_it() {
         let b = barriers(&one_screen(), &[edge(Side::Bottom)]);
+        assert_eq!(b.len(), 1);
         assert_eq!((b[0].x1, b[0].y1, b[0].x2, b[0].y2), (0, 1440, 2559, 1440));
     }
 
     #[test]
     fn the_near_edges_sit_at_the_origin() {
         let l = barriers(&one_screen(), &[edge(Side::Left)]);
+        assert_eq!(l.len(), 1);
         assert_eq!((l[0].x1, l[0].y1, l[0].x2, l[0].y2), (0, 0, 0, 1439));
         let t = barriers(&one_screen(), &[edge(Side::Top)]);
+        assert_eq!(t.len(), 1);
         assert_eq!((t[0].x1, t[0].y1, t[0].x2, t[0].y2), (0, 0, 2559, 0));
     }
 
@@ -217,6 +234,7 @@ mod tests {
             span: (0.25, 0.75),
         };
         let b = barriers(&one_screen(), &[e]);
+        assert_eq!(b.len(), 1);
         assert_eq!(
             (b[0].x1, b[0].y1, b[0].x2, b[0].y2),
             (2560, 360, 2560, 1079)
