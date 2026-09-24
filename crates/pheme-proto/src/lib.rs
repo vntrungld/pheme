@@ -2,6 +2,17 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The wire protocol both ends must agree on.
+///
+/// A known limitation of the handshake, recorded here rather than left to be
+/// rediscovered: postcard decodes a message whole, so adding a field to `Msg::Hello`
+/// changes its encoding and a `Hello` from a peer at an older version now fails to
+/// **decode** before its `version` field can be read. The mismatch is therefore reported
+/// as a malformed handshake ("first message was not Hello") rather than as a clean
+/// protocol-version mismatch. Both ends are built from the same tree and nothing is
+/// released, so this costs nothing in practice; restructuring the handshake so the
+/// version survives an encoding change is not worth doing for a pre-release protocol.
+/// See §2.4 of the sub-project 3 spec.
 pub const PROTOCOL_VERSION: u16 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
