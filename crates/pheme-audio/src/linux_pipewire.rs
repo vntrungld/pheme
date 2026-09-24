@@ -635,6 +635,15 @@ impl PipewireVirtualSource {
 impl AudioPlayback for PipewireVirtualSource {
     fn start(&mut self, source: rtrb::Consumer<i16>) -> Result<()> {
         init();
+        // A node that has just been created provably has no consumers yet, and the state
+        // listener only starts reporting once the main loop is dispatching — after
+        // `start` returns. Left at `Unknown`, the first demand polls would read "wanted",
+        // publish it, and the `Idle` arriving milliseconds later would then have to wait
+        // out the full linger: the server's microphone would open, and its indicator
+        // light, at every session start with nothing recording. That is the exact
+        // symptom this feature exists to remove. §3.1's rule protects against *failing
+        // to know*; this is knowing the answer is no, the same justification `stop` uses.
+        self.demand.store(DEMAND_IDLE, Ordering::SeqCst);
         let (cmd_tx, cmd_rx) = pw::channel::channel::<Cmd>();
         let demand = self.demand.clone();
         let node = self.node.clone();
