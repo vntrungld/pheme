@@ -405,6 +405,7 @@ mod tests {
     use pheme_audio::pack::Packer;
     use pheme_audio::FRAME_US;
     use std::time::Duration;
+    use std::time::Instant;
 
     /// The tone's amplitude, measured robustly.
     ///
@@ -782,21 +783,35 @@ mod tests {
         );
         assert!(wait_until(|| handle.started(), SETTLE));
 
-        // Drive the device clock as well as the sender. Without a drain the worker fills
-        // the ring with prefill silence, stops popping, and never reports a depth at all
-        // — the pipeline stalls while the test still looks like it is running one.
+        // Keep frames flowing until the worker reports a buffered depth, and keep
+        // draining so it never stalls. Two races have bitten this test, and they pull in
+        // opposite directions. Without a drain the worker fills the ring with prefill
+        // silence, stops popping and never reports a depth at all. And once the sender
+        // stops, the worker drains the buffer and `pop` records zero again — so checking
+        // the depth *after* the loop races a window that may already have shut. Pushing
+        // for as long as we wait keeps that window open, which is why the deadline is on
+        // the loop rather than on a `wait_until` after it.
         let mut packer = Packer::new();
-        for i in 0..40 {
+        let mut saw_depth = false;
+        let deadline = Instant::now() + SETTLE;
+        let mut i = 0usize;
+        while Instant::now() < deadline {
             let f = packer
                 .push(&sine_frame(i), i as u64 * FRAME_US)
                 .expect("a sine is never silent");
             audio.push(f);
             handle.drain_frames(1);
+            if stats.depth_ms.load(Ordering::Relaxed) > 0 {
+                saw_depth = true;
+                break;
+            }
+            i += 1;
+            std::thread::sleep(Duration::from_millis(1));
         }
-        assert!(wait_until(
-            || stats.depth_ms.load(Ordering::Relaxed) > 0,
-            SETTLE
-        ));
+        assert!(
+            saw_depth,
+            "the worker never reported a buffered depth, so it never popped a frame"
+        );
 
         let before = stats.resets.load(Ordering::Relaxed);
         audio.reset();
