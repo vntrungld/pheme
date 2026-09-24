@@ -124,15 +124,14 @@ fn is_wayland(wayland_display: Option<&std::ffi::OsStr>, session_type: Option<&s
     wayland_display.is_some() || session_type.is_some_and(|v| v.eq_ignore_ascii_case("wayland"))
 }
 
-/// True when this process is running in a Wayland session, using the same pure
-/// predicate and environment reads `detect_capture()` uses to choose the portal
-/// backend over X11.
+/// True when this process is running in a Wayland session.
 ///
-/// Callers that need to decide whether a Wayland-only mechanism applies -- such as
-/// `pheme-app` binding the lock hotkey through the GlobalShortcuts portal -- use
-/// this rather than re-reading `WAYLAND_DISPLAY`/`XDG_SESSION_TYPE` themselves, so
-/// the two decisions cannot disagree. Always `false` off Linux: there is no
-/// Wayland session to detect, and no environment is read.
+/// The only place that reads `WAYLAND_DISPLAY`/`XDG_SESSION_TYPE`: `detect_capture()`
+/// calls this rather than reading them itself, and so does every other caller that
+/// needs to decide whether a Wayland-only mechanism applies -- such as `pheme-app`
+/// binding the lock hotkey through the GlobalShortcuts portal -- so the decisions
+/// cannot disagree. Always `false` off Linux: there is no Wayland session to
+/// detect, and no environment is read.
 pub fn is_wayland_session() -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -151,11 +150,7 @@ pub fn is_wayland_session() -> bool {
 pub fn detect_capture() -> Result<Box<dyn InputCapture>> {
     #[cfg(target_os = "linux")]
     {
-        let session_type = std::env::var("XDG_SESSION_TYPE").ok();
-        if is_wayland(
-            std::env::var_os("WAYLAND_DISPLAY").as_deref(),
-            session_type.as_deref(),
-        ) {
+        if is_wayland_session() {
             // `new()`'s only failure path is `wayland_screens()`, which every
             // Wayland compositor gets right whether or not it has the
             // InputCapture portal -- so a missing-portal failure almost never
