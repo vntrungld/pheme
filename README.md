@@ -1,8 +1,7 @@
 # Pheme
 
 Share one machine's keyboard and mouse with another over the LAN, Deskflow-style,
-with audio forwarded from the client to the server (the reverse direction is
-planned). Written in Rust. GPL-3.0.
+with audio forwarded in both directions. Written in Rust. GPL-3.0.
 
 Status: early development — see `docs/superpowers/specs/` for the design.
 
@@ -81,6 +80,44 @@ On Linux the value is a PipeWire node name — `pactl list sinks short` prints
 them. On Windows it is the device's name as shown in the sound settings, or any
 part of it that only one device matches.
 
+### The server's microphone on the client
+
+The microphone attached to the **server** appears on the **client** as an ordinary
+recording device, so a call or a recording running on the client uses the microphone
+you are actually sitting in front of.
+
+On a Linux client it appears as `pheme-mic` in `pactl list sources short`, described as
+"Pheme Mic" in sound settings and `pavucontrol`. Select it wherever you would pick a
+microphone.
+
+**The server's microphone is opened only while something is recording.** There is
+nothing to switch on: when an application on the client opens Pheme Mic, the server
+opens its microphone; about three seconds after the last one closes, the server closes
+it again. Until then the device is not held open and its indicator light stays off.
+
+```toml
+[audio]
+mic_device = "alsa_input.usb-Blue_Yeti-00.mono-fallback"
+```
+
+Set `mic_device` under `[audio]` on the server to choose a microphone other than the
+system default — `pactl list sources short` on the server prints the names, and on
+Windows it is the device's name as shown in the sound settings, the same matching
+rules as `capture_device` and `playback_device` above. There is no separate
+client-side setting for a virtual microphone: a Windows client does not have one (see
+below), and a Linux client always exposes Pheme Mic.
+
+A Windows client has no virtual microphone. Windows has no user-mode way for a program
+to create a recording device — that needs a signed kernel driver such as VB-CABLE — so
+this is deferred, not implemented in this release. A Windows client keeps its
+keyboard, mouse and audio-out exactly as before; it simply never asks the server to
+open its microphone. A Windows *server* sends its microphone to a Linux client
+normally.
+
+Do not route Pheme Mic into Pheme Speaker on the client: that sends the server's
+microphone straight back to the server's speakers, which will howl. Nothing stops
+you, because the routing is yours to choose.
+
 ### Building on Linux
 
 The PipeWire bindings are generated at build time, so building needs:
@@ -103,7 +140,8 @@ sudo dnf install pipewire-devel clang pkgconf
   **client** works under X11 or Wayland (injection goes through uinput).
 - Wayland capture and macOS support come in later sub-projects; clipboard
   forwarding is not implemented yet.
-- Audio is one direction only for now: client to server. The server's microphone
-  reaching the client comes in the next release.
+- A Windows client cannot receive the server's microphone: creating a recording
+  device on Windows needs a signed kernel driver (VB-CABLE), which is deferred. A
+  Windows server's microphone reaching a Linux client works normally.
 
 See `docs/testing.md` for the manual test checklist.

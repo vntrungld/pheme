@@ -93,3 +93,35 @@ Run both sides with `--stats` for A2 and A5; the client logs `audio_sent` and
 
 If A2 shows `audio_depth_ms` climbing steadily over ten minutes, the drift controller is
 not holding — report the trend, do not just restart.
+
+## Microphone (sub-project 3)
+
+Run with this machine as the Linux client and the QEMU VM as the Windows server
+(`~/pheme-vm/start-vm.sh`), and again Linux server → Linux client.
+
+| # | Check | Result |
+|---|---|---|
+| M1 | "Pheme Mic" appears in the client's sound settings; recording from it plays the server's microphone | |
+| M2 | Nothing recording → `mic_open=false` on the server and the OS shows the microphone unused; start recording → audio within 500 ms | |
+| M3 | Stop recording → the microphone closes after about 3 s; opening a sound-settings page that merely lists devices does not make it flap | |
+| M4 | **No silence at the start of a recording.** Record for 5 s, stop, record again: the second recording has audio from its first moment | |
+| M5 | A mono microphone on the server arrives as two channels on the client | |
+| M6 | Ten minutes continuous: `mic_underruns=0`, `mic_depth_ms` steady rather than climbing | |
+| M7 | Unplug the network for 3 s and reconnect: the microphone resumes by itself | |
+| M8 | Unplug the server's microphone mid-session: it recovers within the retry cycle, and the keyboard and mouse are unaffected | |
+| M9 | A Windows client: the server's microphone never opens and the client's log stays clean | |
+| M10 | Latency: clap near the server's microphone while recording on the client; the offset is under 40 ms | |
+
+M4 is the row worth running twice. The failure it catches is inaudible to every
+counter: the client's jitter buffer discards the resumed stream as late, so the
+recording simply starts silent while `lost`, `late` and `underruns` all read zero.
+
+M2 and M3 read `mic_open` from the server's `--stats` line, which is the only place
+the demand gate is visible. M6 reads `mic_underruns` and `mic_depth_ms` from the
+**client's** `--stats` line instead — that is the side receiving the microphone
+stream, the same way A2 reads `audio_depth_ms` from the server because the server is
+the side receiving playback.
+
+Note that a level meter counts as a consumer. An open sound-settings input page, or
+`pavucontrol`, holds the server's microphone open — correct behaviour, surprising the
+first time. Close them before running M2 or M3.
