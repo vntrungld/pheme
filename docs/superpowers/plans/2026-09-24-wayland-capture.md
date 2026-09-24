@@ -2326,15 +2326,20 @@ In `crates/pheme-input/src/linux_x11.rs`, delete the `WAYLAND_DISPLAY` check at 
 In `crates/pheme-input/src/lib.rs`:
 
 ```rust
-/// True when this process is in a Wayland session.
+/// True when these values describe a Wayland session.
 ///
-/// Checked **before** X11: a Wayland session also sets `DISPLAY` for XWayland, so an
-/// X11 connection succeeds, XInput2 and XTest install without error, and the backend
-/// then captures nothing but XWayland clients. Nothing at any layer reports this.
+/// Takes the two values instead of reading the environment itself, so the decision
+/// is a pure function and its test needs no process-wide mutation. Every
+/// `cargo test` binary is multithreaded and `std::env::set_var` is unsound there —
+/// which is why the 2024 edition made it `unsafe`.
+///
+/// This is checked **before** X11. A Wayland session also sets `DISPLAY` for
+/// XWayland, so an X11 connection succeeds, XInput2 and XTest install without
+/// error, and the backend then captures nothing but XWayland clients. Nothing at
+/// any layer reports it.
 #[cfg(target_os = "linux")]
-fn is_wayland_session() -> bool {
-    std::env::var_os("WAYLAND_DISPLAY").is_some()
-        || std::env::var("XDG_SESSION_TYPE").is_ok_and(|v| v.eq_ignore_ascii_case("wayland"))
+fn is_wayland(wayland_display: Option<&std::ffi::OsStr>, session_type: Option<&str>) -> bool {
+    wayland_display.is_some() || session_type.is_some_and(|v| v.eq_ignore_ascii_case("wayland"))
 }
 ```
 
@@ -2343,7 +2348,11 @@ and in `detect_capture()`:
 ```rust
     #[cfg(target_os = "linux")]
     {
-        if is_wayland_session() {
+        let session_type = std::env::var("XDG_SESSION_TYPE").ok();
+        if is_wayland(
+            std::env::var_os("WAYLAND_DISPLAY").as_deref(),
+            session_type.as_deref(),
+        ) {
             return portal::PortalCapture::new()
                 .map(|c| Box::new(c) as Box<dyn InputCapture>)
                 .map_err(|e| match e {
@@ -2360,49 +2369,34 @@ and in `detect_capture()`:
     }
 ```
 
-Add a test for the predicate, which is the part that can be tested without a session:
+and the test, which needs no environment at all:
 
 ```rust
 #[cfg(all(test, target_os = "linux"))]
 mod selection_tests {
-    // `is_wayland_session` reads process-wide environment, so these run in one test
-    // to keep them ordered against each other.
+    use std::ffi::OsStr;
+
     #[test]
     fn a_wayland_session_is_detected_even_when_x11_is_also_available() {
-        let restore = (
-            std::env::var_os("WAYLAND_DISPLAY"),
-            std::env::var_os("XDG_SESSION_TYPE"),
-            std::env::var_os("DISPLAY"),
-        );
-        // XWayland: both are set. X11 would connect successfully and capture nothing.
-        unsafe {
-            std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
-            std::env::set_var("DISPLAY", ":0");
-            std::env::remove_var("XDG_SESSION_TYPE");
-        }
-        assert!(super::is_wayland_session());
+        // Under XWayland both are set. Checking X11 first would connect happily and
+        // then capture nothing but XWayland clients, with no error anywhere.
+        assert!(super::is_wayland(Some(OsStr::new("wayland-0")), None));
+        assert!(super::is_wayland(Some(OsStr::new("wayland-0")), Some("x11")));
+    }
 
-        unsafe {
-            std::env::remove_var("WAYLAND_DISPLAY");
-            std::env::set_var("XDG_SESSION_TYPE", "wayland");
-        }
-        assert!(super::is_wayland_session(), "XDG_SESSION_TYPE alone is enough");
+    #[test]
+    fn the_session_type_alone_is_enough() {
+        assert!(super::is_wayland(None, Some("wayland")));
+        assert!(super::is_wayland(None, Some("Wayland")), "the comparison ignores case");
+    }
 
-        unsafe {
-            std::env::set_var("XDG_SESSION_TYPE", "x11");
-        }
-        assert!(!super::is_wayland_session());
-
-        unsafe {
-            match &restore.0 { Some(v) => std::env::set_var("WAYLAND_DISPLAY", v), None => std::env::remove_var("WAYLAND_DISPLAY") }
-            match &restore.1 { Some(v) => std::env::set_var("XDG_SESSION_TYPE", v), None => std::env::remove_var("XDG_SESSION_TYPE") }
-            match &restore.2 { Some(v) => std::env::set_var("DISPLAY", v), None => std::env::remove_var("DISPLAY") }
-        }
+    #[test]
+    fn an_x11_session_is_not_mistaken_for_wayland() {
+        assert!(!super::is_wayland(None, Some("x11")));
+        assert!(!super::is_wayland(None, None));
     }
 }
 ```
-
-`std::env::set_var` is `unsafe` from the 2024 edition; this crate is edition 2021, so drop the `unsafe` blocks if the compiler rejects them.
 
 - [ ] **Step 5: Write the live test**
 
