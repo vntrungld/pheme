@@ -23,6 +23,13 @@ pub struct ServerDeps {
     pub endpoint: Endpoint,
     pub placements: Vec<ClientPlacement>,
     pub hotkeys: Hotkeys,
+    /// The raw `hotkeys.lock` string from the configuration, before `Config::hotkeys()`
+    /// converts it to a `KeyCode`. Used only on Wayland, to bind the lock hotkey
+    /// through the GlobalShortcuts portal as a `preferred_trigger` -- the portal wants
+    /// the trigger syntax, not a `KeyCode`, and the compositor may bind something else
+    /// entirely. `None` when no lock hotkey is configured, or on X11/Windows where the
+    /// existing key-watching path already reaches `ServerCore::toggle_lock()`.
+    pub lock_hotkey_trigger: Option<String>,
     pub stats: bool,
     /// Where audio received from the client is played.
     pub audio: PlaybackSource,
@@ -132,6 +139,52 @@ impl Shared {
     }
 }
 
+/// Binds the lock hotkey through `org.freedesktop.portal.GlobalShortcuts` when this
+/// is a Wayland session and a lock hotkey is configured. `None` otherwise --
+/// including every failure inside the bind, which only logs a `warn!`: a lock
+/// hotkey that could not be bound must never take keyboard and mouse sharing down
+/// with it.
+///
+/// The returned value must be kept alive for as long as the server runs; dropping
+/// it unbinds the shortcut and stops its thread.
+#[cfg(target_os = "linux")]
+fn bind_lock_shortcut(
+    trigger: Option<String>,
+    shared: &Arc<Shared>,
+) -> Option<pheme_input::portal::shortcuts::LockShortcut> {
+    if !pheme_input::is_wayland_session() {
+        // X11 already reaches `toggle_lock()` through the key-watching path in
+        // `on_event`; binding the portal shortcut too would double-toggle.
+        return None;
+    }
+    let trigger = trigger?;
+    let (toggle_tx, toggle_rx) = crossbeam_channel::bounded(4);
+    let shortcut = pheme_input::portal::shortcuts::LockShortcut::bind(trigger, toggle_tx);
+    let toggle_shared = shared.clone();
+    if let Err(e) = std::thread::Builder::new()
+        .name("pheme-lock-toggle".into())
+        .spawn(move || {
+            while toggle_rx.recv().is_ok() {
+                let actions = toggle_shared.core.lock().unwrap().toggle_lock();
+                toggle_shared.execute(actions);
+            }
+        })
+    {
+        warn!("could not spawn the lock-toggle thread; the lock hotkey is unavailable: {e}");
+        // Drops `shortcut`, which unbinds it and joins its thread -- nothing must be
+        // left sending toggles that nothing will ever receive.
+        return None;
+    }
+    Some(shortcut)
+}
+
+/// Wayland, and therefore the GlobalShortcuts portal, exists only on Linux. The
+/// key-watching path already handles the lock hotkey on every other platform.
+#[cfg(not(target_os = "linux"))]
+fn bind_lock_shortcut(_trigger: Option<String>, _shared: &Arc<Shared>) -> Option<()> {
+    None
+}
+
 pub async fn run_server(
     deps: ServerDeps,
     mut shutdown: watch::Receiver<bool>,
@@ -142,6 +195,7 @@ pub async fn run_server(
         endpoint,
         placements,
         hotkeys,
+        lock_hotkey_trigger,
         stats,
         audio,
         audio_stats,
@@ -175,6 +229,13 @@ pub async fn run_server(
         audio: audio_in,
         mic,
     });
+
+    // Binds the lock hotkey through the GlobalShortcuts portal on Wayland, where no
+    // key event ever reaches the router thread below. `None` on X11 and Windows,
+    // where the existing key-watching path already reaches `toggle_lock()` through
+    // `on_event` -- a second mechanism there would double-toggle. Held for the life
+    // of the server: dropping it unbinds the shortcut.
+    let _lock_shortcut = bind_lock_shortcut(lock_hotkey_trigger, &shared);
 
     // Router thread: blocking receive from the capture backend, no async hop for datagrams.
     // It owns `router_alive`; dropping it when the loop ends (the backend closed the event
@@ -531,6 +592,7 @@ pub async fn main(cfg: Config, pair: bool, stats: bool) -> anyhow::Result<()> {
             endpoint,
             placements: cfg.placements()?,
             hotkeys: cfg.hotkeys()?,
+            lock_hotkey_trigger: cfg.hotkeys.lock.clone(),
             stats,
             audio: PlaybackSource::Detect(cfg.audio.playback_device.clone()),
             audio_stats: None,

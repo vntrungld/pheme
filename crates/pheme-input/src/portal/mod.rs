@@ -3,6 +3,7 @@
 
 pub mod geometry;
 pub(crate) mod session;
+pub mod shortcuts;
 pub mod translate;
 
 use std::sync::mpsc::RecvTimeoutError;

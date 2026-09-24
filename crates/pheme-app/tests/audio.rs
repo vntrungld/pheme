@@ -121,6 +121,7 @@ fn spawn_pair(fail_capture: bool) -> Pair {
                 span: (0.0, 1.0),
             }],
             hotkeys: Hotkeys::default(),
+            lock_hotkey_trigger: None,
             stats: false,
             audio: PlaybackSource::Backend(Box::new(speaker_backend)),
             audio_stats: Some(heard.clone()),

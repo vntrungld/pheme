@@ -130,6 +130,14 @@ impl ServerCore {
         self.locked
     }
 
+    /// Toggles the input lock. The X11 and Windows backends reach this through the
+    /// hotkey in `on_event`; on Wayland the GlobalShortcuts portal calls it directly,
+    /// because a Wayland server sees no keys while local.
+    pub fn toggle_lock(&mut self) -> Vec<Action> {
+        self.locked = !self.locked;
+        vec![Action::SetLocked(self.locked)]
+    }
+
     pub fn client_connected(&mut self, name: &str, screens: Vec<ScreenInfo>) -> Vec<Action> {
         debug!(name, ?screens, "client connected");
         self.connected
@@ -207,8 +215,7 @@ impl ServerCore {
         if let CaptureEvent::Key { code, down } = ev {
             if Some(code) == self.hotkeys.lock {
                 if down {
-                    self.locked = !self.locked;
-                    return vec![Action::SetLocked(self.locked)];
+                    return self.toggle_lock();
                 }
                 return Vec::new();
             }
@@ -564,6 +571,42 @@ mod tests {
         let a = c.on_event(CaptureEvent::MotionRel { dx: -5000, dy: 0 });
         assert_eq!(a.len(), 1, "only the datagram; no Leave while locked");
         assert_eq!(c.active(), Active::Remote("lap".into()));
+    }
+
+    #[test]
+    fn toggle_lock_is_the_same_state_the_hotkey_reaches() {
+        // `toggle_lock()` is what the GlobalShortcuts portal calls on Wayland,
+        // where no key event ever reaches `on_event`. It must be exactly the
+        // state change the hotkey branch applies, or the two paths drift apart.
+        let mut a = core(Side::Right, (0.0, 1.0));
+        let mut b = core(Side::Right, (0.0, 1.0));
+
+        let via_key = a.on_event(CaptureEvent::Key {
+            code: LOCK,
+            down: true,
+        });
+        let via_toggle = b.toggle_lock();
+        assert_eq!(via_key, via_toggle);
+        assert_eq!(a.locked(), b.locked());
+        assert!(a.locked());
+
+        // Releasing and pressing the key again is what the X11 approach would need
+        // to unlock -- but on Wayland the key press is never seen, so this is the
+        // only path a portal-bound toggle has to release a lock it took.
+        a.on_event(CaptureEvent::Key {
+            code: LOCK,
+            down: false,
+        });
+        a.on_event(CaptureEvent::Key {
+            code: LOCK,
+            down: true,
+        });
+        b.toggle_lock();
+        assert_eq!(a.locked(), b.locked());
+        assert!(
+            !a.locked(),
+            "a lock that cannot be released is worse than no lock"
+        );
     }
 
     #[test]

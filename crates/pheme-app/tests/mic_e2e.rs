@@ -207,6 +207,7 @@ fn spawn_server_instance(
                 span: (0.0, 1.0),
             }],
             hotkeys: Hotkeys::default(),
+            lock_hotkey_trigger: None,
             stats: false,
             audio: PlaybackSource::Disabled,
             audio_stats: None,
