@@ -2369,6 +2369,15 @@ fn is_wayland(wayland_display: Option<&std::ffi::OsStr>, session_type: Option<&s
 and in `detect_capture()`:
 
 ```rust
+The friendly message below must ALSO wrap the failure `start()` receives through
+`ready`. `PortalCapture::new()`'s only failure path is `wayland_screens()`, which is
+plain `wl_output` enumeration and succeeds on wlroots compositors — so a Hyprland or
+Sway user never reaches this `map_err` at all. The real "no portal" failure happens
+inside `establish()` on the session thread, after `detect_capture()` has already
+returned `Ok`. Wrapping only here leaves the one message aimed at those users
+unreachable by them.
+
+```rust
     #[cfg(target_os = "linux")]
     {
         let session_type = std::env::var("XDG_SESSION_TYPE").ok();
