@@ -17,7 +17,7 @@ use reis::ei;
 use reis::event::{DeviceCapability, EiEvent};
 use tracing::{debug, error, info, warn};
 
-use crate::portal::geometry::{barriers, Zone};
+use crate::portal::geometry::{barriers, zone_bounds, Zone};
 use crate::portal::translate::{
     button_from_evdev, clamp_into, key_from_evdev, modifier_keys, wheel_from_discrete, HeldKeys,
     Motion,
@@ -652,6 +652,27 @@ pub(crate) async fn run(
                     error!("refreshing zones failed: {e}");
                 } else if let Err(e) = sess.set_barriers(&edges).await {
                     error!("re-declaring barriers after a zone change failed: {e}");
+                }
+                // Spec §9 asks for both halves here: fresh zones for the barriers, and
+                // a fresh screen list for the core. Only the first half exists. The
+                // core's rect is fixed when `run_server` builds it, and `screen` — the
+                // rect every activation is clamped into — was fixed when `start()` was
+                // called, so after a monitor change the barrier sits on the new outer
+                // edge while the clamp still folds positions onto the old one, and the
+                // core stops recognising the crossing. Refreshing the core's layout
+                // mid-session is a separate piece of work (it has to reach `ServerCore`
+                // and every client's placement); until it exists, say so plainly rather
+                // than let the mismatch look like a bug in the pointer.
+                match zone_bounds(&sess.zones) {
+                    Some(z) if z != screen => warn!(
+                        zones = ?z,
+                        screens = ?screen,
+                        "the display layout changed and no longer matches the screen \
+                         list this session started with. Barriers follow the new \
+                         layout, but edge detection does not: restart pheme server to \
+                         pick up the new layout"
+                    ),
+                    _ => {}
                 }
             }
             Step::Portal(PortalEvent::Closed) => {

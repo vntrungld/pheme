@@ -522,6 +522,20 @@ Windows client, and again Wayland → Linux.
 - **Touchscreen is refused.** KDE advertises the capability and does not
   grant it. Nothing in Pheme uses it, but the granted set must be read
   from the response rather than assumed to match the request.
+- **A monitor change needs a restart — §9 is only half implemented.**
+  §9 says `ZonesChanged` triggers "fresh zones for the barriers, and a
+  fresh screen list for the core". Only the first half ships. The
+  barriers are re-declared against the new zones, but the screen list
+  reaches `ServerCore` once, when the server starts, and the rect every
+  activation is clamped into is fixed at the same moment. After a
+  monitor is added or removed the barrier sits on the new outer edge
+  while edge detection still uses the old rect, so the crossing can stop
+  working — and, because a barrier is physically stopping the pointer,
+  an activation the core then declines is one of the cases §5.3's
+  release exists for. Pushing a fresh layout through `ServerCore` and
+  every client placement mid-session is its own piece of work; until it
+  is done the session compares the new zone union against the screen
+  rect it started with and warns that the server must be restarted.
 - **A barrier rejection is silent** (§3.1). It is visible only in
   `failed_barriers`, which is why §4.2 makes checking it mandatory.
 

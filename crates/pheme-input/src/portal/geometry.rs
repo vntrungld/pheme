@@ -54,6 +54,22 @@ fn union(zones: &[Zone]) -> Option<(i32, i32, i32, i32)> {
     Some((x0, y0, x1, y1))
 }
 
+/// The bounding box of the compositor's zones, in the same form the core uses for the
+/// server's screens — `None` when there are no zones at all.
+///
+/// This is what a barrier is placed against, so it is also what has to agree with the
+/// rect the core clamps and tests edges against. `ZonesChanged` is the moment the two
+/// can silently stop agreeing (§9).
+pub fn zone_bounds(zones: &[Zone]) -> Option<pheme_core::Rect> {
+    let (x0, y0, x1, y1) = union(zones)?;
+    Some(pheme_core::Rect {
+        x: x0,
+        y: y0,
+        w: x1 - x0,
+        h: y1 - y0,
+    })
+}
+
 /// Maps capture edges onto portal barriers, splitting each edge across the zones that
 /// touch it. Returns barriers with ids starting at 1; the order is stable so tests can
 /// name positions.
