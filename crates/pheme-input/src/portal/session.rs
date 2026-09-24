@@ -336,12 +336,19 @@ async fn next_portal(
 /// `ConnectToEIS`, the libei handshake runs here, the signal subscriptions go up
 /// before anything can be missed, and only then does `set_barriers` — the one
 /// call that ever reaches `Enable` — arm the session.
+///
+/// `stopped` is signalled once, right after `tx` is dropped at the end of the
+/// loop, and before the untimed `shutdown` calls that follow it. `PortalCapture`'s
+/// `stop()` waits on it with a bound instead of joining this thread blindly:
+/// `shutdown`'s `Release` and `Close` have no timeout of their own, so a slow or
+/// hung compositor must not be able to turn `stop()` into an unbounded wait.
 pub(crate) async fn run(
     tx: EventSender<CaptureEvent>,
     cmds: async_channel::Receiver<Cmd>,
     screen: Rect,
     mut edges: Vec<CaptureEdge>,
     ready: std::sync::mpsc::Sender<Result<()>>,
+    stopped: std::sync::mpsc::Sender<()>,
 ) {
     // Startup reports its first failure to whoever called `start()`, so a refused
     // permission or a rejected barrier surfaces there instead of leaving a thread
@@ -630,9 +637,11 @@ pub(crate) async fn run(
 
     // Dropping `tx` is what lets the receiver observe disconnection, which the
     // trait's `stop()` contract requires -- and it happens *before* `shutdown`,
-    // whose two D-Bus calls have no timeout: `stop()` joins this thread, so an
-    // unresponsive portal must not hold the sender open past that budget.
+    // whose two D-Bus calls have no timeout of their own. `stopped` tells
+    // `stop()` the moment this has happened, so it can stop waiting on this
+    // thread here rather than risk blocking on an unresponsive portal.
     drop(tx);
+    let _ = stopped.send(());
     shutdown(&mut sess).await;
 }
 

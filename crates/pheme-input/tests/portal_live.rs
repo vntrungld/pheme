@@ -5,8 +5,13 @@
 //! Run with:
 //!   cargo test -p pheme-input --test portal_live -- --ignored --nocapture
 //!
-//! It does NOT capture input — it stops before `Enable` has anything to trigger it,
-//! so it cannot take the keyboard away from whoever is running it.
+//! `set_edges` below genuinely arms a barrier at the right edge of the primary
+//! screen -- that is the point of the test, since only a real compositor can
+//! confirm the declared geometry is accepted. The barrier stays armed only
+//! until the `stop()` call right after it closes the session, but that window
+//! is not perfectly bounded: `shutdown`'s `Release` and `Close` calls have no
+//! timeout of their own. Keep the pointer away from the screen's right edge
+//! while this test runs.
 
 #![cfg(target_os = "linux")]
 

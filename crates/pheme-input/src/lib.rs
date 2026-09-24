@@ -133,17 +133,15 @@ pub fn detect_capture() -> Result<Box<dyn InputCapture>> {
             std::env::var_os("WAYLAND_DISPLAY").as_deref(),
             session_type.as_deref(),
         ) {
+            // `new()`'s only failure path is `wayland_screens()`, which every
+            // Wayland compositor gets right whether or not it has the
+            // InputCapture portal -- so a missing-portal failure almost never
+            // surfaces here. It surfaces from `start()` instead, which wraps
+            // it with the same message; this call is wrapped too so the two
+            // sites cannot drift apart.
             return portal::PortalCapture::new()
                 .map(|c| Box::new(c) as Box<dyn InputCapture>)
-                .map_err(|e| match e {
-                    Error::Backend(m) | Error::Unsupported(m) => Error::Unsupported(format!(
-                        "Wayland capture needs a compositor that implements the InputCapture \
-                         portal (KDE, GNOME): {m}. wlroots compositors such as Hyprland and \
-                         Sway are not supported yet; this machine can still be used as a \
-                         client."
-                    )),
-                    other => other,
-                });
+                .map_err(portal::describe_no_portal);
         }
         linux_x11::X11Capture::new().map(|c| Box::new(c) as Box<dyn InputCapture>)
     }
