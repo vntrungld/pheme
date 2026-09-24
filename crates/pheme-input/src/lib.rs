@@ -13,6 +13,8 @@ pub mod linux_screens;
 pub mod linux_uinput;
 #[cfg(target_os = "linux")]
 pub mod linux_x11;
+#[cfg(target_os = "linux")]
+pub mod portal;
 #[cfg(target_os = "windows")]
 pub mod windows;
 

@@ -14,7 +14,7 @@ version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-only"
 repository = "https://github.com/trungld/pheme"
-rust-version = "1.85"
+rust-version = "1.87"
 
 [workspace.dependencies]
 pheme-proto = { path = "crates/pheme-proto" }
@@ -46,6 +46,10 @@ toml = "0.8"
 dirs = "6"
 clap = { version = "4", features = ["derive"] }
 proptest = "1"
+ashpd = { version = "0.13", default-features = false, features = ["async-io", "input_capture", "global_shortcuts"] }
+reis = { version = "0.7", features = ["async-io"] }
+futures-lite = "2"
+async-channel = "2"
 
 [profile.release]
 lto = "thin"

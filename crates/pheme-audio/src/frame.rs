@@ -39,7 +39,7 @@ pub fn samples_to_bytes(src: &[i16], dst: &mut Vec<u8>) {
 ///
 /// Fails when `src` is not a whole number of stereo sample pairs (4 bytes).
 pub fn bytes_to_samples(src: &[u8], dst: &mut Vec<i16>) -> Result<()> {
-    if src.len() % (2 * crate::CHANNELS) != 0 {
+    if !src.len().is_multiple_of(2 * crate::CHANNELS) {
         return Err(Error::Backend(format!(
             "audio payload of {} bytes is not a whole number of stereo samples",
             src.len()

@@ -16,6 +16,10 @@ tracing = { workspace = true }
 evdev = "0.13"
 x11rb = { version = "0.14", features = ["xinput", "xtest", "xfixes", "randr"] }
 wayland-client = "0.31"
+ashpd = { workspace = true }
+reis = { workspace = true }
+futures-lite = { workspace = true }
+async-channel = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.62", features = [

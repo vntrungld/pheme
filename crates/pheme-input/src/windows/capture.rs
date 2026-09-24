@@ -62,7 +62,7 @@ fn send(ev: CaptureEvent) {
     if let Some(h) = HOOKS.lock().unwrap().as_ref() {
         if h.tx.try_send(ev).is_err() {
             let n = DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
-            if n.is_power_of_two() || n % 1000 == 0 {
+            if n.is_power_of_two() || n.is_multiple_of(1000) {
                 warn!(dropped = n, "capture channel full; dropping event");
             }
         }
