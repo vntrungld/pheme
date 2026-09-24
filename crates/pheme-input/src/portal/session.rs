@@ -591,6 +591,16 @@ pub(crate) async fn run(
                 if id.is_some() && id == sess.activation {
                     debug!(?id, "the compositor ended the capture");
                     sess.activation = None;
+                    // `CaptureEnded` goes first, before the key-ups, because the
+                    // channel may be full and the two losses are not comparable. A
+                    // lost key-up leaves one key held on the client, and the `Leave`
+                    // that `CaptureEnded` produces makes the client drop it anyway.
+                    // A lost `CaptureEnded` wedges the core in `Remote` with the
+                    // input going nowhere and nothing saying why. The irreplaceable
+                    // message takes the last free slot.
+                    if tx.try_send(CaptureEvent::CaptureEnded).is_err() {
+                        error!("dropped CaptureEnded; the core still believes it is capturing");
+                    }
                     // The key-ups for anything still held go to the compositor from
                     // here on, so the core would keep them held forever.
                     for k in held.flush() {
@@ -603,14 +613,6 @@ pub(crate) async fn run(
                         {
                             warn!(?k, "dropped a key-up; the core will hold this key");
                         }
-                    }
-                    // The caller turns this into ServerCore::release_remote(). It is
-                    // the only thing that tells the core the compositor ended the
-                    // capture, so a drop here is not recoverable the way a dropped
-                    // motion event is: the core would stay Remote with the input
-                    // going nowhere and nothing saying why.
-                    if tx.try_send(CaptureEvent::CaptureEnded).is_err() {
-                        error!("dropped CaptureEnded; the core still believes it is capturing");
                     }
                 } else {
                     debug!(?id, current = ?sess.activation, "ignoring a Deactivated for another activation");
