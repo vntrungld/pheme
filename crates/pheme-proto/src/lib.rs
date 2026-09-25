@@ -451,9 +451,18 @@ mod tests {
     }
 
     /// The guard that makes a wire change deliberate. postcard is not
-    /// self-describing, so an added field is a wire change: both ends
-    /// compare versions for equality and refuse a mismatch, which is the
-    /// correct outcome and means both machines upgrade together.
+    /// self-describing, so an added field is a wire change and both
+    /// machines must upgrade together.
+    ///
+    /// Both ends do compare versions and refuse a mismatch
+    /// (`server.rs`, `client.rs`), but do not expect that comparison to be
+    /// what a person meets. For the 2 -> 3 step it is unreachable:
+    /// `display_input` was appended to `Hello`, and a version 2 `Hello`
+    /// fails to decode before the version field inside it is ever read.
+    /// What that person sees is a malformed-handshake error naming neither
+    /// version. The version check catches the cases where the wire format
+    /// happens to stay decodable; this constant is what makes the change
+    /// deliberate either way.
     #[test]
     fn protocol_version_is_pinned() {
         assert_eq!(PROTOCOL_VERSION, 3);

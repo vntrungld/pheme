@@ -494,11 +494,15 @@ AudioParams` is there so neither side transmits into a format the other
 cannot read — and `display_input` is the same idea.
 
 `PROTOCOL_VERSION` goes from 2 to 3. postcard is not self-describing, so
-an added field is a wire change; both ends already refuse a mismatch
-(`server.rs:749`, `client.rs:388`) and that is the correct outcome. The
-guard test at `pheme-proto/src/lib.rs:434` asserting the version is
-updated in the same commit, which is what it is for. `SwitchDisplay` is
-appended after the last existing variant.
+an added field is a wire change and both machines must upgrade together.
+Both ends do compare versions and refuse a mismatch (`server.rs:749`,
+`client.rs:388`), but that comparison is not what an out-of-date peer
+meets on this particular step: `display_input` is appended to `Hello`, so
+a version 2 `Hello` fails to decode before the version inside it is read,
+and the error names neither version. The guard test at
+`pheme-proto/src/lib.rs:434` asserting the version is updated in the same
+commit, which is what it is for. `SwitchDisplay` is appended after the
+last existing variant.
 
 ## 10. CLI
 
