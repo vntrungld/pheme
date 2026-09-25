@@ -6,6 +6,9 @@
 
 pub mod switch;
 
+pub mod caps;
+pub mod edid;
+
 pub use switch::DisplaySwitch;
 
 /// VCP feature code for Input Select (MCCS 2.2 section 8.4).
