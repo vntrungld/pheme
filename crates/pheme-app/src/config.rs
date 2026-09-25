@@ -615,9 +615,12 @@ side = "top"
         assert_eq!(c.display.input, Some(17));
     }
 
-    /// Break it by dropping `#[serde(default = "default_cooldown_ms")]`:
-    /// a [display] section naming only `input` gets a zero cooldown, and
-    /// every crossing commands the monitor mid-switch.
+    /// Break it by dropping `default` from `DisplayCfg`'s container
+    /// attribute, `#[serde(deny_unknown_fields, default)]`. That attribute
+    /// is the only thing supplying an absent `cooldown_ms`; there is no
+    /// per-field default beside it. Without it the section fails to
+    /// deserialize outright on the missing key, rather than taking 1000
+    /// from the hand-written `Default`.
     #[test]
     fn a_display_section_without_a_cooldown_gets_the_default() {
         let c: Config = toml::from_str("[display]\ninput = 15").unwrap();
