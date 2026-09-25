@@ -25,6 +25,9 @@ pub struct Layout {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Hotkeys {
     pub lock: Option<KeyCode>,
+    /// Re-assert the monitor's input for whichever machine holds the
+    /// pointer. Sub-project 7 design section 8.
+    pub switch_display: Option<KeyCode>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +91,15 @@ pub enum Action {
         y: i32,
     },
     SetLocked(bool),
+    /// Re-assert the monitor input for the machine that holds the pointer.
+    ///
+    /// `local` says which machine that is; it is all the core knows, and
+    /// deliberately so -- a VCP value names a physical cable and belongs to
+    /// the configuration, not to the state machine. The app turns this into
+    /// its own `display.input` or the peer's.
+    SwitchDisplay {
+        local: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,6 +261,14 @@ impl ServerCore {
             if Some(code) == self.hotkeys.lock {
                 if down {
                     return self.toggle_lock();
+                }
+                return Vec::new();
+            }
+            if Some(code) == self.hotkeys.switch_display {
+                if down {
+                    return vec![Action::SwitchDisplay {
+                        local: self.remote.is_none(),
+                    }];
                 }
                 return Vec::new();
             }
@@ -475,6 +495,7 @@ mod tests {
     use pheme_proto::{Button, KeyCode, Modifiers, Msg, ScreenInfo};
 
     const LOCK: KeyCode = KeyCode(0x47); // ScrollLock
+    const SWITCH: KeyCode = KeyCode(0x45); // F12
 
     fn screen(w: u32, h: u32) -> Vec<ScreenInfo> {
         vec![ScreenInfo {
@@ -495,7 +516,34 @@ mod tests {
                 span,
             }],
         };
-        let mut c = ServerCore::new(layout, Hotkeys { lock: Some(LOCK) });
+        let mut c = ServerCore::new(
+            layout,
+            Hotkeys {
+                lock: Some(LOCK),
+                switch_display: None,
+            },
+        );
+        c.client_connected("lap", screen(1000, 500));
+        c
+    }
+
+    /// `core`, with a switch-display hotkey bound as well.
+    fn core_with_switch(side: Side, span: (f32, f32)) -> ServerCore {
+        let layout = Layout {
+            server_screens: screen(1920, 1080),
+            clients: vec![ClientPlacement {
+                name: "lap".into(),
+                side,
+                span,
+            }],
+        };
+        let mut c = ServerCore::new(
+            layout,
+            Hotkeys {
+                lock: Some(LOCK),
+                switch_display: Some(SWITCH),
+            },
+        );
         c.client_connected("lap", screen(1000, 500));
         c
     }
@@ -584,7 +632,13 @@ mod tests {
                 span: (0.0, 1.0),
             }],
         };
-        let mut c = ServerCore::new(layout, Hotkeys { lock: None });
+        let mut c = ServerCore::new(
+            layout,
+            Hotkeys {
+                lock: None,
+                switch_display: None,
+            },
+        );
         assert!(enter_right(&mut c).is_empty());
     }
 
@@ -728,6 +782,59 @@ mod tests {
             !a.locked(),
             "a lock that cannot be released is worse than no lock"
         );
+    }
+
+    /// Break it by hard-coding `local: true`: the hotkey then always asks
+    /// for the server's input, so it can never bring the screen back from a
+    /// client -- the one case it exists for.
+    #[test]
+    fn the_switch_display_hotkey_reports_which_machine_holds_the_pointer() {
+        let mut c = core_with_switch(Side::Right, (0.0, 1.0));
+        let a = c.on_event(CaptureEvent::Key {
+            code: SWITCH,
+            down: true,
+        });
+        assert_eq!(a, vec![Action::SwitchDisplay { local: true }]);
+
+        enter_right(&mut c);
+        assert!(matches!(c.active(), Active::Remote(_)));
+
+        let a = c.on_event(CaptureEvent::Key {
+            code: SWITCH,
+            down: true,
+        });
+        assert_eq!(a, vec![Action::SwitchDisplay { local: false }]);
+    }
+
+    /// Break it by testing the hotkey after the local/remote split rather
+    /// than before it: the key is then forwarded to the client, typed into
+    /// whatever has focus there, and the person who cannot see their screen
+    /// has no way back.
+    #[test]
+    fn the_switch_display_hotkey_is_never_forwarded() {
+        let mut c = core_with_switch(Side::Right, (0.0, 1.0));
+        enter_right(&mut c);
+        let a = c.on_event(CaptureEvent::Key {
+            code: SWITCH,
+            down: true,
+        });
+        assert!(
+            !a.iter()
+                .any(|x| matches!(x, Action::SendControl(Msg::Key { .. }))),
+            "the hotkey reached the client: {a:?}"
+        );
+    }
+
+    /// Break it by acting on key-up as well: one press then commands the
+    /// monitor twice, and the second command lands mid-switch.
+    #[test]
+    fn the_switch_display_hotkey_acts_on_the_way_down_only() {
+        let mut c = core_with_switch(Side::Right, (0.0, 1.0));
+        let a = c.on_event(CaptureEvent::Key {
+            code: SWITCH,
+            down: false,
+        });
+        assert!(a.is_empty(), "{a:?}");
     }
 
     #[test]
@@ -880,7 +987,13 @@ mod tests {
                 },
             ],
         };
-        let mut c = ServerCore::new(layout, Hotkeys { lock: Some(LOCK) });
+        let mut c = ServerCore::new(
+            layout,
+            Hotkeys {
+                lock: Some(LOCK),
+                switch_display: None,
+            },
+        );
         c.client_connected("right", screen(1000, 500));
         c.client_connected("top", screen(1000, 500));
         c
@@ -1108,7 +1221,7 @@ mod props {
                 server_screens: vec![ScreenInfo { x: 0, y: 0, w: 1920, h: 1080, primary: true }],
                 clients: vec![ClientPlacement { name: "c".into(), side: Side::Right, span: (0.0, 1.0) }],
             };
-            let mut core = ServerCore::new(layout, Hotkeys { lock: Some(KeyCode(0x47)) });
+            let mut core = ServerCore::new(layout, Hotkeys { lock: Some(KeyCode(0x47)), switch_display: None });
             core.client_connected("c", vec![ScreenInfo { x: 0, y: 0, w: 800, h: 600, primary: true }]);
             let mut grabbed = false;
             for e in events {

@@ -182,6 +182,8 @@ impl Shared {
                     // actively running.
                     self.publish_edges();
                 }
+                // Task 8 wires this to DisplayService and the peer.
+                Action::SwitchDisplay { .. } => {}
             }
         }
     }

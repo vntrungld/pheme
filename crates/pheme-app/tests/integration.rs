@@ -192,6 +192,7 @@ async fn server_and_client_exchange_input_over_quic() {
             }],
             hotkeys: Hotkeys {
                 lock: Some(KeyCode(0x47)),
+                switch_display: None,
             },
             lock_hotkey_trigger: None,
             stats: false,
@@ -832,7 +833,10 @@ async fn locking_withdraws_the_edges_and_unlocking_puts_them_back() {
         shutdown_tx,
         cap,
         inj: _,
-    } = spawn_pair_with_hotkeys(Hotkeys { lock: Some(LOCK) });
+    } = spawn_pair_with_hotkeys(Hotkeys {
+        lock: Some(LOCK),
+        switch_display: None,
+    });
     wait_connected(&cap).await;
     // `wait_connected` proves the client is there by crossing the edge, which leaves
     // the input on the client. Come back first: withdrawing the barriers is what a
@@ -916,7 +920,10 @@ async fn locking_while_remote_waits_for_the_return_before_withdrawing_the_edges(
         shutdown_tx,
         cap,
         inj,
-    } = spawn_pair_with_hotkeys(Hotkeys { lock: Some(LOCK) });
+    } = spawn_pair_with_hotkeys(Hotkeys {
+        lock: Some(LOCK),
+        switch_display: None,
+    });
     wait_connected(&cap).await;
     let before = cap.edge_calls();
     assert_eq!(

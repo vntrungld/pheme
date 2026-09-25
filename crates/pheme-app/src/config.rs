@@ -247,7 +247,20 @@ impl Config {
                 None => bail!("unknown key name for hotkeys.lock: {name:?}"),
             },
         };
-        Ok(Hotkeys { lock })
+        // No portal-trigger branch here: unlike `lock`, this hotkey is never
+        // bound through the GlobalShortcuts portal, so a value containing
+        // `+` names no key and is an error on every platform.
+        let switch_display = match self.hotkeys.switch_display.as_deref() {
+            None | Some("") => None,
+            Some(name) => match key_by_name(name) {
+                Some(code) => Some(code),
+                None => bail!("unknown key name for hotkeys.switch_display: {name:?}"),
+            },
+        };
+        Ok(Hotkeys {
+            lock,
+            switch_display,
+        })
     }
 
     /// The configured client placements; fails on a `span` outside `[0, 1]` or that is
@@ -447,6 +460,12 @@ side = "top"
             None,
             "empty string disables the hotkey"
         );
+    }
+
+    #[test]
+    fn an_unknown_switch_display_key_is_an_error() {
+        let c: Config = toml::from_str("[hotkeys]\nswitch_display = \"NoSuchKey\"").unwrap();
+        assert!(c.hotkeys().is_err());
     }
 
     #[test]
