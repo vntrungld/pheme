@@ -354,9 +354,10 @@ will rewrite a hand-written `0x11`, so the config comment above says what
 the value is rather than leaving the reader to recognise hex.
 
 `HotkeysCfg` gains `#[serde(default)] pub switch_display: Option<String>`,
-defaulting to `None`. The `#[serde(default)]` matters: `HotkeysCfg` is
-`deny_unknown_fields` with a hand-written `Default`, and without it every
-existing `[hotkeys]` section that names only `lock` would stop parsing.
+defaulting to `None`. The attribute is explicit rather than load-bearing:
+serde's derive already treats an absent `Option<T>` field as `None`, which
+is how the existing `lock` field parses without one. It is written out so a
+reader sees the intent at the field instead of having to know that rule.
 
 ## 7. When the hardware says no
 
