@@ -34,6 +34,12 @@ enum Req {
 /// and the oldest of them is no longer anyone's intention.
 const QUEUE: usize = 4;
 
+/// Cheap to clone: every clone shares the same channel to the display
+/// thread and the same `last` counter, so two owners commanding the same
+/// monitor never disagree about what was last confirmed. Needed so the
+/// front-end's IPC command loop -- a task independent of any one session --
+/// can hold its own handle alongside the one a session already borrows.
+#[derive(Clone)]
 pub struct DisplayService {
     tx: Sender<Req>,
     /// The input last *successfully* commanded, for the front-end's status

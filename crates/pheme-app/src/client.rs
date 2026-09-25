@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context};
@@ -98,6 +98,12 @@ struct SessionExtras<'a> {
     display: &'a Option<DisplayService>,
     /// This machine's own `[display] input`, sent in `Hello`.
     display_input: Option<u16>,
+    /// The server's own `[display] input`, as last learned from a
+    /// `HelloAck` -- shared with the IPC command loop, which runs
+    /// independently of any one session and has no peer of its own to ask.
+    /// `Command::SwitchDisplay` reads it there to re-assert the input this
+    /// machine last knew the server was cabled to.
+    known_server_display_input: Arc<Mutex<Option<u16>>>,
 }
 
 /// Pushes a `Status` carrying only `state`, with every other field at its
@@ -106,7 +112,16 @@ struct SessionExtras<'a> {
 /// has nothing else to report while it is resolving or connecting -- unlike
 /// `session`'s per-second tick, which has real figures to send alongside
 /// `Connected`.
-fn send_link_state(status_tx: &Option<mpsc::Sender<Status>>, state: LinkState) {
+///
+/// `display_input` is the exception: it is this machine's own hardware
+/// state, not something a session measures, so it is reported here exactly
+/// as `session` reports it rather than defaulted to `None` along with
+/// everything else.
+fn send_link_state(
+    status_tx: &Option<mpsc::Sender<Status>>,
+    state: LinkState,
+    display: &Option<DisplayService>,
+) {
     if let Some(tx) = status_tx {
         let _ = tx.try_send(Status {
             role: Role::Client,
@@ -120,6 +135,7 @@ fn send_link_state(status_tx: &Option<mpsc::Sender<Status>>, state: LinkState) {
             audio_lost: 0,
             mic_depth_ms: 0,
             mic_lost: 0,
+            display_input: display.as_ref().and_then(|d| d.last_input()),
         });
     }
 }
@@ -198,6 +214,13 @@ pub async fn run_client(
     let mic_stats = mic_stats.unwrap_or_default();
     let mut mic = RecvSide::spawn(mic, mic_stats.clone());
 
+    // The server's own `[display] input`, as last learned from a `HelloAck`.
+    // Set inside `session`, once per successful handshake, and read by the
+    // IPC command loop below -- which is spawned once, independent of any
+    // particular session, and so has no live peer of its own to ask when
+    // `Command::SwitchDisplay` arrives.
+    let known_server_display_input: Arc<Mutex<Option<u16>>> = Arc::new(Mutex::new(None));
+
     // `status_tx` is `Some` exactly when a front-end is attached: `session`'s per-second
     // tick pushes onto it, and the IPC command loop below drains it onto the socket. A
     // full channel drops the newest update rather than blocking a session on a slow
@@ -233,11 +256,17 @@ pub async fn run_client(
             audio_lost: 0,
             mic_depth_ms: 0,
             mic_lost: 0,
+            display_input: display.as_ref().and_then(|d| d.last_input()),
         };
         if let Err(e) = link.send_status(&initial).await {
             debug!("status send failed: {e}");
         }
         let shutdown_tx = shutdown_tx.clone();
+        // `DisplayService` is cheap to clone -- it is just a channel handle
+        // and a shared counter -- so this task gets its own, independent of
+        // the reference `session` borrows every time it runs.
+        let display_for_cmd = display.clone();
+        let known_server_display_input = known_server_display_input.clone();
         let mut status_rx = status_rx.expect("status channel exists whenever ipc does");
         tokio::spawn(async move {
             loop {
@@ -255,6 +284,17 @@ pub async fn run_client(
                         // to set. Accepted and ignored rather than reaching
                         // for a core that has nothing to change.
                         Ok(Some(Command::Lock)) | Ok(Some(Command::Unlock)) => {}
+                        // There is no core to ask and no peer to tell -- the
+                        // server owns the hotkey -- so this re-asserts the
+                        // input this machine last learned the server is
+                        // cabled to, exactly as `session`'s own `Msg::Leave`
+                        // handling does.
+                        Ok(Some(Command::SwitchDisplay)) => {
+                            let v = *known_server_display_input.lock().unwrap();
+                            if let (Some(d), Some(v)) = (display_for_cmd.as_ref(), v) {
+                                d.force(v);
+                            }
+                        }
                         // Stop and a closed socket are the same outcome and
                         // take the same path out: the shutdown signal Ctrl+C
                         // already uses. A second shutdown route would need its
@@ -282,7 +322,7 @@ pub async fn run_client(
         // this is the state a person meets first when the server has a typo
         // in `connect`, hasn't started yet, or sits behind a firewall, and
         // it is what distinguishes "retrying" from "hung" on the front-end.
-        send_link_state(&status_tx, LinkState::Connecting);
+        send_link_state(&status_tx, LinkState::Connecting, &display);
         let resolved = tokio::select! {
             r = target.resolve() => r,
             _ = shutdown.changed() => break,
@@ -309,6 +349,7 @@ pub async fn run_client(
                                 status_tx: status_tx.clone(),
                                 display: &display,
                                 display_input,
+                                known_server_display_input: known_server_display_input.clone(),
                             },
                             clipboard.clone(),
                             &mut shutdown,
@@ -325,12 +366,12 @@ pub async fn run_client(
                             "connect to {server_addr} rejected: untrusted server ({reason})"
                         );
                         warn!("{msg}");
-                        send_link_state(&status_tx, LinkState::Failed(msg));
+                        send_link_state(&status_tx, LinkState::Failed(msg), &display);
                     }
                     Err(e) => {
                         let msg = format!("connect to {server_addr} failed: {e}");
                         debug!("{msg}");
-                        send_link_state(&status_tx, LinkState::Failed(msg));
+                        send_link_state(&status_tx, LinkState::Failed(msg), &display);
                     }
                 }
             }
@@ -340,7 +381,7 @@ pub async fn run_client(
             Err(e) => {
                 let msg = format!("could not resolve {target:?}: {e}");
                 debug!("{msg}");
-                send_link_state(&status_tx, LinkState::Failed(msg));
+                send_link_state(&status_tx, LinkState::Failed(msg), &display);
             }
         }
         if *shutdown.borrow() {
@@ -376,6 +417,7 @@ async fn session(
         status_tx,
         display,
         display_input,
+        known_server_display_input,
     } = audio;
     let screens = inject.screens();
     let mut rx = peer.take_incoming();
@@ -428,6 +470,10 @@ async fn session(
         Some(Msg::Bye { reason }) => bail!("server refused: {reason}"),
         other => bail!("unexpected handshake reply: {other:?}"),
     };
+    // Shared with the IPC command loop (see `known_server_display_input`'s
+    // own doc comment) so `Command::SwitchDisplay` can answer with this
+    // even between sessions, while a reconnect is in progress.
+    *known_server_display_input.lock().unwrap() = server_display_input;
 
     // The server starts every session with its microphone closed, so without this the
     // first demand is never sent and the microphone never opens.
@@ -596,6 +642,7 @@ async fn session(
                         audio_lost: 0,
                         mic_depth_ms: mic_stats.depth_ms.load(Ordering::Relaxed) as u32,
                         mic_lost: m.lost,
+                        display_input: display.as_ref().and_then(|d| d.last_input()),
                     };
                     let _ = tx.try_send(status);
                 }

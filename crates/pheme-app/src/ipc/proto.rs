@@ -46,6 +46,11 @@ pub struct Status {
     pub audio_lost: u64,
     pub mic_depth_ms: u32,
     pub mic_lost: u64,
+    /// The monitor input this machine last successfully commanded, or
+    /// `None` when display switching is off or nothing has been commanded
+    /// yet. Rendered as a hex value, because that is how `display.input` is
+    /// written and how `pheme displays` prints it.
+    pub display_input: Option<u16>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,6 +60,10 @@ pub enum Command {
     /// Stop cleanly. The front-end sends this before restarting the child with
     /// a changed configuration.
     Stop,
+    /// Re-assert the monitor input for the machine that holds the pointer.
+    /// The window's and the tray's route to the same thing the
+    /// `hotkeys.switch_display` key does.
+    SwitchDisplay,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -120,6 +129,7 @@ mod tests {
             audio_lost: 3,
             mic_depth_ms: 0,
             mic_lost: 0,
+            display_input: Some(0x11),
         }
     }
 
@@ -134,11 +144,32 @@ mod tests {
 
     #[test]
     fn every_command_survives_a_round_trip() {
-        for c in [Command::Lock, Command::Unlock, Command::Stop] {
+        for c in [
+            Command::Lock,
+            Command::Unlock,
+            Command::Stop,
+            Command::SwitchDisplay,
+        ] {
             let mut buf = Vec::new();
             encode_frame(&c, &mut buf).unwrap();
             let (got, _) = decode_frame::<Command>(&buf).unwrap().unwrap();
             assert_eq!(got, c);
+        }
+    }
+
+    /// Break it by inserting SwitchDisplay before Stop in the enum: the
+    /// front-end and a core built from a different commit then disagree
+    /// about which number means "stop", and Save-with-restart kills the
+    /// wrong thing.
+    #[test]
+    fn command_variants_keep_their_order() {
+        for (c, want) in [
+            (Command::Lock, 0u8),
+            (Command::Unlock, 1),
+            (Command::Stop, 2),
+            (Command::SwitchDisplay, 3),
+        ] {
+            assert_eq!(postcard::to_stdvec(&c).unwrap(), vec![want]);
         }
     }
 

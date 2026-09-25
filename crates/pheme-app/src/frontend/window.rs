@@ -183,6 +183,10 @@ pub struct StatusView {
     pub audio_lost: u64,
     pub mic_depth_ms: u32,
     pub mic_lost: u64,
+    /// The monitor input this machine last successfully commanded, or
+    /// `None` when display switching is off or nothing has been commanded
+    /// yet.
+    pub display_input: Option<u16>,
     /// Set only while [`CoreState::Stopped`], and gone again the moment a
     /// fresh `Running` report arrives.
     pub stopped_reason: Option<String>,
@@ -216,6 +220,7 @@ impl StatusView {
                 self.audio_lost = status.audio_lost;
                 self.mic_depth_ms = status.mic_depth_ms;
                 self.mic_lost = status.mic_lost;
+                self.display_input = status.display_input;
             }
         }
     }
@@ -601,6 +606,21 @@ impl PhemeApp {
             }
         }
     }
+
+    /// Re-asserts the monitor's input for whichever machine holds the
+    /// pointer. The only place the tray's "Switch display" item and the
+    /// window's own button drive, for the same reason `toggle_lock` is:
+    /// two callers reimplementing one action drift apart.
+    ///
+    /// The hotkey remains the one that matters. When the monitor is showing
+    /// the wrong machine the person cannot see this window at all, which is
+    /// exactly the case the feature exists for.
+    fn switch_display(&mut self) {
+        if matches!(self.supervisor.state(), CoreState::Running(_)) {
+            self.handle
+                .block_on(self.supervisor.send(Command::SwitchDisplay));
+        }
+    }
 }
 
 impl eframe::App for PhemeApp {
@@ -633,6 +653,7 @@ impl eframe::App for PhemeApp {
                 }
                 TrayEvent::ToggleLock => self.toggle_lock(),
                 TrayEvent::StartStop => self.start_stop(),
+                TrayEvent::SwitchDisplay => self.switch_display(),
             }
         }
 
@@ -771,6 +792,12 @@ fn draw_status(ui: &mut egui::Ui, view: &StatusView) {
             ui.label(if view.locked { "yes" } else { "no" });
             ui.end_row();
 
+            ui.label(match view.display_input {
+                Some(v) => format!("Display input 0x{v:02x}"),
+                None => "Display switching off".to_string(),
+            });
+            ui.end_row();
+
             ui.label("Events/s");
             ui.label(view.events.to_string());
             ui.end_row();
@@ -831,18 +858,18 @@ fn link_state_name(state: &LinkState) -> &'static str {
     }
 }
 
-/// Start/Stop and Lock, next to the status panel -- drawn every frame,
-/// regardless of whether a tray exists.
+/// Start/Stop, Lock and Switch display, next to the status panel -- drawn
+/// every frame, regardless of whether a tray exists.
 ///
-/// Finding 3 (final review): these two actions used to live only in the
+/// Finding 3 (final review): Start/Stop and Lock used to live only in the
 /// tray's menu, which left a person on GNOME without the AppIndicator
 /// extension (the README's own stated default there) with no way to start
-/// a stopped core, and no way to lock input from the GUI at all. Both
-/// buttons call [`PhemeApp::start_stop`] and [`PhemeApp::toggle_lock`] --
-/// the exact same methods `TrayEvent::StartStop` and
-/// `TrayEvent::ToggleLock` call in `PhemeApp::update` -- rather than
-/// reimplementing either action here, so the window and the tray can never
-/// disagree about what a click does.
+/// a stopped core, and no way to lock input from the GUI at all. Every
+/// button here calls the method its matching `TrayEvent` arm calls in
+/// `PhemeApp::update` -- [`PhemeApp::start_stop`], [`PhemeApp::toggle_lock`]
+/// and [`PhemeApp::switch_display`] -- rather than reimplementing any
+/// action here, so the window and the tray can never disagree about what a
+/// click does.
 fn draw_actions(ui: &mut egui::Ui, core_state: &CoreState, app: &mut PhemeApp) {
     let running = matches!(core_state, CoreState::Running(_));
     let locked = matches!(core_state, CoreState::Running(status) if status.locked);
@@ -860,6 +887,12 @@ fn draw_actions(ui: &mut egui::Ui, core_state: &CoreState, app: &mut PhemeApp) {
             .clicked()
         {
             app.toggle_lock();
+        }
+        if ui
+            .add_enabled(running, egui::Button::new("Switch display"))
+            .clicked()
+        {
+            app.switch_display();
         }
     });
     ui.separator();
@@ -1416,6 +1449,7 @@ mod tests {
             audio_lost: 3,
             mic_depth_ms: 0,
             mic_lost: 0,
+            display_input: Some(0x11),
         }
     }
 

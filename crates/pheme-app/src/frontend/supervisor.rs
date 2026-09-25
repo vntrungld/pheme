@@ -466,6 +466,7 @@ fn starting_status(role: Role) -> Status {
         audio_lost: 0,
         mic_depth_ms: 0,
         mic_lost: 0,
+        display_input: None,
     }
 }
 

@@ -23,6 +23,7 @@ const ICON_DISCONNECTED_PNG: &[u8] = include_bytes!("../../assets/tray-disconnec
 const ID_OPEN: &str = "open";
 const ID_LOCK: &str = "lock";
 const ID_START_STOP: &str = "start_stop";
+const ID_SWITCH_DISPLAY: &str = "switch_display";
 const ID_QUIT: &str = "quit";
 
 /// What the tray's menu asked the caller to do.
@@ -36,6 +37,9 @@ pub enum TrayEvent {
     /// Stop the running core, or start one, depending on which the menu
     /// was showing when it was clicked.
     StartStop,
+    /// Re-assert the monitor input for whichever machine holds the
+    /// pointer, the same thing the recovery hotkey does.
+    SwitchDisplay,
     /// Exit the whole application, tray included.
     Quit,
 }
@@ -52,6 +56,7 @@ pub struct Tray {
     icon_disconnected: Icon,
     lock: CheckMenuItem,
     start_stop: MenuItem,
+    switch_display: MenuItem,
     /// The state last actually applied to the icon and the menu, so a
     /// caller that calls `set_state` on every frame does not rewrite the
     /// icon file (Linux writes it to disk) and the menu text that often.
@@ -148,8 +153,9 @@ impl Tray {
         let open = MenuItem::with_id(ID_OPEN, "Open", true, None);
         let lock = CheckMenuItem::with_id(ID_LOCK, "Lock input", false, false, None);
         let start_stop = MenuItem::with_id(ID_START_STOP, "Start", false, None);
+        let switch_display = MenuItem::with_id(ID_SWITCH_DISPLAY, "Switch display", false, None);
         let quit = MenuItem::with_id(ID_QUIT, "Quit", true, None);
-        let menu = Menu::with_items(&[&open, &lock, &start_stop, &quit])?;
+        let menu = Menu::with_items(&[&open, &lock, &start_stop, &switch_display, &quit])?;
 
         let icon = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
@@ -163,6 +169,7 @@ impl Tray {
             icon_disconnected,
             lock,
             start_stop,
+            switch_display,
             applied: None,
         })
     }
@@ -196,6 +203,7 @@ impl Tray {
         self.start_stop
             .set_text(if next.running { "Stop" } else { "Start" });
         self.start_stop.set_enabled(true);
+        self.switch_display.set_enabled(next.running);
 
         self.applied = Some(next);
     }
@@ -234,6 +242,7 @@ fn event_for_id(id: &str) -> Option<TrayEvent> {
         ID_OPEN => Some(TrayEvent::Open),
         ID_LOCK => Some(TrayEvent::ToggleLock),
         ID_START_STOP => Some(TrayEvent::StartStop),
+        ID_SWITCH_DISPLAY => Some(TrayEvent::SwitchDisplay),
         ID_QUIT => Some(TrayEvent::Quit),
         _ => None,
     }
@@ -398,6 +407,7 @@ mod tests {
             audio_lost: 0,
             mic_depth_ms: 0,
             mic_lost: 0,
+            display_input: None,
         }
     }
 
@@ -419,6 +429,10 @@ mod tests {
         assert_eq!(event_for_id(ID_OPEN), Some(TrayEvent::Open));
         assert_eq!(event_for_id(ID_LOCK), Some(TrayEvent::ToggleLock));
         assert_eq!(event_for_id(ID_START_STOP), Some(TrayEvent::StartStop));
+        assert_eq!(
+            event_for_id(ID_SWITCH_DISPLAY),
+            Some(TrayEvent::SwitchDisplay)
+        );
         assert_eq!(event_for_id(ID_QUIT), Some(TrayEvent::Quit));
     }
 
@@ -798,6 +812,9 @@ mod tests {
                     TrayEvent::StartStop => {
                         running = !running;
                         println!("core would now be running = {running}");
+                    }
+                    TrayEvent::SwitchDisplay => {
+                        println!("core would now re-assert the monitor input")
                     }
                     TrayEvent::Open => println!("core would now show the window"),
                 }

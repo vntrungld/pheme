@@ -600,6 +600,7 @@ pub async fn run_server(
                         audio_lost: a.lost,
                         mic_depth_ms: 0,
                         mic_lost: 0,
+                        display_input: s.display.as_ref().and_then(|d| d.last_input()),
                     };
                     let _ = tx.try_send(status);
                 }
@@ -629,12 +630,14 @@ pub async fn run_server(
             audio_lost: 0,
             mic_depth_ms: 0,
             mic_lost: 0,
+            display_input: shared.display.as_ref().and_then(|d| d.last_input()),
         };
         if let Err(e) = link.send_status(&initial).await {
             debug!("status send failed: {e}");
         }
         let shutdown_tx = shutdown_tx.clone();
         let lock = lock_handle.clone();
+        let shared = shared.clone();
         let mut status_rx = status_rx.expect("status channel exists whenever ipc does");
         tokio::spawn(async move {
             loop {
@@ -649,6 +652,15 @@ pub async fn run_server(
                     r = link.recv_command() => match r {
                         Ok(Some(Command::Lock)) => lock.set(true),
                         Ok(Some(Command::Unlock)) => lock.set(false),
+                        Ok(Some(Command::SwitchDisplay)) => {
+                            // Two statements, deliberately. The temporary guard
+                            // drops at the end of the `let`, so `execute` --
+                            // which locks `core` itself on several paths --
+                            // never runs while this holds it.
+                            let local =
+                                matches!(shared.core.lock().unwrap().active(), Active::Local);
+                            shared.execute(vec![Action::SwitchDisplay { local }]);
+                        }
                         // Stop and a closed socket are the same outcome and
                         // take the same path out: the shutdown signal Ctrl+C
                         // already uses. A second shutdown route would need its

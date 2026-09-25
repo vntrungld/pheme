@@ -135,6 +135,7 @@ async fn run_stub_core(ipc_path: &str) {
         audio_lost: 0,
         mic_depth_ms: 0,
         mic_lost: 0,
+        display_input: None,
     };
     let mut ticker = tokio::time::interval(Duration::from_millis(200));
     loop {
