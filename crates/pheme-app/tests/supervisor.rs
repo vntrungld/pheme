@@ -81,6 +81,20 @@ fn stub_main(mode: &str) -> ! {
         let rt = tokio::runtime::Runtime::new().expect("stub tokio runtime");
         rt.block_on(run_stub_core(&ipc_path));
         std::process::exit(0);
+    } else if mode == "pair-fail" {
+        // A pairing attempt that fails or times out: the real core prints
+        // its code, then `bail!`s out of `pheme_app::server::main` before
+        // ever reaching `run_server` -- so it exits nonzero without ever
+        // connecting over `--ipc` at all, same as `fail-` below but with a
+        // code printed first.
+        if std::env::args().any(|a| a == "--pair") {
+            println!(
+                "Pairing code: 654321   (valid for 120 s, run `pheme pair \
+                 <this-host> 654321` on the client)"
+            );
+        }
+        eprintln!("pairing failed: too many failed attempts");
+        std::process::exit(1);
     } else if let Some(rest) = mode.strip_prefix("exit-") {
         let code: i32 = rest.parse().unwrap_or(1);
         std::process::exit(code);
@@ -181,6 +195,10 @@ fn stub_exe() -> PathBuf {
 
 fn stub_exe_that_pairs() -> PathBuf {
     make_stub("pair")
+}
+
+fn stub_exe_whose_pairing_fails() -> PathBuf {
+    make_stub("pair-fail")
 }
 
 fn stub_exe_that_exits(code: i32) -> PathBuf {
@@ -378,6 +396,56 @@ async fn restart_pairing_adds_the_flag_and_captures_the_printed_code() {
         .await,
         "the child never reconnected after pairing"
     );
+}
+
+#[tokio::test]
+async fn a_pairing_generation_that_exits_reports_its_own_exit_reason() {
+    // Fix round 1 finding on task 11: a pairing attempt that fails or times
+    // out exits nonzero *before* ever connecting over `--ipc` -- the same
+    // shape `CoreState::Stopped` already has for a dozen other reasons, so
+    // reading `state()` alone cannot tell "the generation that printed this
+    // code just died" from "an older generation's `Stopped` hasn't been
+    // overwritten yet". `current_exit_reason` exists to answer exactly that,
+    // tied to this one generation rather than shared across every
+    // generation the `Supervisor` has ever spawned. (`window.rs`'s own
+    // `PairingCodeStatus::from_parts` tests pin what the panel does with
+    // the combination this test proves the `Supervisor` half of.)
+    let mut s = Supervisor::start(stub_exe_whose_pairing_fails(), Some(server_config()))
+        .await
+        .unwrap();
+    // The initial (non-`--pair`) generation: no code, and once it settles,
+    // no exit reason recorded against it that the pairing code could ever
+    // be confused with (it was replaced before printing anything).
+    wait_until(
+        || matches!(s.state(), CoreState::Stopped(_)),
+        Duration::from_secs(5),
+    )
+    .await;
+
+    // This stub fails almost immediately -- unlike a real, slower pairing
+    // attempt, there is no reliable window in which the code has arrived
+    // but the exit has not, so this test does not assert one; it only
+    // pins the end state both eventually reach.
+    s.restart_pairing().await.unwrap();
+    assert!(
+        wait_until(|| s.pairing_code().is_some(), Duration::from_secs(5)).await,
+        "the pairing code never reached the supervisor"
+    );
+    assert_eq!(s.pairing_code().as_deref(), Some("654321"));
+
+    assert!(
+        wait_until(|| s.current_exit_reason().is_some(), Duration::from_secs(5)).await,
+        "the failed generation's exit was never recorded against it"
+    );
+    let reason = s.current_exit_reason().unwrap();
+    assert!(
+        reason.contains("too many failed attempts"),
+        "unexpected reason: {reason}"
+    );
+    // The code is still there -- it is `PairingCodeStatus::from_parts`'s
+    // job, not the `Supervisor`'s, to stop presenting it once
+    // `current_exit_reason` is `Some`.
+    assert_eq!(s.pairing_code().as_deref(), Some("654321"));
 }
 
 #[tokio::test]

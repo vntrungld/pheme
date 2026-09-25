@@ -542,6 +542,66 @@ fn draw_pairing(ui: &mut egui::Ui, role: Option<Role>, core_state: &CoreState, a
     }
 }
 
+/// What the server pairing panel should show for the code its current
+/// generation has printed, if any. Three states, and only the first shows
+/// the code at all:
+///
+/// - [`Live`][Self::Live]: the code is still good -- its generation hasn't
+///   exited, and hasn't (yet) connected over `--ipc` to say it is serving
+///   normally.
+/// - [`Completed`][Self::Completed]: that generation connected over `--ipc`
+///   (`CoreState::Running`) -- pairing succeeded, and the code is spent.
+/// - [`Failed`][Self::Failed]: that generation's own child exited before
+///   either of the above -- a wrong code, a timeout, or anything else
+///   `pheme server --pair` can fail with.
+///
+/// Kept separate from `draw_pairing_server` itself, on the same reasoning
+/// as [`StatusView`]: which of these three a code is in is a pure
+/// reduction of a few small pieces of state, worth testing without a
+/// window (see the finding that added this: `Supervisor::state()` alone
+/// cannot tell "the generation that printed this code is over" from "an
+/// *older* generation's `Stopped` just hasn't been overwritten yet",
+/// because it is shared across every generation a `Supervisor` ever
+/// spawns).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PairingCodeStatus {
+    /// No code has been printed (or asked for) yet.
+    None,
+    Live(String),
+    Completed(String),
+    Failed {
+        code: String,
+        reason: String,
+    },
+}
+
+impl PairingCodeStatus {
+    /// Reduces what the current generation has reported into one of the
+    /// three states above.
+    ///
+    /// `exit_reason` is `Supervisor::current_exit_reason()`: `Some` only
+    /// once *this* generation's own child has exited, which is what
+    /// distinguishes `Failed` from `Live` even while the shared
+    /// `core_state` still reads `Stopped` from whatever generation came
+    /// before this one.
+    fn from_parts(
+        code: Option<String>,
+        exit_reason: Option<String>,
+        core_state: &CoreState,
+    ) -> Self {
+        let Some(code) = code else {
+            return Self::None;
+        };
+        if let Some(reason) = exit_reason {
+            return Self::Failed { code, reason };
+        }
+        match core_state {
+            CoreState::Running(_) => Self::Completed(code),
+            _ => Self::Live(code),
+        }
+    }
+}
+
 /// The server half of the pairing panel: a button that restarts the
 /// supervised core with `--pair`, and the code it prints once it has.
 fn draw_pairing_server(ui: &mut egui::Ui, core_state: &CoreState, app: &mut PhemeApp) {
@@ -554,17 +614,16 @@ fn draw_pairing_server(ui: &mut egui::Ui, core_state: &CoreState, app: &mut Phem
             app.action_error = Some(format!("could not start pairing: {e:#}"));
         }
     }
-    match (app.supervisor.pairing_code(), core_state) {
-        (Some(code), CoreState::Running(_)) => {
-            // The generation that printed this code has since connected
-            // over `--ipc` and is serving normally -- pairing ended one way
-            // or another, so the code on screen is stale, not live.
-            ui.label(format!(
-                "Last pairing code was {code}, now inactive. Click Start \
-                 pairing again for a new one."
-            ));
+    let status = PairingCodeStatus::from_parts(
+        app.supervisor.pairing_code(),
+        app.supervisor.current_exit_reason(),
+        core_state,
+    );
+    match status {
+        PairingCodeStatus::None => {
+            ui.label("Click Start pairing to get a code, then enter it on the client.");
         }
-        (Some(code), _) => {
+        PairingCodeStatus::Live(code) => {
             ui.label(format!("Pairing code: {code}"));
             ui.label(
                 "Enter this on the client's pairing panel (or run `pheme \
@@ -572,8 +631,23 @@ fn draw_pairing_server(ui: &mut egui::Ui, core_state: &CoreState, app: &mut Phem
                  client.",
             );
         }
-        (None, _) => {
-            ui.label("Click Start pairing to get a code, then enter it on the client.");
+        PairingCodeStatus::Completed(code) => {
+            // The generation that printed this code has since connected
+            // over `--ipc` and is serving normally -- pairing succeeded,
+            // so the code on screen is stale, not live.
+            ui.label(format!(
+                "Last pairing code was {code}, now inactive: pairing \
+                 succeeded. Click Start pairing again for a new one."
+            ));
+        }
+        PairingCodeStatus::Failed { code, reason } => {
+            // Same visual pattern `action_error` already uses: red, plain
+            // text. A dead code shown as though it were live is worse than
+            // showing nothing -- the whole reason this state exists.
+            ui.colored_label(
+                egui::Color32::RED,
+                format!("Pairing code {code} is no longer valid: {reason}"),
+            );
         }
     }
 }
@@ -781,6 +855,96 @@ mod tests {
         assert_eq!(
             view.state,
             Some(LinkState::Failed("address already in use".into()))
+        );
+    }
+
+    // --- `PairingCodeStatus::from_parts` ------------------------------
+    //
+    // The three states a pairing code can be in, pinned directly against
+    // the pure reduction -- no window, no Supervisor, no process.
+
+    #[test]
+    fn no_code_yet_is_none_regardless_of_core_state() {
+        assert_eq!(
+            PairingCodeStatus::from_parts(None, None, &CoreState::NoConfig),
+            PairingCodeStatus::None
+        );
+        assert_eq!(
+            PairingCodeStatus::from_parts(None, None, &CoreState::Stopped("x".into())),
+            PairingCodeStatus::None
+        );
+    }
+
+    #[test]
+    fn a_code_with_its_generation_still_alive_is_live() {
+        // The case that matters most while pairing has just started: the
+        // *previous* generation's `Stopped` can still be sitting in the
+        // shared `core_state` (`stop_current` inside `restart_pairing` ran
+        // before the new generation reported anything), and that must not
+        // be mistaken for the new code having already died.
+        assert_eq!(
+            PairingCodeStatus::from_parts(
+                Some("123456".into()),
+                None,
+                &CoreState::Stopped("previous generation exited normally".into()),
+            ),
+            PairingCodeStatus::Live("123456".into())
+        );
+        assert_eq!(
+            PairingCodeStatus::from_parts(Some("123456".into()), None, &CoreState::NoConfig),
+            PairingCodeStatus::Live("123456".into())
+        );
+    }
+
+    #[test]
+    fn a_code_whose_generation_connected_over_ipc_is_completed() {
+        // The generation that printed this code went on to connect over
+        // `--ipc` and report a real `Status` -- pairing succeeded.
+        let status = Status {
+            state: LinkState::Listening,
+            ..server_status_with_peer("laptop-win")
+        };
+        assert_eq!(
+            PairingCodeStatus::from_parts(Some("123456".into()), None, &CoreState::Running(status)),
+            PairingCodeStatus::Completed("123456".into())
+        );
+    }
+
+    #[test]
+    fn a_code_whose_generation_exited_is_failed_not_live() {
+        // The finding this test exists for: a pairing attempt that failed
+        // or timed out exits non-zero, which the shared `core_state`
+        // reports as `Stopped` -- indistinguishable, by state alone, from
+        // the previous generation's own `Stopped` still sitting there
+        // while the new one is genuinely still alive and waiting. Without
+        // `exit_reason`, this fell into the same bucket as
+        // `a_code_with_its_generation_still_alive_is_live` above and kept
+        // presenting a dead code as though it were still good.
+        assert_eq!(
+            PairingCodeStatus::from_parts(
+                Some("123456".into()),
+                Some("exited with status 1: pairing failed: wrong code".into()),
+                &CoreState::Stopped("exited with status 1: pairing failed: wrong code".into()),
+            ),
+            PairingCodeStatus::Failed {
+                code: "123456".into(),
+                reason: "exited with status 1: pairing failed: wrong code".into(),
+            }
+        );
+        // The failure reads the same even if `core_state` has not caught
+        // up yet -- `exit_reason` alone decides this, precisely because it
+        // is the one piece of state tied to *this* generation rather than
+        // shared with every other one a `Supervisor` has ever spawned.
+        assert_eq!(
+            PairingCodeStatus::from_parts(
+                Some("123456".into()),
+                Some("timed out".into()),
+                &CoreState::NoConfig,
+            ),
+            PairingCodeStatus::Failed {
+                code: "123456".into(),
+                reason: "timed out".into(),
+            }
         );
     }
 

@@ -53,6 +53,20 @@ struct Generation {
     /// it has. Always present but always `None` for a generation not spawned
     /// with `--pair` -- see [`Supervisor::restart_pairing`].
     pairing_code: Arc<Mutex<Option<String>>>,
+    /// Set the moment *this* generation's own child has exited -- on its
+    /// own, or because it was stopped -- to the same human-readable reason
+    /// [`state`][Self] gets. `None` while it is still alive.
+    ///
+    /// Exists because `state` is shared across every generation a
+    /// `Supervisor` ever spawns: reading `Stopped(reason)` there does not
+    /// say *which* generation stopped, and while pairing is starting up
+    /// that is exactly the ambiguity that matters -- `stop_current`
+    /// (inside `restart_pairing`) leaves the *previous* generation's own
+    /// `Stopped` sitting in `state` for a moment before the new one has
+    /// reported anything at all. Reading this cell instead answers "is the
+    /// generation that printed the pairing code I'm holding actually still
+    /// running", which `state` alone cannot.
+    exited: Arc<Mutex<Option<String>>>,
 }
 
 /// A message the stop path sends to the task that owns the child.
@@ -114,6 +128,17 @@ impl Supervisor {
                 .expect("pairing code mutex poisoned")
                 .clone()
         })
+    }
+
+    /// The reason the *current* generation's own child has exited, if it
+    /// has -- `None` while it is still running. See the doc comment on
+    /// `Generation::exited` for why this, and not `state()`, is what tells
+    /// a pairing code that is still live apart from one whose generation is
+    /// over.
+    pub fn current_exit_reason(&self) -> Option<String> {
+        self.current
+            .as_ref()
+            .and_then(|gen| gen.exited.lock().expect("exited mutex poisoned").clone())
     }
 
     /// Sends a command to the running child, if any. Silently dropped if
@@ -255,8 +280,15 @@ async fn spawn_generation(
     };
     let stderr_rx = capture_stderr(&mut child);
 
+    let exited = Arc::new(Mutex::new(None));
     let (child_cmd_tx, child_cmd_rx) = mpsc::channel(1);
-    let child_task = tokio::spawn(run_child(child, stderr_rx, state.clone(), child_cmd_rx));
+    let child_task = tokio::spawn(run_child(
+        child,
+        stderr_rx,
+        state.clone(),
+        exited.clone(),
+        child_cmd_rx,
+    ));
 
     let (ipc_cmd_tx, ipc_cmd_rx) = mpsc::channel(4);
     let ipc_task = tokio::spawn(run_ipc(listener, state, ipc_cmd_rx));
@@ -268,6 +300,7 @@ async fn spawn_generation(
         ipc_task,
         child_task,
         pairing_code,
+        exited,
     })
 }
 
@@ -314,13 +347,15 @@ async fn run_child(
     mut child: Child,
     stderr_rx: oneshot::Receiver<String>,
     state: Arc<Mutex<CoreState>>,
+    exited: Arc<Mutex<Option<String>>>,
     mut cmd_rx: mpsc::Receiver<ChildCmd>,
 ) {
     tokio::select! {
         status = child.wait() => {
             let stderr = stderr_rx.await.unwrap_or_default();
             let reason = describe_exit(status, &stderr);
-            *state.lock().expect("state mutex poisoned") = CoreState::Stopped(reason);
+            *state.lock().expect("state mutex poisoned") = CoreState::Stopped(reason.clone());
+            *exited.lock().expect("exited mutex poisoned") = Some(reason);
         }
         cmd = cmd_rx.recv() => {
             let Some(ChildCmd::Stop(deadline, done)) = cmd else {
@@ -335,7 +370,8 @@ async fn run_child(
             };
             let stderr = stderr_rx.await.unwrap_or_default();
             let reason = describe_exit(status, &stderr);
-            *state.lock().expect("state mutex poisoned") = CoreState::Stopped(reason);
+            *state.lock().expect("state mutex poisoned") = CoreState::Stopped(reason.clone());
+            *exited.lock().expect("exited mutex poisoned") = Some(reason);
             let _ = done.send(());
         }
     }
