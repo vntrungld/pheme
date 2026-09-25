@@ -57,6 +57,16 @@ impl ClipSync {
         self.last = Some(text.to_string());
         true
     }
+
+    /// Forget the last exchange, so the same text is accepted again.
+    ///
+    /// Called when writing the clipboard failed. `incoming` has already
+    /// recorded the text as exchanged, but the clipboard never received it;
+    /// without this, the peer re-sending that same text — the natural retry —
+    /// would be refused as a repeat and that copy could never land here.
+    pub fn forget(&mut self) {
+        self.last = None;
+    }
 }
 
 #[cfg(test)]
@@ -110,6 +120,15 @@ mod tests {
     fn an_empty_message_does_not_clear_the_local_clipboard() {
         let mut s = ClipSync::new();
         assert!(!s.incoming(""));
+    }
+
+    #[test]
+    fn forgetting_lets_the_same_text_arrive_again() {
+        let mut s = ClipSync::new();
+        assert!(s.incoming("retry me"));
+        assert!(!s.incoming("retry me"));
+        s.forget();
+        assert!(s.incoming("retry me"));
     }
 
     #[test]

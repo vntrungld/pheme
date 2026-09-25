@@ -3,6 +3,8 @@
 //!
 //! Sub-project 5 design §3.1, §3.4 and §3.6.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 
 use crossbeam_channel::{unbounded, Sender};
@@ -24,6 +26,9 @@ enum Cmd {
 #[derive(Clone)]
 pub struct ClipboardService {
     tx: Sender<Cmd>,
+    /// Set once the worker thread has ended, so a later `send_to`/`apply`
+    /// reports its disappearance once instead of failing silently forever.
+    dead: Arc<AtomicBool>,
 }
 
 impl ClipboardService {
@@ -38,6 +43,11 @@ impl ClipboardService {
     /// `None` is a supported state, not a failure: GNOME's Wayland compositor
     /// implements no data-control protocol. Callers keep running without
     /// clipboard sharing.
+    ///
+    /// Must be called from within a tokio runtime: it captures the current
+    /// `Handle` via `Handle::current()`, which panics otherwise. It also
+    /// blocks the calling thread until the clipboard has finished opening (or
+    /// failed to).
     pub fn spawn(
         open: impl FnOnce() -> Result<Box<dyn Clipboard>, ClipError> + Send + 'static,
     ) -> Option<ClipboardService> {
@@ -60,8 +70,8 @@ impl ClipboardService {
                 };
                 let mut sync = ClipSync::new();
                 // A clipboard that has stopped answering would otherwise log on
-                // every single crossing. The first failure is worth a warning;
-                // the rest are not.
+                // every single crossing, on either path. The first failure is
+                // worth a warning; the rest are not.
                 let mut reported = false;
                 while let Ok(cmd) = rx.recv() {
                     match cmd {
@@ -71,7 +81,13 @@ impl ClipboardService {
                                     reported = false;
                                     t
                                 }
-                                Ok(None) => continue,
+                                Ok(None) => {
+                                    // No text on the clipboard is a working
+                                    // backend, not a failure: the next real
+                                    // failure deserves its own warning.
+                                    reported = false;
+                                    continue;
+                                }
                                 Err(e) => {
                                     if reported {
                                         debug!("reading the clipboard failed: {e}");
@@ -103,7 +119,20 @@ impl ClipboardService {
                                 continue;
                             }
                             if let Err(e) = clip.set_text(&text) {
-                                warn!("writing the clipboard failed: {e}");
+                                // The policy already recorded this text as
+                                // exchanged, but the clipboard never received
+                                // it. Forget it, or the peer's natural retry —
+                                // the same text again — would be refused as a
+                                // repeat and could never land here.
+                                sync.forget();
+                                if reported {
+                                    debug!("writing the clipboard failed: {e}");
+                                } else {
+                                    warn!("writing the clipboard failed: {e}");
+                                    reported = true;
+                                }
+                            } else {
+                                reported = false;
                             }
                         }
                     }
@@ -111,17 +140,29 @@ impl ClipboardService {
             })
             .expect("spawning the clipboard thread");
         match ready_rx.recv() {
-            Ok(true) => Some(ClipboardService { tx }),
+            Ok(true) => Some(ClipboardService {
+                tx,
+                dead: Arc::new(AtomicBool::new(false)),
+            }),
             // `Err` means the thread ended before reporting, which is the same
             // outcome for the caller as an unavailable clipboard.
             _ => None,
         }
     }
 
+    /// Reports the worker's disappearance once rather than on every crossing.
+    fn report_gone(&self) {
+        if !self.dead.swap(true, Ordering::Relaxed) {
+            warn!("the clipboard worker stopped; clipboard sharing is off for this session");
+        }
+    }
+
     /// Reads the local clipboard and sends it to `peer`, on the worker thread.
     /// Returns immediately; nothing on the input path waits for it.
     pub fn send_to(&self, peer: PeerSender) {
-        let _ = self.tx.send(Cmd::SendTo(peer));
+        if self.tx.send(Cmd::SendTo(peer)).is_err() {
+            self.report_gone();
+        }
     }
 
     /// Applies a `Msg::Clipboard` that arrived from the peer. Anything else is
@@ -136,7 +177,9 @@ impl ClipboardService {
         }
         match std::str::from_utf8(data) {
             Ok(text) => {
-                let _ = self.tx.send(Cmd::Apply(text.to_string()));
+                if self.tx.send(Cmd::Apply(text.to_string())).is_err() {
+                    self.report_gone();
+                }
             }
             // A peer sending bytes that are not text is not a reason to stop.
             Err(e) => debug!("clipboard message was not valid UTF-8: {e}"),
@@ -217,28 +260,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failing_clipboard_does_not_stop_the_service() {
-        // A compositor restart, or an X11 selection owner that went away: the
-        // session must continue, and a later working call must still work.
+    async fn a_failed_write_does_not_lose_the_text_it_could_not_store() {
+        // A compositor restart, or an X11 selection owner that went away. The
+        // peer's natural retry is the same text again, and it must land: the
+        // policy recorded it as exchanged before the write failed.
         let (clip, handle) = MockClipboard::new();
         let s = ClipboardService::spawn(move || Ok(Box::new(clip) as Box<dyn Clipboard>)).unwrap();
         handle.fail_with("the compositor went away");
         s.apply(&Msg::Clipboard {
             mime: CLIP_MIME.to_string(),
-            data: b"lost".to_vec(),
+            data: b"same text".to_vec(),
         });
         std::thread::sleep(Duration::from_millis(50));
-        assert_eq!(
-            handle.sets(),
-            0,
-            "a failing backend must not record a write"
-        );
+        assert_eq!(handle.text(), None, "a failing backend stored something");
         handle.stop_failing();
         s.apply(&Msg::Clipboard {
             mime: CLIP_MIME.to_string(),
-            data: b"found".to_vec(),
+            data: b"same text".to_vec(),
         });
-        assert!(eventually(|| handle.text().as_deref() == Some("found")));
+        assert!(
+            eventually(|| handle.text().as_deref() == Some("same text")),
+            "the retry of the same text was refused as a repeat"
+        );
     }
 
     #[tokio::test]
