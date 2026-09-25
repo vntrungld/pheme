@@ -1,7 +1,7 @@
 //! Client runtime: QUIC peer → core → injection, with automatic reconnect.
 
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -98,12 +98,55 @@ struct SessionExtras<'a> {
     display: &'a Option<DisplayService>,
     /// This machine's own `[display] input`, sent in `Hello`.
     display_input: Option<u16>,
+    /// Shared with the IPC command loop, which runs independently of any
+    /// one session: `session` fills it in as it learns each fact, and
+    /// `Command::SwitchDisplay` reads it there.
+    switch: Arc<SwitchDisplayState>,
+}
+
+/// What `Command::SwitchDisplay` needs, shared between `session` and the
+/// IPC command loop.
+///
+/// The button in the window and the item in the tray both promise the same
+/// thing the `switch_display` hotkey does: re-assert the input of whichever
+/// machine holds the pointer, on *both* machines, because only the one the
+/// monitor is currently showing can be heard (design section 8). The server
+/// computes that from its own core. A client has no core that knows, so it
+/// keeps the three facts here: which input the server declared, whether the
+/// pointer is on this machine, and who to tell.
+#[derive(Default)]
+struct SwitchDisplayState {
     /// The server's own `[display] input`, as last learned from a
-    /// `HelloAck` -- shared with the IPC command loop, which runs
-    /// independently of any one session and has no peer of its own to ask.
-    /// `Command::SwitchDisplay` reads it there to re-assert the input this
-    /// machine last knew the server was cabled to.
-    known_server_display_input: Arc<Mutex<Option<u16>>>,
+    /// `HelloAck`. Kept across a reconnect, so a click that lands while the
+    /// link is down still knows the value.
+    server_input: Mutex<Option<u16>>,
+    /// Whether the pointer is on this machine: `Msg::Enter` sets it,
+    /// `Msg::Leave`, `Msg::Bye` and the end of a session clear it. False
+    /// between sessions, which is right -- with no link there is no
+    /// crossing, and the pointer is on the server.
+    pointer_here: AtomicBool,
+    /// The live session's peer, so the request can be sent to the server as
+    /// well as carried out here. `None` between sessions.
+    peer: Mutex<Option<pheme_net::PeerSender>>,
+}
+
+impl SwitchDisplayState {
+    /// The input to ask both machines for: this machine's own when the
+    /// pointer is here, the server's when it is there.
+    fn target(&self, own_input: Option<u16>) -> Option<u16> {
+        if self.pointer_here.load(Ordering::Relaxed) {
+            own_input
+        } else {
+            *self.server_input.lock().unwrap()
+        }
+    }
+
+    /// Every session ends with the pointer back on the server and no peer
+    /// to talk to. The server's declared input is deliberately kept.
+    fn session_ended(&self) {
+        self.pointer_here.store(false, Ordering::Relaxed);
+        *self.peer.lock().unwrap() = None;
+    }
 }
 
 /// Pushes a `Status` carrying only `state`, with every other field at its
@@ -214,12 +257,10 @@ pub async fn run_client(
     let mic_stats = mic_stats.unwrap_or_default();
     let mut mic = RecvSide::spawn(mic, mic_stats.clone());
 
-    // The server's own `[display] input`, as last learned from a `HelloAck`.
-    // Set inside `session`, once per successful handshake, and read by the
-    // IPC command loop below -- which is spawned once, independent of any
-    // particular session, and so has no live peer of its own to ask when
-    // `Command::SwitchDisplay` arrives.
-    let known_server_display_input: Arc<Mutex<Option<u16>>> = Arc::new(Mutex::new(None));
+    // What the IPC command loop needs to answer `Command::SwitchDisplay`.
+    // Written inside `session`, read by a task that is spawned once and
+    // outlives every session, so it has no peer of its own to ask.
+    let switch: Arc<SwitchDisplayState> = Arc::new(SwitchDisplayState::default());
 
     // `status_tx` is `Some` exactly when a front-end is attached: `session`'s per-second
     // tick pushes onto it, and the IPC command loop below drains it onto the socket. A
@@ -266,7 +307,7 @@ pub async fn run_client(
         // and a shared counter -- so this task gets its own, independent of
         // the reference `session` borrows every time it runs.
         let display_for_cmd = display.clone();
-        let known_server_display_input = known_server_display_input.clone();
+        let switch_for_cmd = Arc::clone(&switch);
         let mut status_rx = status_rx.expect("status channel exists whenever ipc does");
         tokio::spawn(async move {
             loop {
@@ -284,18 +325,36 @@ pub async fn run_client(
                         // to set. Accepted and ignored rather than reaching
                         // for a core that has nothing to change.
                         Ok(Some(Command::Lock)) | Ok(Some(Command::Unlock)) => {}
-                        // There is no core to ask and no peer to tell -- the
-                        // server owns the hotkey -- so this re-asserts the
-                        // input this machine last learned the server is
-                        // cabled to. Unlike `session`'s own `Msg::Leave`
-                        // handling, which calls `switch_to` and so can be
-                        // deduped or held by the cooldown policy, this is a
-                        // recovery action and calls `force`, which bypasses
-                        // both on purpose.
+                        // The same thing the hotkey does on the server,
+                        // which is what the window, the tray and
+                        // `Command::SwitchDisplay`'s own documentation all
+                        // promise: work out which machine holds the
+                        // pointer, then ask *both* machines for that
+                        // machine's input. Only the one the monitor is
+                        // currently showing can be heard, and it is never
+                        // knowable from here which one that is (design
+                        // section 8).
+                        //
+                        // `force`, not `switch_to`: a person clicking this
+                        // is correcting a monitor the policy's belief about
+                        // is already wrong, so the dedupe and the cooldown
+                        // are exactly what must not apply.
                         Ok(Some(Command::SwitchDisplay)) => {
-                            let v = *known_server_display_input.lock().unwrap();
-                            if let (Some(d), Some(v)) = (display_for_cmd.as_ref(), v) {
-                                d.force(v);
+                            if let Some(v) = switch_for_cmd.target(display_input) {
+                                if let Some(d) = display_for_cmd.as_ref() {
+                                    d.force(v);
+                                }
+                                // Cloned out of the lock before the await:
+                                // a std `Mutex` guard must not be held
+                                // across one.
+                                let peer = switch_for_cmd.peer.lock().unwrap().clone();
+                                if let Some(p) = peer {
+                                    if let Err(e) =
+                                        p.send_control(&Msg::SwitchDisplay { input: v }).await
+                                    {
+                                        debug!("switch display send failed: {e}");
+                                    }
+                                }
                             }
                         }
                         // Stop and a closed socket are the same outcome and
@@ -352,7 +411,7 @@ pub async fn run_client(
                                 status_tx: status_tx.clone(),
                                 display: &display,
                                 display_input,
-                                known_server_display_input: known_server_display_input.clone(),
+                                switch: Arc::clone(&switch),
                             },
                             clipboard.clone(),
                             &mut shutdown,
@@ -362,6 +421,9 @@ pub async fn run_client(
                             Ok(()) => info!("disconnected from server"),
                             Err(e) => warn!("session ended: {e}"),
                         }
+                        // However that session ended, there is no peer to
+                        // ask any more and the pointer is not here.
+                        switch.session_ended();
                         backoff.note_connected_for(started.elapsed());
                     }
                     Err(NetError::Untrusted(reason)) => {
@@ -420,7 +482,7 @@ async fn session(
         status_tx,
         display,
         display_input,
-        known_server_display_input,
+        switch,
     } = audio;
     let screens = inject.screens();
     let mut rx = peer.take_incoming();
@@ -473,10 +535,11 @@ async fn session(
         Some(Msg::Bye { reason }) => bail!("server refused: {reason}"),
         other => bail!("unexpected handshake reply: {other:?}"),
     };
-    // Shared with the IPC command loop (see `known_server_display_input`'s
-    // own doc comment) so `Command::SwitchDisplay` can answer with this
-    // even between sessions, while a reconnect is in progress.
-    *known_server_display_input.lock().unwrap() = server_display_input;
+    // Shared with the IPC command loop (see `SwitchDisplayState`) so
+    // `Command::SwitchDisplay` can answer with this even between sessions,
+    // while a reconnect is in progress.
+    *switch.server_input.lock().unwrap() = server_display_input;
+    *switch.peer.lock().unwrap() = Some(sender.clone());
 
     // The server starts every session with its microphone closed, so without this the
     // first demand is never sent and the microphone never opens.
@@ -507,6 +570,7 @@ async fn session(
                 Some(Msg::Ping(n)) => { let _ = sender.send_control(&Msg::Pong(n)).await; }
                 Some(Msg::Pong(_)) => {}
                 Some(Msg::Bye { reason }) => {
+                    switch.pointer_here.store(false, Ordering::Relaxed);
                     // The pointer is going back to the server (or the server is
                     // gone), so the client's clipboard goes with it (§3.1).
                     if let Some(c) = &clipboard {
@@ -525,6 +589,7 @@ async fn session(
                     // The pointer is going back to the server, so the client's
                     // clipboard goes with it (§3.1).
                     if matches!(m, Msg::Leave { .. }) {
+                        switch.pointer_here.store(false, Ordering::Relaxed);
                         if let Some(c) = &clipboard {
                             c.send_to(sender.clone());
                         }
@@ -544,6 +609,9 @@ async fn session(
                     // because this machine was not the one on screen, gets
                     // its one chance to find one.
                     if matches!(m, Msg::Enter { .. }) {
+                        // Also the only place the front-end's "Switch
+                        // display" can learn that the pointer is here.
+                        switch.pointer_here.store(true, Ordering::Relaxed);
                         if let (Some(d), Some(v)) = (display, display_input) {
                             d.became_displayed(v);
                         }

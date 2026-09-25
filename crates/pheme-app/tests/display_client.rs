@@ -14,12 +14,13 @@ use std::time::{Duration, Instant};
 use pheme_app::client::{run_client, ClientDeps};
 use pheme_app::config::DisplayCfg;
 use pheme_app::display::DisplayService;
+use pheme_app::ipc::{Command, IpcConnection, IpcListener};
 use pheme_app::target::Target;
 use pheme_display::mock::{opens_once, MockMonitor, MockMonitorHandle};
-use pheme_input::mock::MockInject;
+use pheme_input::mock::{InjectCall, MockInject, MockInjectLog};
 use pheme_net::{Endpoint, Identity, Incoming, Peer, TrustStore};
-use pheme_proto::{AudioParams, Msg, ScreenInfo, PROTOCOL_VERSION};
-use tokio::sync::watch;
+use pheme_proto::{AudioParams, Modifiers, Msg, ScreenInfo, PROTOCOL_VERSION};
+use tokio::sync::{mpsc, watch};
 
 /// The input this machine (the client under test) is cabled to.
 const CLIENT_INPUT: u16 = 0x0f;
@@ -62,6 +63,17 @@ struct Rig {
     /// Held, not dropped: dropping it closes the connection and the client
     /// would tear the session down underneath the test.
     peer: Peer,
+    /// Control messages from the client, already taken from `peer`.
+    rx: mpsc::Receiver<Msg>,
+    /// The front-end's side of the IPC socket, for the tests that click a
+    /// button rather than move a pointer. `None` unless the rig was asked
+    /// for one, because binding a socket per test is not free.
+    gui: Option<IpcConnection>,
+    /// What the client injected. The session and the IPC command loop are
+    /// separate tasks reading separate sockets, so a command sent from the
+    /// test can overtake a `Msg` sent from the test; this is how a test
+    /// waits for the session to have caught up first.
+    inj: MockInjectLog,
 }
 
 impl Rig {
@@ -76,6 +88,17 @@ impl Rig {
 /// 9 -- and handing back `SERVER_INPUT` in the `HelloAck`, which the client
 /// must keep for the crossing-back hook (step 2).
 async fn spawn_rig() -> Rig {
+    rig(false).await
+}
+
+/// As `spawn_rig`, but with a front-end attached, so a test can send the
+/// `Command::SwitchDisplay` the window's button and the tray's item both
+/// send.
+async fn spawn_rig_with_gui() -> Rig {
+    rig(true).await
+}
+
+async fn rig(gui: bool) -> Rig {
     let sdir = tempfile::tempdir().unwrap();
     let cdir = tempfile::tempdir().unwrap();
     let sid = Identity::load_or_create(sdir.path(), "server").unwrap();
@@ -89,7 +112,7 @@ async fn spawn_rig() -> Rig {
     let server_addr = server_ep.local_addr().unwrap();
     let client_ep = Endpoint::client(&cid, ctrust).unwrap();
 
-    let (inject, _inj) = MockInject::new(screens(1000, 500));
+    let (inject, inj) = MockInject::new(screens(1000, 500));
     // The monitor starts on this machine's own input, which is what it
     // really shows before any crossing happens.
     let (monitor, mon) = MockMonitor::new("MOCK", "mock", CLIENT_INPUT);
@@ -104,6 +127,16 @@ async fn spawn_rig() -> Rig {
         Box::new(opens_once(monitor)),
     )
     .expect("the feature is configured on");
+
+    // Bound before the client is spawned: `run_client` connects to this
+    // socket as its first act when it is given one.
+    let mut listener = match gui {
+        true => Some(IpcListener::bind().await.expect("binding the ipc socket")),
+        false => None,
+    };
+    let ipc = listener
+        .as_ref()
+        .map(|l| std::path::PathBuf::from(l.path().to_string()));
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let client = tokio::spawn(run_client(
@@ -120,11 +153,15 @@ async fn spawn_rig() -> Rig {
             clipboard: None,
             display: Some(display),
             display_input: Some(CLIENT_INPUT),
-            ipc: None,
+            ipc,
         },
         shutdown_tx.clone(),
         shutdown_rx,
     ));
+    let gui = match listener.as_mut() {
+        Some(l) => Some(l.accept().await.expect("the client never attached")),
+        None => None,
+    };
 
     let Ok(Incoming::Peer(mut peer)) = server_ep.accept().await else {
         panic!("the client never connected");
@@ -154,6 +191,24 @@ async fn spawn_rig() -> Rig {
         shutdown_tx,
         mon,
         peer,
+        rx,
+        gui,
+        inj,
+    }
+}
+
+/// Reads until a `SwitchDisplay` arrives, ignoring the handshake and status
+/// traffic around it.
+async fn next_switch_display(rx: &mut mpsc::Receiver<Msg>) -> u16 {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(left, rx.recv()).await {
+            Ok(Some(Msg::SwitchDisplay { input })) => return input,
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("the control stream ended before a SwitchDisplay arrived"),
+            Err(_) => panic!("no SwitchDisplay arrived within 5 s"),
+        }
     }
 }
 
@@ -211,6 +266,91 @@ async fn a_switch_display_from_the_server_reaches_the_monitor() {
         wait_until(|| mon.input() == OTHER_INPUT, Duration::from_secs(5)).await,
         "the server's request never reached the monitor; it was left on {:#04x}",
         mon.input()
+    );
+    rig.shutdown().await;
+}
+
+/// The front-end's "Switch display", on the client.
+///
+/// The window, the tray and `Command::SwitchDisplay`'s own documentation
+/// all say the same thing: it re-asserts the input of whichever machine
+/// holds the pointer, and does what the hotkey does. What it used to do was
+/// force the *server's* input unconditionally, so a click while the pointer
+/// was on this machine threw the picture over to the machine the person was
+/// not using, and the server was never asked at all.
+///
+/// Break it by reading `server_input` directly instead of
+/// `SwitchDisplayState::target` -- that is the old behaviour, and the first
+/// pair of assertions fails. Break it by dropping the `send_control`, and
+/// both `next_switch_display` calls time out: only the machine the monitor
+/// is listening to can act, and this end can never know which one that is.
+///
+/// The two halves ask for different values, so neither can pass for the
+/// other's reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_gui_switch_asks_for_the_machine_that_holds_the_pointer() {
+    let mut rig = spawn_rig_with_gui().await;
+
+    // The pointer is here: the target is this machine's own input.
+    rig.peer
+        .sender()
+        .send_control(&Msg::Enter {
+            seq: 1,
+            x: 10,
+            y: 20,
+            mods: Modifiers(0),
+        })
+        .await
+        .expect("sending Enter");
+    // The session task and the IPC command loop read different sockets,
+    // so the command can overtake the `Enter` unless the test waits: the
+    // injected warp is the client session having processed it.
+    assert!(
+        wait_until(
+            || rig.inj.calls().contains(&InjectCall::MoveAbs(10, 20)),
+            Duration::from_secs(5)
+        )
+        .await,
+        "the client never acted on the Enter"
+    );
+    let gui = rig.gui.as_mut().expect("the rig was asked for a front-end");
+    gui.send_command(Command::SwitchDisplay)
+        .await
+        .expect("sending the command");
+    assert_eq!(
+        next_switch_display(&mut rig.rx).await,
+        CLIENT_INPUT,
+        "with the pointer here, both machines must be asked for this machine's input"
+    );
+    let mon = rig.mon.clone();
+    assert!(
+        wait_until(|| mon.input() == CLIENT_INPUT, Duration::from_secs(5)).await,
+        "the monitor was left on {:#04x}, not this machine's {CLIENT_INPUT:#04x}",
+        mon.input()
+    );
+
+    // And back: the pointer is on the server, so the target is the
+    // server's input.
+    rig.peer
+        .sender()
+        .send_control(&Msg::Leave { seq: 2 })
+        .await
+        .expect("sending Leave");
+    // Same race, and this time the crossing back has a visible effect of
+    // its own: the client commands its own monitor to the server's input.
+    let mon = rig.mon.clone();
+    assert!(
+        wait_until(|| mon.input() == SERVER_INPUT, Duration::from_secs(5)).await,
+        "the client never acted on the Leave"
+    );
+    let gui = rig.gui.as_mut().expect("the rig was asked for a front-end");
+    gui.send_command(Command::SwitchDisplay)
+        .await
+        .expect("sending the command");
+    assert_eq!(
+        next_switch_display(&mut rig.rx).await,
+        SERVER_INPUT,
+        "with the pointer on the server, both machines must be asked for the server's input"
     );
     rig.shutdown().await;
 }

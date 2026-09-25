@@ -60,9 +60,15 @@ pub enum Command {
     /// Stop cleanly. The front-end sends this before restarting the child with
     /// a changed configuration.
     Stop,
-    /// Re-assert the monitor input for the machine that holds the pointer.
-    /// The window's and the tray's route to the same thing the
-    /// `hotkeys.switch_display` key does.
+    /// Re-assert the monitor input for the machine that holds the pointer,
+    /// on both machines -- only the one the monitor is currently showing
+    /// can be heard. The window's and the tray's route to the same thing
+    /// the `hotkeys.switch_display` key does.
+    ///
+    /// Both roles honour it and both work it out the same way. The server
+    /// asks its core which machine has the pointer; the client, which has
+    /// no core that knows, tracks it from the `Enter` and `Leave` it is
+    /// sent (`SwitchDisplayState` in `client.rs`).
     SwitchDisplay,
 }
 
