@@ -2,6 +2,7 @@
 //!
 //! Sub-project 5 design: `docs/superpowers/specs/2026-09-25-clipboard-discovery-design.md`.
 
+mod backend;
 pub mod mock;
 mod sync;
 
@@ -31,4 +32,15 @@ pub trait Clipboard {
     /// is `Ok(None)`, not an error: there is simply nothing to send.
     fn get_text(&mut self) -> Result<Option<String>, ClipError>;
     fn set_text(&mut self, text: &str) -> Result<(), ClipError>;
+}
+
+/// Opens the platform clipboard.
+///
+/// `Err(ClipError::Unavailable)` is a supported outcome, not a failure to
+/// handle. GNOME's Wayland compositor implements neither `wlr-data-control` nor
+/// `ext-data-control` and has declined to, so there is no route for a
+/// window-less process; a headless session has no clipboard at all. The caller
+/// logs once and runs without clipboard sharing. §3.3.
+pub fn open() -> Result<Box<dyn Clipboard>, ClipError> {
+    backend::SystemClipboard::open().map(|c| Box::new(c) as Box<dyn Clipboard>)
 }

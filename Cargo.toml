@@ -52,6 +52,7 @@ ashpd = { version = "0.13", default-features = false, features = ["async-io", "i
 reis = { version = "0.7", features = ["async-io"] }
 futures-lite = "2"
 async-channel = "2"
+arboard = { version = "3.6", default-features = false, features = ["wayland-data-control"] }
 
 [profile.release]
 lto = "thin"
