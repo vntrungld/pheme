@@ -211,3 +211,22 @@ is the only place that gets tested.
 | G8 | Lock from the tray while the pointer is on the client | the checkmark and the core agree; unlocking restores |
 | G9 | `pheme devices` on both platforms | the list matches what the OS sound settings show |
 | G10 | GNOME without the AppIndicator extension | one warning, no tray, the window still opens |
+
+## Display input switching (sub-project 7)
+
+These need one monitor cabled to both machines, and a monitor that answers
+DDC/CI. They are the only tests that exercise real hardware: everything
+automated runs against a mock.
+
+| # | Action | Pass |
+|---|---|---|
+| E1 | `pheme displays` on each machine | each monitor is listed with a plausible identity and a current input |
+| E2 | Set `display.input` on both, cross the edge | the monitor shows the client within ~2 s |
+| E3 | Cross back | the monitor shows the server |
+| E4 | Sweep across the edge and back inside one second | the monitor ends on the machine the pointer ended on, and switches at most once |
+| E5 | Press the `switch_display` hotkey while the monitor is on the wrong machine | the monitor corrects itself |
+| E6 | Click "Switch display" in the window | the same |
+| E7 | Run with `display.input` set where the monitor ignores DDC/CI | one warning at startup, nothing later, input and audio unaffected |
+| E8 | Remove `[display]`, cross the edge | no DDC traffic, no warning, everything else unchanged |
+| E9 | Unplug the monitor's second cable, cross the edge | the failed command warns once and does not repeat on later crossings |
+| E10 | Give both machines the same `display.input` and connect | the "same monitor input" warning appears on the server |

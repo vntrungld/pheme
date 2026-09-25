@@ -309,6 +309,50 @@ sudo pacman -S pipewire clang pkgconf
 sudo dnf install pipewire-devel clang pkgconf
 ```
 
+## Sharing one monitor between both machines
+
+If a single monitor is cabled to both machines, pheme can make the picture
+follow the pointer: crossing the screen edge switches the monitor's input
+source to the machine that now has the keyboard and mouse.
+
+Run `pheme displays` on each machine to find the value for the input that
+machine is cabled to:
+
+    IDENTITY                             LOCATION      CURRENT  SUPPORTED
+    GSM LG ULTRAGEAR (106NTMXE1579)      /dev/i2c-10   0x11     0x0f 0x11 0x12
+
+Then set it on **each machine**, to that machine's own input:
+
+```toml
+[display]
+# The VCP 0x60 value of the input THIS machine is cabled to.
+input = 0x11
+# Optional: a substring of the identity above, when more than one monitor
+# answers.
+monitor = "ULTRAGEAR"
+# Optional: minimum gap between switches, in milliseconds.
+cooldown_ms = 1000
+
+[hotkeys]
+# Optional: re-assert the input for whichever machine has the pointer, for
+# when the monitor missed a command. Worth setting -- when the screen shows
+# the wrong machine you cannot reach the window or the tray.
+switch_display = "F12"
+```
+
+The two machines must **not** use the same value: each names its own cable.
+
+Requirements and limits:
+
+- The monitor must answer DDC/CI. Many do not, and some have a DDC/CI
+  switch in their on-screen menu that ships turned off. Check with
+  `pheme displays`, or with `ddcutil detect` on Linux.
+- Some laptop docks and HDMI adapters do not carry the i2c lines the
+  protocol needs.
+- On Linux, `pheme setup` loads `i2c-dev` and adds the udev rule. If it
+  still fails, `usermod -aG i2c $USER` and log in again.
+- With no `[display]` section, nothing here runs and nothing changes.
+
 ## Clipboard
 
 The clipboard is **text only** — no images, no files.
