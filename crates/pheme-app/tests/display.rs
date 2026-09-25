@@ -69,13 +69,15 @@ fn an_unconfigured_input_means_no_service() {
 /// enumeration costs about a second, and it would be a second of every
 /// start, spent before the input path exists.
 ///
-/// `released` is the one load-bearing assertion here. Of the other three,
-/// `opens == 1` says that a `switch_to` or a `force` never retries the
-/// open -- which is worth saying now that `became_displayed` does, and is
-/// broken by moving the retry into the `Switch` arm; the two-second bound
+/// `released` is the one load-bearing assertion here. The two-second bound
 /// cannot fail, because a send that is dropped returns at once whether it
-/// blocks or not; and `last_input()` is `None` because that is the
-/// sentinel every implementation starts at.
+/// blocks or not, and `last_input()` is `None` because that is the sentinel
+/// every implementation starts at; both are kept as documentation of the
+/// contract rather than as coverage.
+///
+/// It says nothing about how many times the open is attempted. A
+/// `switch_to` now retries it, deliberately (see `OPEN_ATTEMPTS`), and the
+/// count and its bound belong to the two tests below.
 ///
 /// What this test deliberately does *not* claim: it cannot catch an
 /// implementation that unwraps the `OpenFn`'s result. That panic happens on
@@ -134,12 +136,6 @@ fn a_failing_open_leaves_a_service_that_does_nothing() {
     assert!(
         svc.no_monitor(),
         "a service that found no monitor must say so"
-    );
-    assert_eq!(
-        opens.load(Ordering::SeqCst),
-        1,
-        "a monitor that does not answer is not retried on any schedule, and \
-         switching or forcing is not a schedule"
     );
 }
 
@@ -284,16 +280,18 @@ fn a_request_made_during_the_cooldown_still_arrives() {
 /// Critical 2 from the final review, in its local form: on the hardware
 /// design section 2 is premised on, the machine that must command the
 /// monitor is the one that cannot open it at startup, because the monitor
-/// was showing the other machine at the time. It gets another go at the
-/// one instant the answer can have changed.
+/// was showing the other machine at the time. It gets another go when it
+/// next needs a handle.
 ///
-/// Break it by deleting the `open_monitor` call in the `BecameDisplayed`
-/// arm: the second open never happens, `opens` stays at 1, and the later
-/// switch reaches nothing. Break it just as well by leaving the `OpenFn`
-/// as `FnOnce` -- which is how this shipped, and is why it needed a
-/// finding to notice.
+/// That moment is a `switch_to`, which is the pointer *leaving* this
+/// machine -- so this machine has been the displayed input for the whole
+/// visit and the monitor settled long ago. Break it by moving the
+/// `open_monitor` call back into the `BecameDisplayed` arm: the retry then
+/// lands while the monitor is mid-switch, and on real hardware it fails for
+/// the same reason the first attempt did. Break it outright by deleting the
+/// call: `opens` stays at 1 and the switch reaches nothing.
 #[test]
-fn an_open_that_found_nothing_is_retried_when_this_machine_is_displayed() {
+fn an_open_that_found_nothing_is_retried_when_a_switch_needs_a_handle() {
     let (mon, handle) = MockMonitor::new("MOCK", "mock", 0x11);
     let opens = Arc::new(AtomicUsize::new(0));
     let o = Arc::clone(&opens);
@@ -314,17 +312,20 @@ fn an_open_that_found_nothing_is_retried_when_this_machine_is_displayed() {
         }),
     )
     .expect("the feature is configured on");
+    wait_for("the startup open to fail", || svc.no_monitor());
 
-    // Nothing to command yet: the startup open found no monitor.
-    svc.switch_to(0x0f);
-    assert_eq!(handle.sets(), 0);
-
-    svc.became_displayed(0x0f);
-    wait_for("the second open", || opens.load(Ordering::SeqCst) == 2);
-    // And the service works from here on, which is the whole point of
-    // retrying at all.
+    // A crossing, and nothing else: no `became_displayed` first, so an
+    // implementation that retries there instead of here finds nothing to
+    // retry and this test fails -- which is the point of it.
     svc.switch_to(0x12);
-    wait_for("the switch after the reopen", || handle.input() == 0x12);
+    wait_for("the switch that opened the monitor", || {
+        handle.input() == 0x12
+    });
+    assert_eq!(
+        opens.load(Ordering::SeqCst),
+        2,
+        "one open at startup and one when the switch needed a handle"
+    );
 }
 
 /// The bound on that retry. Design section 7 says nothing retries on a
@@ -335,7 +336,8 @@ fn an_open_that_found_nothing_is_retried_when_this_machine_is_displayed() {
 ///
 /// Break it by dropping the `attempts >= OPEN_ATTEMPTS` check: the thread
 /// never gives up, so it never exits, the `OpenFn` is never dropped, and
-/// `gone` stays false while `opens` climbs past three.
+/// `gone` stays false while `opens` climbs past three -- once per crossing,
+/// for ever, at about a second each.
 ///
 /// The exit is observed through the `OpenFn`'s own drop rather than a
 /// sleep. A thread that has given up is gone, so nothing it could report
@@ -364,7 +366,7 @@ fn a_monitor_that_never_answers_stops_being_reopened() {
     .expect("the feature is configured on");
 
     for _ in 0..20 {
-        svc.became_displayed(0x11);
+        svc.switch_to(0x0f);
     }
     wait_for("the service thread to give up", || {
         gone.load(Ordering::SeqCst)
@@ -373,20 +375,22 @@ fn a_monitor_that_never_answers_stops_being_reopened() {
         opens.load(Ordering::SeqCst),
         3,
         "three attempts in all: one at startup and one at each of the first two \
-         crossings that put this machine on screen"
+         switches that found no handle"
     );
 }
 
 /// The other side of `no_monitor`: a retry that succeeds takes it back.
 ///
 /// Break it by dropping the `NO_MONITOR` reset in `open_monitor`'s `Ok`
-/// arm: the window then says no monitor answered while the monitor is
-/// being switched under the person's nose.
+/// arm: the window then goes on saying no monitor answered while one is
+/// open and working.
 ///
-/// The assertion comes *before* any successful command on purpose. A
-/// confirmed switch stores its own value in the same atomic and so clears
-/// the sentinel whatever `open_monitor` does -- a first version of this
-/// test switched first, and passed with the reset deleted.
+/// The switch here asks for the input the policy has just been told is
+/// selected, so rule 1 refuses it: the open happens, no command follows,
+/// and the only thing that can have cleared the sentinel is the open
+/// itself. A first version of this test let the command through, and
+/// passed with the reset deleted -- a confirmed switch stores its own value
+/// in the same atomic.
 #[test]
 fn a_reopen_that_works_clears_the_no_monitor_report() {
     let (mon, handle) = MockMonitor::new("MOCK", "mock", 0x11);
@@ -408,16 +412,13 @@ fn a_reopen_that_works_clears_the_no_monitor_report() {
     .expect("the feature is configured on");
     wait_for("the failed open to be reported", || svc.no_monitor());
 
-    svc.became_displayed(0x0f);
+    svc.became_displayed(0x11);
+    svc.switch_to(0x11);
     wait_for("the second open", || opens.load(Ordering::SeqCst) == 2);
     assert!(
         !svc.no_monitor(),
         "the report must go back as soon as a monitor answers, not when one is \
          first commanded"
     );
-
-    // And the service really does work from here, so the assertion above
-    // is about a live monitor rather than a cleared flag.
-    svc.switch_to(0x12);
-    wait_for("the switch after the reopen", || handle.input() == 0x12);
+    assert_eq!(handle.sets(), 0, "rule 1 should have refused that switch");
 }

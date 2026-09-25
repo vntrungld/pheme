@@ -251,7 +251,9 @@ displayed input**. Both sides know it exactly:
 
 `DisplayService::became_displayed(own_input)` carries it, alongside
 `switch_to` and `force` and with the same never-blocks, never-fails
-contract. The service thread answers it with `observe(own_input)`.
+contract. The service thread answers it with `observe(own_input)` and
+nothing else — in particular it does not try to open a monitor there; §7
+says why that belongs on `switch_to` instead.
 
 **A held request the return makes stale.** Every value a machine
 `request`s is the peer's input -- a hand-away -- and every value it observes
@@ -317,8 +319,8 @@ impl DisplayService {
     pub fn switch_to(&self, value: u16);
     pub fn force(&self, value: u16);
     /// This machine is now the input the monitor is displaying, and it is
-    /// cabled to `own_input` (§3.4). Reopens a monitor if none is held,
-    /// and tells the policy what is on screen. Never blocks, never fails.
+    /// cabled to `own_input` (§3.4): tells the policy what is on screen.
+    /// Never blocks, never fails.
     pub fn became_displayed(&self, own_input: u16);
 }
 ```
@@ -370,9 +372,10 @@ if matches!(m, Msg::Leave { .. }) {
 Each side also answers the *opposite* transition — the one that makes it
 the displayed input — with `became_displayed(own_input)` (§3.4): the server
 in the same arm, on `Msg::Enter`'s mirror `Msg::Leave`, and the client on
-`Msg::Enter`. Those two calls issue no command; they keep this machine's
-belief about a monitor the peer also commands from going stale, and give a
-machine that found no monitor at startup its chance to find one.
+`Msg::Enter`. Those two calls issue no command and open nothing; they keep this
+machine's belief about a monitor the peer also commands from going stale.
+The chance to find a monitor that startup missed comes one crossing later,
+on the `switch_to` that needs the handle (§7).
 
 `display_input: Option<u16>` is a new field on the existing `Link` struct
 (`server.rs:77`), set from the client's `Hello` when the link is built.
@@ -443,17 +446,28 @@ not exceptional:
   It does not exit on the spot, because on the hardware §2 is premised on a
   startup enumeration finding nothing may mean only that this machine was
   not the one on screen — and that is the machine, by §2, that will have to
-  command the monitor later. So the open is retried at the one instant its
-  answer can have changed: `became_displayed` (§3.4). **Nothing retries on
-  a schedule** — there is no timer anywhere in this design — and nothing
-  retries for ever: the open is attempted `OPEN_ATTEMPTS` = 3 times in all,
-  once at startup and once at each of the first two crossings that put this
-  machine on screen. Three covers a monitor that was still re-syncing on the
-  first retry. When they run out the thread says so once more and exits,
-  which disconnects the channel and makes every later send a dropped one,
-  exactly as before. The bound is what keeps the common case — hardware that
-  answers no DDC/CI at all — from spending 1.09 s of the display thread on
-  every crossing for the life of the program.
+  command the monitor later. So the open is retried, at the moment the
+  handle is actually needed: a **`switch_to` that finds no handle**.
+
+  That moment, and not `became_displayed`. A switch is the pointer leaving
+  this machine, so by then this machine has been the displayed input for
+  the whole visit and the monitor settled long ago. `became_displayed` is
+  the opposite instant — the peer commanded the monitor toward this machine
+  a moment earlier and it is mid-switch, which rule 2 puts at one to three
+  seconds — so every retry made there would be made into a re-sync and
+  would fail for the same reason the first attempt did. On the server it is
+  worse than a race: the hook runs as the server *sends* `Msg::Leave`,
+  before the client has even received it.
+
+  **Nothing retries on a schedule** — there is no timer anywhere in this
+  design — and nothing retries for ever: the open is attempted
+  `OPEN_ATTEMPTS` = 3 times in all, once at startup and once at each of the
+  first two switches that find no handle. When they run out the thread says
+  so once more and exits, which disconnects the channel and makes every
+  later send a dropped one, exactly as before. The bound is what keeps the
+  common case — hardware that answers no DDC/CI at all — from spending
+  1.09 s of the display thread on every crossing for the life of the
+  program.
 - A `set_input` that fails logs a warning the first time and at `debug`
   after that, calls `forget()`, and leaves the service running.
 - `switch_to` on a `None` service is a no-op at the call site, because the
@@ -606,9 +620,11 @@ Automated, none of it needing a monitor:
   identical request from reaching the monitor (the `forget` path, driven
   end to end rather than asserted on the policy alone); `force` reaches
   the monitor when `switch_to` for the same value would not; an open that
-  found nothing is retried on `became_displayed` and works from then on;
+  found nothing is retried by the next `switch_to` and works from then on;
   and that retry stops after `OPEN_ATTEMPTS`, observed through the
-  `OpenFn`'s own drop when the thread gives up.
+  `OpenFn`'s own drop when the thread gives up. The retry test drives a
+  `switch_to` alone, with no `became_displayed` before it, so an
+  implementation that retries at the wrong moment fails it.
 - Config: `[display]` with a hex `input`; an absent section leaving the
   feature off; `[hotkeys]` naming only `lock` still parsing.
 - Proto: `Hello`/`HelloAck` round-trip with and without `display_input`;
@@ -631,7 +647,7 @@ cabled to both machines.
 |---|---|---|
 | E1 | `pheme displays` on each machine, **without** switching the monitor to that machine first — run it on the machine the monitor is *not* showing | each monitor is listed with a plausible identity and a current input. Record, per machine, whether it answered while off screen: a machine that lists nothing until the monitor is switched to it is the case E1 exists to find, and the client is the machine it matters on |
 | E2 | Set `display.input` on both, then cross the edge and back **twice**, slowly, waiting for the picture each time | all four transitions switch: out → the client, back → the server, out → the client, back → the server. The second round trip is the one that matters; the first one passed even with the defect this row was rewritten for |
-| E3 | Restart the client while the monitor is showing the **server**, then cross the edge | the monitor shows the client. A client that enumerated no monitor at startup must still find one once it is on screen |
+| E3 | Restart the client while the monitor is showing the **server**, then cross the edge **and come back** | the monitor shows the client, and then comes back to the server. The second half is the one that matters: a client that enumerated no monitor at startup looks for one again on the crossing back, and without that the picture never returns |
 | E4 | Sweep the pointer across the edge and back inside one second | the monitor switches **at least once and at most twice**, and ends on the machine the pointer ended on. Zero switches is a failure, not a pass: a feature that is wedged also "ends" on the right machine |
 | E5 | Press the `switch_display` hotkey while the monitor is on the wrong machine | the monitor corrects itself |
 | E6 | Click "Switch display" in the window twice: once on the machine that both holds the pointer and is on screen, and once on the client while the client is on screen but the pointer is on the server | the first click leaves the monitor where it is, because it is already right; the second switches the monitor to the server. A click that moves the picture away from the machine holding the pointer is a failure |

@@ -38,17 +38,26 @@ enum Req {
 }
 
 /// How many times a monitor is opened before the service gives up for good:
-/// once at startup, then once at each of the first two moments this machine
-/// becomes the displayed input.
+/// once at startup, then once at each of the first two switches that need a
+/// handle and find none.
 ///
-/// A bound is needed because DDC/CI is answered only by the displayed
+/// A retry is needed because DDC/CI is answered only by the displayed
 /// input, so an enumeration that found nothing at startup may simply have
-/// been run on the machine that was off screen. Retrying at every crossing
-/// for ever would cost a second of the display thread on every crossing on
-/// the very common hardware that answers nothing at all; three attempts is
-/// enough to cover a monitor that was mid-switch or re-syncing on the first
-/// one, and after them the thread exits exactly as design section 7 says --
-/// nothing retries on a schedule, and nothing retries for ever.
+/// been run on the machine that was off screen. It happens on `Req::Switch`
+/// rather than on `Req::BecameDisplayed` because of *when* each arrives. A
+/// switch is the pointer leaving this machine, so by then this machine has
+/// been the displayed input for the whole visit and the monitor settled
+/// long ago. `BecameDisplayed` is the opposite instant: the peer commanded
+/// the monitor toward this machine a moment earlier and it is mid-switch,
+/// which this crate's own rule 2 puts at one to three seconds -- every
+/// retry made there would be made into a re-sync and would fail for the
+/// same reason the first attempt did.
+///
+/// A bound is needed because retrying at every crossing for ever would cost
+/// a second of the display thread on every crossing, on the very common
+/// hardware that answers nothing at all. After the last one the thread
+/// exits, which is design section 7's permanent off: nothing retries on a
+/// schedule, and nothing retries for ever.
 const OPEN_ATTEMPTS: u32 = 3;
 
 /// Four, the same depth the status channel uses. A full queue means four
@@ -91,11 +100,10 @@ impl DisplayService {
     /// This returns before the monitor is opened, so it cannot and does not
     /// report whether one answered: enumeration costs about a second and
     /// runs on the spawned thread. A thread that finds no monitor says so
-    /// once and holds no handle; every `switch_to` it is then sent is
-    /// dropped, and it tries again only when `became_displayed` says this
-    /// machine is on screen, at most `OPEN_ATTEMPTS` times in all. When
-    /// those run out it exits, which disconnects the channel and turns
-    /// every later send into a dropped one.
+    /// once and holds no handle; it tries again on a `switch_to` that finds
+    /// none, at most `OPEN_ATTEMPTS` times in all, and when those run out
+    /// it exits, which disconnects the channel and turns every later send
+    /// into a dropped one.
     pub fn spawn(cfg: &DisplayCfg, open: OpenFn) -> Option<DisplayService> {
         // Off unless `[display] input` names the input this machine is
         // cabled to. Written with `?` because clippy's `question_mark` lint
@@ -151,14 +159,17 @@ impl DisplayService {
     ///
     /// The peer commands the same monitor, so the policy's belief about
     /// what is on screen goes stale every time the peer switches it. This
-    /// is the one moment that belief can be refreshed: the monitor is
-    /// listening to this machine's cable, so it will answer a read, and a
-    /// machine whose startup enumeration found nothing because it was off
-    /// screen can finally find something.
+    /// is the moment that belief can be corrected, because the event itself
+    /// says what the monitor is now showing.
     ///
     /// The server calls it when the pointer returns to local -- the client
     /// has just commanded the monitor to this machine's input -- and the
     /// client on `Msg::Enter`, where the server has just done the same.
+    ///
+    /// It deliberately does *not* try to open a monitor. The monitor is
+    /// mid-switch at this instant; the retry belongs where the handle is
+    /// actually needed and the picture has long since settled, which is
+    /// `switch_to` (see `OPEN_ATTEMPTS`).
     pub fn became_displayed(&self, own_input: u16) {
         self.send(Req::BecameDisplayed(own_input));
     }
@@ -219,9 +230,15 @@ fn run(rx: Receiver<Req>, mut open: OpenFn, cooldown: Duration, last: Arc<Atomic
         };
         let now = Instant::now();
         let issue = match req {
-            Some(Req::Switch(v)) => policy.request(v, now),
-            Some(Req::Force(v)) => Some(policy.force(v, now)),
-            Some(Req::BecameDisplayed(own)) => {
+            Some(Req::Switch(v)) => {
+                // The one place a monitor is looked for again. A switch is
+                // the pointer leaving this machine, so this machine has
+                // been the displayed input for the whole visit and the
+                // monitor has long since settled -- which is what a machine
+                // that found nothing at startup, because it was off screen
+                // then, needs in order to find something now. Bounded by
+                // `OPEN_ATTEMPTS`, and on no schedule: only a crossing
+                // brings it here.
                 if mon.is_none() {
                     mon = open_monitor(&mut open, &mut attempts, &last);
                     if mon.is_none() && attempts >= OPEN_ATTEMPTS {
@@ -233,33 +250,41 @@ fn run(rx: Receiver<Req>, mut open: OpenFn, cooldown: Duration, last: Arc<Atomic
                         return;
                     }
                 }
-                if mon.is_some() {
-                    // `own`, and deliberately not a fresh `get_input()`.
-                    // The event itself is the stronger evidence: it means
-                    // the peer has just commanded the monitor to this
-                    // machine's cable, so this machine's own input is what
-                    // is on screen by construction.
-                    //
-                    // A read here races that command. The peer issues it
-                    // on *its* display thread and sends the crossing at
-                    // once, so a read taken on this side can still return
-                    // the peer's input -- and observing that value is the
-                    // very defect this hook exists to fix, because rule 1
-                    // would then refuse this machine's next correct
-                    // command. On the hardware design section 2 describes
-                    // the read would merely fail and fall back to `own`,
-                    // but on a monitor that answers from a non-displayed
-                    // input (section 15) it succeeds with a stale value,
-                    // and `display_crossing.rs` fails on it deterministically.
-                    //
-                    // Believing `own` wrongly cannot wedge anything: the
-                    // only command rule 1 can refuse is one for this
-                    // machine's own input, and a crossing never asks for
-                    // that -- it asks for the peer's. The recovery hotkey
-                    // bypasses rule 1 outright.
-                    policy.observe(own);
-                    debug!(input = own, "this machine is the displayed input");
-                }
+                policy.request(v, now)
+            }
+            Some(Req::Force(v)) => Some(policy.force(v, now)),
+            Some(Req::BecameDisplayed(own)) => {
+                // `own`, and deliberately not a fresh `get_input()`.
+                // The event itself is the stronger evidence: it means
+                // the peer has just commanded the monitor to this
+                // machine's cable, so this machine's own input is what
+                // is on screen by construction.
+                //
+                // A read here races that command. The peer issues it
+                // on *its* display thread and sends the crossing at
+                // once, so a read taken on this side can still return
+                // the peer's input -- and observing that value is the
+                // very defect this hook exists to fix, because rule 1
+                // would then refuse this machine's next correct
+                // command. On the hardware design section 2 describes
+                // the read would merely fail and fall back to `own`,
+                // but on a monitor that answers from a non-displayed
+                // input (section 15) it succeeds with a stale value,
+                // and `display_crossing.rs` fails on it deterministically.
+                //
+                // Believing `own` wrongly cannot wedge anything: the
+                // only command rule 1 can refuse is one for this
+                // machine's own input, and a crossing never asks for
+                // that -- it asks for the peer's. The recovery hotkey
+                // bypasses rule 1 outright.
+                //
+                // On the server this is not even a race: the hook runs as
+                // the server *sends* `Msg::Leave`, before the client has
+                // received it, so a read there would be certain to answer
+                // with the client's input on any monitor that answers off
+                // screen.
+                policy.observe(own);
+                debug!(input = own, "this machine is the displayed input");
                 None
             }
             None => policy.poll(now),
