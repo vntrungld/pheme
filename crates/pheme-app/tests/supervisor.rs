@@ -1,21 +1,34 @@
 //! Supervisor tests, plus the stub core they spawn.
 //!
-//! The stub is this same test binary, re-invoked. `Supervisor` always spawns
-//! its child as `<exe> <role> --ipc <path>`, which would otherwise collide
-//! with the standard test harness parsing `--ipc` as an unrecognized flag.
-//! To dodge that, each `stub_exe*` helper hands back a symlink to this
-//! binary whose *name* carries the desired behaviour (`pheme-core-stub-…`),
-//! and a tiny hand-written constructor — run by the C runtime before Rust's
-//! own `main`, well before the test harness gets anywhere near `argv` —
-//! checks that name and, if it matches, runs the stub core and exits
-//! instead of ever reaching the harness. A plain `cargo test` invocation's
-//! argv0 never matches the prefix, so normal test runs are unaffected.
+//! Unix-only, and deliberately so. The stub is this same test binary,
+//! re-invoked; `Supervisor` always spawns its child as
+//! `<exe> <role> --ipc <path>`, which would otherwise collide with the
+//! standard test harness parsing `--ipc` as an unrecognized flag. To dodge
+//! that, each `stub_exe*` helper hands back a symlink to this binary whose
+//! *name* carries the desired behaviour (`pheme-core-stub-…`), and a tiny
+//! hand-written `.init_array` constructor — an ELF pre-main hook run by the
+//! C runtime before Rust's own `main`, well before the test harness gets
+//! anywhere near `argv` — checks that name and, if it matches, runs the
+//! stub core and exits instead of ever reaching the harness. A plain
+//! `cargo test` invocation's argv0 never matches the prefix, so normal test
+//! runs are unaffected.
+//!
+//! `.init_array` has no equivalent on the `windows-msvc` target this crate
+//! also ships for; its analogue would be `.CRT$XCU`, and building that
+//! second interception path (plus a non-Unix way to hand back a
+//! distinguishable "executable") is not worth maintaining for a fixture.
+//! The supervisor itself still compiles for Windows through the lib target;
+//! what this file does not cover there is its *behaviour*, which rests on
+//! manual rows G2, G6 and G7 like everything else Windows-specific in this
+//! crate.
 //!
 //! The stub itself is an honest, minimal imitation of the real core: it
 //! connects to the socket named by `--ipc`, sends a `Status` every 200 ms,
 //! watches for the connection closing (`recv_command` returning `Ok(None)`),
 //! and exits the moment either happens — the same lifetime rule
 //! `CoreLink::recv_command`'s own docs describe for the real thing.
+
+#![cfg(unix)]
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -118,19 +131,29 @@ fn server_config() -> Config {
     }
 }
 
+/// One directory, shared by every `make_stub` call in this process, rather
+/// than a fresh one per call: a `static` is never dropped, so whatever it
+/// holds is leaked regardless, and a directory per call multiplied that leak
+/// by every stub any test asked for. One directory bounds it to one leaked
+/// directory per test-binary run, holding at most a handful of symlinks —
+/// not one that grows with the number of tests or repeat runs.
+static STUB_DIR: std::sync::LazyLock<tempfile::TempDir> =
+    std::sync::LazyLock::new(|| tempfile::tempdir().expect("tempdir for stub symlinks"));
+
 /// Builds a symlink to this test binary whose name is
 /// `pheme-core-stub-<suffix>`, so the constructor above recognizes it when
-/// `Supervisor` spawns it. Each call gets a fresh directory, so concurrent
-/// tests never share — or race on — a symlink.
+/// `Supervisor` spawns it. Several tests ask for the same suffix (`"normal"`)
+/// and may run concurrently, so a symlink that is already there — created by
+/// another test a moment earlier, pointing at the same target — is fine;
+/// only some other failure is not.
 fn make_stub(suffix: &str) -> PathBuf {
-    let dir = tempfile::tempdir().expect("tempdir for stub symlink");
-    let link = dir.path().join(format!("pheme-core-stub-{suffix}"));
+    let link = STUB_DIR.path().join(format!("pheme-core-stub-{suffix}"));
     let target = std::env::current_exe().expect("current_exe");
-    std::os::unix::fs::symlink(&target, &link).expect("symlink the stub");
-    // Leaked deliberately: the symlink must outlive this function, and the
-    // test process is short-lived enough that the OS temp cleaner is the
-    // right owner of the cleanup, not us.
-    std::mem::forget(dir);
+    match std::os::unix::fs::symlink(&target, &link) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => panic!("symlink the stub at {}: {e}", link.display()),
+    }
     link
 }
 
