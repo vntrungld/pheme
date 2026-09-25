@@ -1,5 +1,6 @@
 //! Client runtime: QUIC peer → core → injection, with automatic reconnect.
 
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -11,13 +12,14 @@ use pheme_input::InputInject;
 use pheme_net::pairing::client_pair;
 use pheme_net::{Endpoint, Identity, NetError, Peer, TrustStore};
 use pheme_proto::{AudioParams, AudioStream, Msg, Os, PROTOCOL_VERSION};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
 
 use crate::audio::{CaptureSource, InStats, OutCounters, PlaybackSource, RecvSide, SendSide};
 use crate::backoff::Backoff;
 use crate::clipboard::ClipboardService;
-use crate::config::{config_dir, Config};
+use crate::config::{config_dir, Config, Role};
+use crate::ipc::{Command, CoreLink, LinkState, Status};
 use crate::target::Target;
 
 pub struct ClientDeps {
@@ -45,6 +47,10 @@ pub struct ClientDeps {
     pub mic_stats: Option<Arc<InStats>>,
     /// The clipboard worker, or `None` where no clipboard is reachable.
     pub clipboard: Option<ClipboardService>,
+    /// Report status to a front-end over this socket and take commands from
+    /// it. `None` for every invocation a person types themselves; only
+    /// `pheme` with no subcommand, supervising this as a child, sets it.
+    pub ipc: Option<PathBuf>,
 }
 
 /// The mic frame in `m`, if it is one this client should play.
@@ -67,13 +73,16 @@ fn mic_frame(m: &Msg) -> Option<Frame> {
     }
 }
 
-/// The two audio sides `session` needs, bundled so the function stays under the
-/// argument-count lint rather than growing an eighth positional parameter.
-struct SessionAudio<'a> {
+/// The extra pieces `session` needs beyond its own positional parameters, bundled so the
+/// function stays under the argument-count lint rather than growing an eighth positional
+/// parameter: the two audio sides, and the sender the per-second tick pushes a `Status`
+/// to when a front-end is attached.
+struct SessionExtras<'a> {
     audio: &'a SendSide,
     counters: &'a OutCounters,
     mic: &'a RecvSide,
     mic_stats: &'a InStats,
+    status_tx: Option<mpsc::Sender<Status>>,
 }
 
 fn apply(inject: &mut dyn InputInject, a: InjectAction) {
@@ -126,6 +135,7 @@ fn input_seq(m: &Msg) -> Option<u32> {
 
 pub async fn run_client(
     deps: ClientDeps,
+    shutdown_tx: watch::Sender<bool>,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let ClientDeps {
@@ -139,12 +149,68 @@ pub async fn run_client(
         mic,
         mic_stats,
         clipboard,
+        ipc,
     } = deps;
     let counters = audio_counters.unwrap_or_default();
     // The client's speaker capture is never gated: it starts open.
     let mut audio = SendSide::spawn(audio, AudioStream::Playback, counters.clone(), true);
     let mic_stats = mic_stats.unwrap_or_default();
     let mut mic = RecvSide::spawn(mic, mic_stats.clone());
+
+    // `status_tx` is `Some` exactly when a front-end is attached: `session`'s per-second
+    // tick pushes onto it, and the IPC command loop below drains it onto the socket. A
+    // full channel drops the newest update rather than blocking a session on a slow
+    // socket write; capacity 4 gives the drain a little slack, and losing one update is
+    // harmless because another follows a second later.
+    let (status_tx, status_rx): (Option<mpsc::Sender<Status>>, Option<mpsc::Receiver<Status>>) =
+        if ipc.is_some() {
+            let (tx, rx) = mpsc::channel(4);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
+    // The core exits when the front-end goes away. That is the lifetime rule
+    // from §3: no pidfile, no adoption, and no orphan left holding the audio
+    // devices or an input-injection handle.
+    if let Some(path) = &ipc {
+        let mut link = CoreLink::connect(&path.to_string_lossy()).await?;
+        let shutdown_tx = shutdown_tx.clone();
+        let mut status_rx = status_rx.expect("status channel exists whenever ipc does");
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    // Statuses arrive from the per-second task on this channel.
+                    Some(s) = status_rx.recv() => {
+                        if let Err(e) = link.send_status(&s).await {
+                            debug!("status send failed: {e}");
+                            break;
+                        }
+                    }
+                    r = link.recv_command() => match r {
+                        // Locking is a server-side concept: only `ServerCore`
+                        // holds a lock state, and a client has no equivalent
+                        // to set. Accepted and ignored rather than reaching
+                        // for a core that has nothing to change.
+                        Ok(Some(Command::Lock)) | Ok(Some(Command::Unlock)) => {}
+                        // Stop and a closed socket are the same outcome and
+                        // take the same path out: the shutdown signal Ctrl+C
+                        // already uses. A second shutdown route would need its
+                        // own proof that it releases the audio devices and the
+                        // injection handle, and there is no reason to have one.
+                        Ok(Some(Command::Stop)) | Ok(None) => break,
+                        Err(e) => {
+                            debug!("ipc read failed: {e}");
+                            break;
+                        }
+                    },
+                    else => break,
+                }
+            }
+            let _ = shutdown_tx.send(true);
+        });
+    }
+
     let mut backoff = Backoff::new();
     loop {
         if *shutdown.borrow() {
@@ -168,11 +234,12 @@ pub async fn run_client(
                             &name,
                             inject.as_mut(),
                             stats,
-                            SessionAudio {
+                            SessionExtras {
                                 audio: &audio,
                                 counters: &counters,
                                 mic: &mic,
                                 mic_stats: &mic_stats,
+                                status_tx: status_tx.clone(),
                             },
                             clipboard.clone(),
                             &mut shutdown,
@@ -216,15 +283,16 @@ async fn session(
     name: &str,
     inject: &mut dyn InputInject,
     stats: bool,
-    audio: SessionAudio<'_>,
+    audio: SessionExtras<'_>,
     clipboard: Option<ClipboardService>,
     shutdown: &mut watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    let SessionAudio {
+    let SessionExtras {
         audio,
         counters,
         mic,
         mic_stats,
+        status_tx,
     } = audio;
     let screens = inject.screens();
     let mut rx = peer.take_incoming();
@@ -366,7 +434,7 @@ async fn session(
                 ping_seq += 1;
                 let _ = sender.send_control(&Msg::Ping(ping_seq)).await;
             }
-            _ = stats_tick.tick(), if stats => {
+            _ = stats_tick.tick(), if stats || status_tx.is_some() => {
                 let sent = counters.sent.swap(0, Ordering::Relaxed);
                 let suppressed = counters.suppressed.swap(0, Ordering::Relaxed);
                 let m = mic_stats.snapshot_delta();
@@ -374,27 +442,49 @@ async fn session(
                 let mic_channel_dropped =
                     total_mic_channel_dropped.saturating_sub(last_mic_channel_dropped);
                 last_mic_channel_dropped = total_mic_channel_dropped;
-                info!(
-                    rtt_us = peer.rtt().as_micros(),
-                    received,
-                    lost,
-                    audio_sent = sent,
-                    audio_suppressed = suppressed,
-                    mic_depth_ms = mic_stats.depth_ms.load(Ordering::Relaxed),
-                    mic_lost = m.lost,
-                    mic_underruns = m.underruns,
-                    mic_late = m.late,
-                    mic_resets = m.resets,
-                    mic_dropped = m.dropped,
-                    // Its own field, not folded into `mic_dropped`: a frame the
-                    // transport drops never reaches the jitter buffer, so no counter
-                    // beside it can account for the gap the listener hears. Spec §2.5.
-                    // Differenced like the rest of the line, which is per second.
-                    mic_channel_dropped,
-                    mic_overflows = m.overflows,
-                    active = core.active(),
-                    "stats/s"
-                );
+                if stats {
+                    info!(
+                        rtt_us = peer.rtt().as_micros(),
+                        received,
+                        lost,
+                        audio_sent = sent,
+                        audio_suppressed = suppressed,
+                        mic_depth_ms = mic_stats.depth_ms.load(Ordering::Relaxed),
+                        mic_lost = m.lost,
+                        mic_underruns = m.underruns,
+                        mic_late = m.late,
+                        mic_resets = m.resets,
+                        mic_dropped = m.dropped,
+                        // Its own field, not folded into `mic_dropped`: a frame the
+                        // transport drops never reaches the jitter buffer, so no counter
+                        // beside it can account for the gap the listener hears. Spec §2.5.
+                        // Differenced like the rest of the line, which is per second.
+                        mic_channel_dropped,
+                        mic_overflows = m.overflows,
+                        active = core.active(),
+                        "stats/s"
+                    );
+                }
+                if let Some(tx) = &status_tx {
+                    let status = Status {
+                        role: Role::Client,
+                        state: LinkState::Connected,
+                        peer: Some(peer.remote_name().to_string()),
+                        rtt_us: peer.rtt().as_micros() as u64,
+                        // Locking is a server-side concept `ClientCore` has
+                        // nothing corresponding to, so a client always
+                        // reports unlocked rather than a figure it never
+                        // measures.
+                        locked: false,
+                        events: received,
+                        lost,
+                        audio_depth_ms: 0,
+                        audio_lost: 0,
+                        mic_depth_ms: mic_stats.depth_ms.load(Ordering::Relaxed) as u32,
+                        mic_lost: m.lost,
+                    };
+                    let _ = tx.try_send(status);
+                }
                 received = 0;
                 lost = 0;
             }
@@ -409,7 +499,12 @@ async fn session(
 }
 
 /// Entry point for `pheme client`.
-pub async fn main(cfg: Config, host: Option<&str>, stats: bool) -> anyhow::Result<()> {
+pub async fn main(
+    cfg: Config,
+    host: Option<&str>,
+    stats: bool,
+    ipc: Option<PathBuf>,
+) -> anyhow::Result<()> {
     let dir = config_dir();
     let identity = Identity::load_or_create(&dir, &cfg.name)?;
     let trust = TrustStore::load(&dir)?.shared();
@@ -421,10 +516,11 @@ pub async fn main(cfg: Config, host: Option<&str>, stats: bool) -> anyhow::Resul
     let inject = pheme_input::detect_inject().context("input injection backend")?;
     info!(name = %cfg.name, target = ?target, fingerprint = %identity.fingerprint, "pheme client");
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let ctrlc_shutdown = shutdown_tx.clone();
     tokio::spawn(async move {
         let _ = tokio::signal::ctrl_c().await;
         info!("shutting down");
-        let _ = shutdown_tx.send(true);
+        let _ = ctrlc_shutdown.send(true);
     });
     let clipboard = ClipboardService::spawn(pheme_clip::open);
     run_client(
@@ -439,7 +535,9 @@ pub async fn main(cfg: Config, host: Option<&str>, stats: bool) -> anyhow::Resul
             mic: PlaybackSource::DetectVirtualMic(None),
             mic_stats: None,
             clipboard,
+            ipc,
         },
+        shutdown_tx,
         shutdown_rx,
     )
     .await

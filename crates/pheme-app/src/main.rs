@@ -32,6 +32,11 @@ enum Cmd {
         /// Log RTT and traffic counters every second
         #[arg(long)]
         stats: bool,
+        /// Report status to a front-end over this socket and take commands
+        /// from it. Hidden because it is not something a person invokes: it is
+        /// how `pheme` with no subcommand talks to the child it started.
+        #[arg(long, hide = true)]
+        ipc: Option<PathBuf>,
     },
     /// Run as the machine being controlled
     Client {
@@ -41,6 +46,11 @@ enum Cmd {
         config: Option<PathBuf>,
         #[arg(long)]
         stats: bool,
+        /// Report status to a front-end over this socket and take commands
+        /// from it. Hidden because it is not something a person invokes: it is
+        /// how `pheme` with no subcommand talks to the child it started.
+        #[arg(long, hide = true)]
+        ipc: Option<PathBuf>,
     },
     /// Pair with a server using the code it displays
     Pair {
@@ -81,17 +91,19 @@ async fn main() -> anyhow::Result<()> {
             config,
             pair,
             stats,
+            ipc,
         } => {
             let cfg = Config::load(config.as_deref())?;
-            pheme_app::server::main(cfg, pair, stats).await
+            pheme_app::server::main(cfg, pair, stats, ipc).await
         }
         Cmd::Client {
             host,
             config,
             stats,
+            ipc,
         } => {
             let cfg = Config::load(config.as_deref())?;
-            pheme_app::client::main(cfg, host.as_deref(), stats).await
+            pheme_app::client::main(cfg, host.as_deref(), stats, ipc).await
         }
         Cmd::Pair { host, code, config } => {
             let cfg = Config::load(config.as_deref())?;

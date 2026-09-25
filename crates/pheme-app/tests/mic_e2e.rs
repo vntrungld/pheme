@@ -215,7 +215,9 @@ fn spawn_server_instance(
             mic: CaptureSource::Backend(Box::new(mic_backend)),
             mic_counters: None,
             clipboard: None,
+            ipc: None,
         },
+        shutdown_tx.clone(),
         run_rx,
     ));
     (server, kill_tx)
@@ -272,7 +274,9 @@ fn spawn_mic_pair(demand: Demand, virtual_mic: bool) -> MicPair {
             },
             mic_stats: Some(heard.clone()),
             clipboard: None,
+            ipc: None,
         },
+        shutdown_tx.clone(),
         client_run_rx,
     ));
 
@@ -438,7 +442,9 @@ async fn a_client_with_no_virtual_microphone_still_runs_its_session_loop() {
             mic: PlaybackSource::Disabled,
             mic_stats: None,
             clipboard: None,
+            ipc: None,
         },
+        shutdown_tx.clone(),
         shutdown_rx,
     ));
 

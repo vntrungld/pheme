@@ -137,7 +137,9 @@ async fn spawn_clip_pair(with_client_clip: bool) -> ClipPair {
             mic: pheme_app::audio::CaptureSource::Disabled,
             mic_counters: None,
             clipboard: server_clipboard,
+            ipc: None,
         },
+        shutdown_tx.clone(),
         shutdown_rx.clone(),
     ));
     let client = tokio::spawn(run_client(
@@ -152,7 +154,9 @@ async fn spawn_clip_pair(with_client_clip: bool) -> ClipPair {
             mic: pheme_app::audio::PlaybackSource::Disabled,
             mic_stats: None,
             clipboard: client_clipboard,
+            ipc: None,
         },
+        shutdown_tx.clone(),
         shutdown_rx,
     ));
     ClipPair {

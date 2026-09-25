@@ -106,7 +106,9 @@ fn spawn_pair_with_hotkeys(hotkeys: Hotkeys) -> Pair {
             mic: pheme_app::audio::CaptureSource::Disabled,
             mic_counters: None,
             clipboard: None,
+            ipc: None,
         },
+        shutdown_tx.clone(),
         shutdown_rx.clone(),
     ));
     let client = tokio::spawn(run_client(
@@ -121,7 +123,9 @@ fn spawn_pair_with_hotkeys(hotkeys: Hotkeys) -> Pair {
             mic: pheme_app::audio::PlaybackSource::Disabled,
             mic_stats: None,
             clipboard: None,
+            ipc: None,
         },
+        shutdown_tx.clone(),
         shutdown_rx,
     ));
     Pair {
@@ -196,7 +200,9 @@ async fn server_and_client_exchange_input_over_quic() {
             mic: pheme_app::audio::CaptureSource::Disabled,
             mic_counters: None,
             clipboard: None,
+            ipc: None,
         },
+        shutdown_tx.clone(),
         shutdown_rx.clone(),
     ));
     let client = tokio::spawn(run_client(
@@ -211,7 +217,9 @@ async fn server_and_client_exchange_input_over_quic() {
             mic: pheme_app::audio::PlaybackSource::Disabled,
             mic_stats: None,
             clipboard: None,
+            ipc: None,
         },
+        shutdown_tx.clone(),
         shutdown_rx.clone(),
     ));
 
@@ -343,11 +351,13 @@ async fn client_reconnects_after_server_restart() {
             mic: pheme_app::audio::PlaybackSource::Disabled,
             mic_stats: None,
             clipboard: None,
+            ipc: None,
         },
+        shutdown_tx.clone(),
         shutdown_rx.clone(),
     ));
 
-    let run_once = |ep: Endpoint, stop: watch::Receiver<bool>| {
+    let run_once = |ep: Endpoint, stop_tx: watch::Sender<bool>, stop: watch::Receiver<bool>| {
         let (capture, handle) = MockCapture::new(screens(1920, 1080));
         let task = tokio::spawn(run_server(
             ServerDeps {
@@ -367,14 +377,16 @@ async fn client_reconnects_after_server_restart() {
                 mic: pheme_app::audio::CaptureSource::Disabled,
                 mic_counters: None,
                 clipboard: None,
+                ipc: None,
             },
+            stop_tx,
             stop,
         ));
         (task, handle)
     };
 
     let (stop1_tx, stop1_rx) = watch::channel(false);
-    let (server1, handle1) = run_once(server_ep, stop1_rx);
+    let (server1, handle1) = run_once(server_ep, stop1_tx.clone(), stop1_rx);
     assert!(wait_until(|| handle1.is_started(), Duration::from_secs(5)).await);
     assert!(
         wait_until(
@@ -393,7 +405,7 @@ async fn client_reconnects_after_server_restart() {
     // Restart the server on the same port; the client must come back on its own.
     let server_ep2 = bind_server_retrying(server_addr, &sid, strust).await;
     let (stop2_tx, stop2_rx) = watch::channel(false);
-    let (server2, handle2) = run_once(server_ep2, stop2_rx);
+    let (server2, handle2) = run_once(server_ep2, stop2_tx.clone(), stop2_rx);
     assert!(wait_until(|| handle2.is_started(), Duration::from_secs(5)).await);
     let before = inj_log.len();
     assert!(
@@ -450,7 +462,9 @@ async fn shutdown_during_resolution_is_observed_promptly() {
             mic: pheme_app::audio::PlaybackSource::Disabled,
             mic_stats: None,
             clipboard: None,
+            ipc: None,
         },
+        shutdown_tx.clone(),
         shutdown_rx,
     ));
 
@@ -515,7 +529,9 @@ async fn server_releases_grab_when_client_vanishes_silently() {
             mic: pheme_app::audio::CaptureSource::Disabled,
             mic_counters: None,
             clipboard: None,
+            ipc: None,
         },
+        shutdown_tx.clone(),
         shutdown_rx.clone(),
     ));
     let client = tokio::spawn(run_client(
@@ -530,7 +546,9 @@ async fn server_releases_grab_when_client_vanishes_silently() {
             mic: pheme_app::audio::PlaybackSource::Disabled,
             mic_stats: None,
             clipboard: None,
+            ipc: None,
         },
+        shutdown_tx.clone(),
         shutdown_rx.clone(),
     ));
 

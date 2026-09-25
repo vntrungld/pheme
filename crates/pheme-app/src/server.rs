@@ -1,5 +1,6 @@
 //! Server runtime: capture thread → core router → QUIC peer.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -12,11 +13,12 @@ use pheme_net::pairing::{generate_code, run_server_pairing};
 use pheme_net::{Endpoint, Identity, Incoming, Peer, PeerSender, TrustStore};
 use pheme_proto::{AudioParams, AudioStream, Msg, PROTOCOL_VERSION};
 use tokio::sync::{mpsc, watch};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::audio::{CaptureSource, InStats, OutCounters, PlaybackSource, RecvSide, SendSide};
 use crate::clipboard::ClipboardService;
-use crate::config::{config_dir, Config};
+use crate::config::{config_dir, Config, Role};
+use crate::ipc::{Command, CoreLink, LinkState, Status};
 
 /// How long shutdown waits for the router thread to notice that every `CaptureEvent`
 /// sender has been dropped.
@@ -64,6 +66,10 @@ pub struct ServerDeps {
     /// arboard's Xwayland fallback.) `None` disables clipboard sharing and
     /// nothing else.
     pub clipboard: Option<ClipboardService>,
+    /// Report status to a front-end over this socket and take commands from
+    /// it. `None` for every invocation a person types themselves; only
+    /// `pheme` with no subcommand, supervising this as a child, sets it.
+    pub ipc: Option<PathBuf>,
 }
 
 /// The currently connected client, as seen by the router thread.
@@ -251,6 +257,31 @@ impl Shared {
     }
 }
 
+/// The lock hotkey's own path into the core (`ServerCore::toggle_lock`, run
+/// through `Shared::execute` exactly as `bind_lock_shortcut`'s thread and the
+/// key-watching path in `on_event` both already do), wrapped so the IPC
+/// command loop can set the lock to an explicit value rather than reaching
+/// into the core a second way. `ServerCore` has no `set_locked`, only a
+/// toggle, so `Lock`/`Unlock` toggle only when that actually changes the
+/// state -- a repeated `Lock` command must not flip an already-locked core
+/// back open.
+#[derive(Clone)]
+struct LockHandle(Arc<Shared>);
+
+impl LockHandle {
+    fn set(&self, want: bool) {
+        let actions = {
+            let mut core = self.0.core.lock().unwrap();
+            if core.locked() == want {
+                Vec::new()
+            } else {
+                core.toggle_lock()
+            }
+        };
+        self.0.execute(actions);
+    }
+}
+
 /// Binds the lock hotkey through `org.freedesktop.portal.GlobalShortcuts` when this
 /// is a Wayland session and a lock hotkey is configured. `None` otherwise --
 /// including every failure inside the bind, which only logs a `warn!`: a lock
@@ -301,6 +332,7 @@ fn bind_lock_shortcut(_configured: Option<String>, _shared: &Arc<Shared>) -> Opt
 
 pub async fn run_server(
     deps: ServerDeps,
+    shutdown_tx: watch::Sender<bool>,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let ServerDeps {
@@ -316,6 +348,7 @@ pub async fn run_server(
         mic,
         mic_counters,
         clipboard,
+        ipc,
     } = deps;
     let audio_stats = audio_stats.unwrap_or_default();
     let audio_in = RecvSide::spawn(audio, audio_stats.clone());
@@ -353,6 +386,9 @@ pub async fn run_server(
     // `on_event` -- a second mechanism there would double-toggle. Held for the life
     // of the server: dropping it unbinds the shortcut.
     let _lock_shortcut = bind_lock_shortcut(lock_hotkey_trigger, &shared);
+    // The IPC command loop's own path to the lock, reusing exactly what the
+    // hotkey above and the key-watching path in `on_event` both already call.
+    let lock_handle = LockHandle(shared.clone());
 
     // Router thread: blocking receive from the capture backend, no async hop for datagrams.
     // It owns `router_alive`; dropping it when the loop ends (the backend closed the event
@@ -374,11 +410,25 @@ pub async fn run_server(
         })
         .context("spawning router thread")?;
 
-    if stats {
+    // `status_tx` is `Some` exactly when a front-end is attached: the per-second task
+    // below pushes onto it, and the IPC command loop spawned further down drains it onto
+    // the socket. A full channel drops the newest update rather than blocking this task
+    // on a slow socket write; capacity 4 gives the drain a little slack before that
+    // happens, and losing one is harmless because another follows a second later.
+    let (status_tx, status_rx): (Option<mpsc::Sender<Status>>, Option<mpsc::Receiver<Status>>) =
+        if ipc.is_some() {
+            let (tx, rx) = mpsc::channel(4);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
+    if stats || ipc.is_some() {
         let s = shared.clone();
         let astats = audio_stats.clone();
         let mic_counters = mic_counters.clone();
         let mut stats_shutdown = shutdown.clone();
+        let status_tx = status_tx.clone();
         tokio::spawn(async move {
             let mut last = (0u64, 0u64, 0u64);
             // Shadow of the peer's monotonic drop counter, so this line reports the
@@ -413,26 +463,90 @@ pub async fn run_server(
                 let mic_sent = mic_counters.sent.swap(0, Ordering::Relaxed);
                 let mic_suppressed = mic_counters.suppressed.swap(0, Ordering::Relaxed);
                 let mic_open = s.mic.is_open();
-                info!(
-                    events = now.0 - last.0,
-                    control = now.1 - last.1,
-                    datagrams = now.2 - last.2,
-                    connected,
-                    audio_depth_ms = astats.depth_ms.load(Ordering::Relaxed),
-                    audio_lost = a.lost,
-                    audio_underruns = a.underruns,
-                    audio_late = a.late,
-                    audio_resets = a.resets,
-                    audio_dropped = a.dropped,
-                    audio_channel_dropped,
-                    audio_overflows = a.overflows,
-                    mic_sent,
-                    mic_suppressed,
-                    mic_open,
-                    "stats/s"
-                );
+                if stats {
+                    info!(
+                        events = now.0 - last.0,
+                        control = now.1 - last.1,
+                        datagrams = now.2 - last.2,
+                        connected,
+                        audio_depth_ms = astats.depth_ms.load(Ordering::Relaxed),
+                        audio_lost = a.lost,
+                        audio_underruns = a.underruns,
+                        audio_late = a.late,
+                        audio_resets = a.resets,
+                        audio_dropped = a.dropped,
+                        audio_channel_dropped,
+                        audio_overflows = a.overflows,
+                        mic_sent,
+                        mic_suppressed,
+                        mic_open,
+                        "stats/s"
+                    );
+                }
+                if let Some(tx) = &status_tx {
+                    let status = Status {
+                        role: Role::Server,
+                        state: if connected {
+                            LinkState::Connected
+                        } else {
+                            LinkState::Listening
+                        },
+                        peer: s.link.lock().unwrap().as_ref().map(|l| l.name.clone()),
+                        rtt_us: 0,
+                        locked: s.core.lock().unwrap().locked(),
+                        events: now.0 - last.0,
+                        // Only the client can count a gap in the other end's
+                        // sequence, so a server reports none rather than a figure
+                        // that would read as "nothing was lost".
+                        lost: 0,
+                        audio_depth_ms: astats.depth_ms.load(Ordering::Relaxed) as u32,
+                        audio_lost: a.lost,
+                        mic_depth_ms: 0,
+                        mic_lost: 0,
+                    };
+                    let _ = tx.try_send(status);
+                }
                 last = now;
             }
+        });
+    }
+
+    // The core exits when the front-end goes away. That is the lifetime rule
+    // from §3: no pidfile, no adoption, and no orphan left holding a uinput
+    // device or a global keyboard hook.
+    if let Some(path) = &ipc {
+        let mut link = CoreLink::connect(&path.to_string_lossy()).await?;
+        let shutdown_tx = shutdown_tx.clone();
+        let lock = lock_handle.clone();
+        let mut status_rx = status_rx.expect("status channel exists whenever ipc does");
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    // Statuses arrive from the per-second task on this channel.
+                    Some(s) = status_rx.recv() => {
+                        if let Err(e) = link.send_status(&s).await {
+                            debug!("status send failed: {e}");
+                            break;
+                        }
+                    }
+                    r = link.recv_command() => match r {
+                        Ok(Some(Command::Lock)) => lock.set(true),
+                        Ok(Some(Command::Unlock)) => lock.set(false),
+                        // Stop and a closed socket are the same outcome and
+                        // take the same path out: the shutdown signal Ctrl+C
+                        // already uses. A second shutdown route would need its
+                        // own proof that it releases the capture and the
+                        // devices, and there is no reason to have one.
+                        Ok(Some(Command::Stop)) | Ok(None) => break,
+                        Err(e) => {
+                            debug!("ipc read failed: {e}");
+                            break;
+                        }
+                    },
+                    else => break,
+                }
+            }
+            let _ = shutdown_tx.send(true);
         });
     }
 
@@ -707,7 +821,12 @@ async fn handle_peer(
 }
 
 /// Entry point for `pheme server`.
-pub async fn main(cfg: Config, pair: bool, stats: bool) -> anyhow::Result<()> {
+pub async fn main(
+    cfg: Config,
+    pair: bool,
+    stats: bool,
+    ipc: Option<PathBuf>,
+) -> anyhow::Result<()> {
     let dir = config_dir();
     let identity = Identity::load_or_create(&dir, &cfg.name)?;
     let trust = TrustStore::load(&dir)?.shared();
@@ -755,10 +874,11 @@ pub async fn main(cfg: Config, pair: bool, stats: bool) -> anyhow::Result<()> {
 
     let capture = pheme_input::detect_capture().context("input capture backend")?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let ctrlc_shutdown = shutdown_tx.clone();
     tokio::spawn(async move {
         let _ = tokio::signal::ctrl_c().await;
         info!("shutting down");
-        let _ = shutdown_tx.send(true);
+        let _ = ctrlc_shutdown.send(true);
     });
     let clipboard = ClipboardService::spawn(pheme_clip::open);
     run_server(
@@ -775,7 +895,9 @@ pub async fn main(cfg: Config, pair: bool, stats: bool) -> anyhow::Result<()> {
             mic: CaptureSource::Detect(cfg.audio.mic_device.clone()),
             mic_counters: None,
             clipboard,
+            ipc,
         },
+        shutdown_tx,
         shutdown_rx,
     )
     .await

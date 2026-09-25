@@ -129,7 +129,9 @@ fn spawn_pair(fail_capture: bool) -> Pair {
             mic: CaptureSource::Disabled,
             mic_counters: None,
             clipboard: None,
+            ipc: None,
         },
+        shutdown_tx.clone(),
         shutdown_rx.clone(),
     ));
     let client = tokio::spawn(run_client(
@@ -144,7 +146,9 @@ fn spawn_pair(fail_capture: bool) -> Pair {
             mic: PlaybackSource::Disabled,
             mic_stats: None,
             clipboard: None,
+            ipc: None,
         },
+        shutdown_tx.clone(),
         shutdown_rx,
     ));
     Pair {
