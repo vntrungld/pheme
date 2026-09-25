@@ -71,6 +71,8 @@ enum Cmd {
     },
     /// List the audio devices this machine offers
     Devices,
+    /// List the monitors this machine can switch, and the inputs they take
+    Displays,
 }
 
 fn init_logging(verbose: u8) {
@@ -217,5 +219,104 @@ async fn run_subcommand(cmd: Cmd) -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Cmd::Displays => {
+            let mut found = pheme_display::enumerate();
+            if found.is_empty() {
+                println!(
+                    "No monitor answered DDC/CI.\n\
+                     On Linux, run `pheme setup` and check that /dev/i2c-* is readable; \
+                     `ddcutil detect` is a useful second opinion.\n\
+                     Many monitors also have a DDC/CI switch in their on-screen menu, \
+                     and some laptop docks and adapters do not carry the i2c lines at all."
+                );
+                return Ok(());
+            }
+            println!(
+                "{:<40} {:<14} {:<8} SUPPORTED",
+                "IDENTITY", "LOCATION", "CURRENT"
+            );
+            for m in found.iter_mut() {
+                // Read before the borrow of `m` is split across the two
+                // calls below; both take `&mut self`.
+                let current = match m.get_input() {
+                    Ok(v) => format_vcp_value(v),
+                    Err(_) => "-".to_string(),
+                };
+                // Advisory: plenty of monitors return no capability string,
+                // or one that omits inputs they do accept. The current
+                // value above is the reliable half -- switch the input by
+                // hand, re-run this, and read off the number.
+                let supported = match m.capabilities() {
+                    Ok(caps) => {
+                        let vals = pheme_display::caps::input_values_from_caps(&caps);
+                        format_supported(&vals)
+                    }
+                    Err(_) => "-".to_string(),
+                };
+                println!(
+                    "{:<40} {:<14} {:<8} {}",
+                    m.identity(),
+                    m.location(),
+                    current,
+                    supported
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+/// A VCP value the way `ddcutil` and MCCS document it: two lower-case hex
+/// digits, `0x`-prefixed. The padding matters -- MCCS assigns `0x0F` to
+/// DisplayPort-1, and an unpadded `0xf` would read as a different value to
+/// anyone cross-checking against a monitor's own on-screen menu.
+fn format_vcp_value(v: u16) -> String {
+    format!("0x{v:02x}")
+}
+
+/// The capability string's advisory input list, space-joined, or `-` when it
+/// named none -- which is common and is not an error (see `pick`'s doc
+/// comment in `pheme_display` for why the list cannot be relied on).
+fn format_supported(vals: &[u16]) -> String {
+    if vals.is_empty() {
+        "-".to_string()
+    } else {
+        vals.iter()
+            .map(|v| format_vcp_value(*v))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+#[cfg(test)]
+mod displays_format_tests {
+    use super::{format_supported, format_vcp_value};
+
+    /// Break it by dropping the `02` width: `0x0f` becomes `0xf`, which is
+    /// no longer the two-digit form MCCS and `ddcutil` print, and no longer
+    /// what a person reads off the monitor's own on-screen menu.
+    #[test]
+    fn a_single_hex_digit_is_zero_padded() {
+        assert_eq!(format_vcp_value(0x0f), "0x0f");
+    }
+
+    #[test]
+    fn a_two_digit_value_is_unchanged() {
+        assert_eq!(format_vcp_value(0x11), "0x11");
+    }
+
+    /// The empty capability list is the common case (see the brief this
+    /// command was written for), not an error, so it prints `-` rather
+    /// than an empty string a column would swallow.
+    #[test]
+    fn no_supported_values_prints_a_dash() {
+        assert_eq!(format_supported(&[]), "-");
+    }
+
+    /// Break it by joining with no separator or the wrong one: the values
+    /// run together and are no longer individually readable.
+    #[test]
+    fn several_supported_values_are_space_joined_in_order() {
+        assert_eq!(format_supported(&[0x0f, 0x11, 0x12]), "0x0f 0x11 0x12");
     }
 }

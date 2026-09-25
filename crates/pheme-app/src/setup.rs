@@ -1,10 +1,11 @@
 //! `pheme setup`: one-time OS prerequisites.
 
-pub const UDEV_RULE: &str = "# Pheme: allow members of the input group to create virtual input devices\nKERNEL==\"uinput\", MODE=\"0660\", GROUP=\"input\", TAG+=\"uaccess\"\n";
+pub const UDEV_RULE: &str = "# Pheme: allow members of the input group to create virtual input devices\nKERNEL==\"uinput\", MODE=\"0660\", GROUP=\"input\", TAG+=\"uaccess\"\n# Pheme: allow the logged-in user to speak DDC/CI to monitors over i2c\nKERNEL==\"i2c-[0-9]*\", MODE=\"0660\", GROUP=\"i2c\", TAG+=\"uaccess\"\n";
 
-/// Makes systemd load the `uinput` module at boot (`modprobe uinput` alone does not
-/// survive a reboot on most distributions).
-pub const MODULES_LOAD: &str = "uinput\n";
+/// Makes systemd load `uinput` (virtual input devices) and `i2c-dev`
+/// (DDC/CI monitor control) at boot; `modprobe` alone does not survive a
+/// reboot on most distributions.
+pub const MODULES_LOAD: &str = "uinput\ni2c-dev\n";
 
 #[cfg(target_os = "linux")]
 pub fn run() -> anyhow::Result<()> {
@@ -29,7 +30,7 @@ pub fn run() -> anyhow::Result<()> {
         println!();
         println!("  cat > {} <<'EOF'\n{}EOF", rule_path.display(), UDEV_RULE);
         println!(
-            "  modprobe uinput && echo uinput > {}",
+            "  modprobe uinput && modprobe i2c-dev && printf 'uinput\\ni2c-dev\\n' > {}",
             modules_path.display()
         );
         println!("  udevadm control --reload && udevadm trigger --name-match=uinput");
@@ -90,6 +91,10 @@ pub fn run() -> anyhow::Result<()> {
             "Setup finished with warnings (see above); reboot or reload udev manually if /dev/uinput stays inaccessible."
         );
     }
+    println!(
+        "If DDC/CI still fails, add yourself to the i2c group and log in again:\n  \
+         usermod -aG i2c {user}"
+    );
     Ok(())
 }
 
@@ -143,15 +148,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn modules_load_entry_names_the_uinput_module() {
-        assert_eq!(MODULES_LOAD, "uinput\n");
-    }
-
-    #[test]
     fn udev_rule_targets_uinput_for_the_input_group() {
         assert!(UDEV_RULE.contains("KERNEL==\"uinput\""));
         assert!(UDEV_RULE.contains("GROUP=\"input\""));
         assert!(UDEV_RULE.contains("uaccess"));
         assert!(UDEV_RULE.ends_with('\n'));
+    }
+
+    /// Break it by replacing rather than appending: uinput stops being
+    /// loaded and virtual input devices stop working, which is the whole
+    /// of sub-project 1.
+    #[test]
+    fn modules_load_entry_names_both_modules() {
+        let lines: Vec<&str> = MODULES_LOAD.lines().collect();
+        assert!(lines.contains(&"uinput"), "{MODULES_LOAD:?}");
+        assert!(lines.contains(&"i2c-dev"), "{MODULES_LOAD:?}");
+    }
+
+    /// Break it by matching `KERNEL=="i2c*"`: that also matches the
+    /// `i2c-dev` bus devices' parents and other i2c character devices this
+    /// rule has no business relaxing.
+    #[test]
+    fn udev_rule_covers_the_i2c_buses() {
+        assert!(UDEV_RULE.contains(r#"KERNEL=="i2c-[0-9]*""#), "{UDEV_RULE}");
+        assert!(UDEV_RULE.contains(r#"GROUP="i2c""#), "{UDEV_RULE}");
+        // uaccess is what makes this work without group membership, the
+        // same way the uinput rule already does.
+        assert_eq!(UDEV_RULE.matches(r#"TAG+="uaccess""#).count(), 2);
     }
 }
