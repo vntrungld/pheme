@@ -18,7 +18,7 @@ pheme-clip = { workspace = true }
 pheme-audio = { workspace = true }
 rtrb = { workspace = true }
 rubato = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["process"] }
 crossbeam-channel = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
