@@ -544,57 +544,83 @@ struct PhemeApp {
     devices: Arc<Mutex<DeviceListState>>,
 }
 
+impl PhemeApp {
+    /// Flips Lock/Unlock against whatever the core last reported. The only
+    /// place either the tray's "Lock input" item or the window's own Lock
+    /// button drives -- see Finding 3 (final review): Start/Stop and Lock
+    /// used to exist only as tray menu items, which left GNOME without the
+    /// AppIndicator extension (the README's own stated default) with no
+    /// way to lock input from the GUI at all. Both callers act through
+    /// this one method rather than each sending their own `Command`, so
+    /// they cannot drift apart on what a click actually does.
+    fn toggle_lock(&mut self) {
+        if let CoreState::Running(status) = self.supervisor.state() {
+            let cmd = if status.locked {
+                Command::Unlock
+            } else {
+                Command::Lock
+            };
+            self.handle.block_on(self.supervisor.send(cmd));
+        }
+    }
+
+    /// Starts or stops the supervised core, whichever the current state
+    /// implies. The only place either the tray's Start/Stop item or the
+    /// window's own Start/Stop button drives -- see [`toggle_lock`][Self::toggle_lock]'s
+    /// doc comment for why both go through one method.
+    fn start_stop(&mut self) {
+        self.action_error = None;
+        match self.supervisor.state() {
+            CoreState::Running(_) => {
+                self.handle.block_on(self.supervisor.shutdown());
+            }
+            // `restart` respawns from whatever `Supervisor` is already
+            // holding; starting a child back up is not a configuration
+            // change, so this never touches disk the way `apply_config`
+            // does. A `NoConfig` restart is a harmless no-op, so there is
+            // nothing to report there either.
+            CoreState::Stopped(_) | CoreState::NoConfig => {
+                if let Err(e) = self.handle.block_on(self.supervisor.restart()) {
+                    // Surfaced the same way a link failure is: a silently
+                    // discarded error here would leave a Start click with
+                    // no visible effect and no reason anywhere.
+                    self.action_error = Some(format!("could not start: {e:#}"));
+                }
+            }
+        }
+    }
+}
+
 impl eframe::App for PhemeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // The tray's clicks and its own icon/menu updates ride on GTK's
         // event loop on Linux; nothing else in this process pumps it.
         pump_gtk();
 
+        // Collected rather than handled inline: `tray.poll()` holds a
+        // mutable borrow of `self.tray` for the loop, and `ToggleLock` and
+        // `StartStop` now call `self.toggle_lock()` / `self.start_stop()`
+        // -- the same methods the window's own buttons call, per Finding 3
+        // -- which need the whole of `self`, not just the tray field. The
+        // borrow has to end before those run.
+        let mut tray_events = Vec::new();
         if let Some(tray) = &mut self.tray {
             while let Some(event) = tray.poll() {
-                match event {
-                    TrayEvent::Open => {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                    }
-                    TrayEvent::Quit => {
-                        self.quitting = true;
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                    TrayEvent::ToggleLock => {
-                        if let CoreState::Running(status) = self.supervisor.state() {
-                            let cmd = if status.locked {
-                                Command::Unlock
-                            } else {
-                                Command::Lock
-                            };
-                            self.handle.block_on(self.supervisor.send(cmd));
-                        }
-                    }
-                    TrayEvent::StartStop => {
-                        self.action_error = None;
-                        match self.supervisor.state() {
-                            CoreState::Running(_) => {
-                                self.handle.block_on(self.supervisor.shutdown());
-                            }
-                            // `restart` respawns from whatever `Supervisor` is
-                            // already holding; starting a child back up is not
-                            // a configuration change, so this never touches
-                            // disk the way `apply_config` does. A `NoConfig`
-                            // restart is a harmless no-op, so there is
-                            // nothing to report there either.
-                            CoreState::Stopped(_) | CoreState::NoConfig => {
-                                if let Err(e) = self.handle.block_on(self.supervisor.restart()) {
-                                    // Surfaced the same way a link failure is:
-                                    // a silently discarded error here would
-                                    // leave a Start click with no visible
-                                    // effect and no reason anywhere.
-                                    self.action_error = Some(format!("could not start: {e:#}"));
-                                }
-                            }
-                        }
-                    }
+                tray_events.push(event);
+            }
+        }
+        for event in tray_events {
+            match event {
+                TrayEvent::Open => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
+                TrayEvent::Quit => {
+                    self.quitting = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                TrayEvent::ToggleLock => self.toggle_lock(),
+                TrayEvent::StartStop => self.start_stop(),
             }
         }
 
@@ -650,6 +676,7 @@ impl eframe::App for PhemeApp {
                     ui.separator();
                 }
                 draw_status(ui, &self.view);
+                draw_actions(ui, &state, self);
                 draw_pairing(ui, role, &state, self);
                 draw_config(ui, self);
             });
@@ -790,6 +817,40 @@ fn link_state_name(state: &LinkState) -> &'static str {
         LinkState::Connected => "Connected",
         LinkState::Failed(_) => "Failed",
     }
+}
+
+/// Start/Stop and Lock, next to the status panel -- drawn every frame,
+/// regardless of whether a tray exists.
+///
+/// Finding 3 (final review): these two actions used to live only in the
+/// tray's menu, which left a person on GNOME without the AppIndicator
+/// extension (the README's own stated default there) with no way to start
+/// a stopped core, and no way to lock input from the GUI at all. Both
+/// buttons call [`PhemeApp::start_stop`] and [`PhemeApp::toggle_lock`] --
+/// the exact same methods `TrayEvent::StartStop` and
+/// `TrayEvent::ToggleLock` call in `PhemeApp::update` -- rather than
+/// reimplementing either action here, so the window and the tray can never
+/// disagree about what a click does.
+fn draw_actions(ui: &mut egui::Ui, core_state: &CoreState, app: &mut PhemeApp) {
+    let running = matches!(core_state, CoreState::Running(_));
+    let locked = matches!(core_state, CoreState::Running(status) if status.locked);
+
+    ui.horizontal(|ui| {
+        if ui.button(if running { "Stop" } else { "Start" }).clicked() {
+            app.start_stop();
+        }
+        let lock_label = if locked { "Unlock input" } else { "Lock input" };
+        // Disabled while nothing is running, same as the tray's own
+        // checkmark item (`Tray::set_state` calls `lock.set_enabled(running)`):
+        // there is nothing for a lock command to reach.
+        if ui
+            .add_enabled(running, egui::Button::new(lock_label))
+            .clicked()
+        {
+            app.toggle_lock();
+        }
+    });
+    ui.separator();
 }
 
 /// What the client pairing panel's "Discover servers" button last asked for,
