@@ -28,15 +28,7 @@ pub fn run() -> anyhow::Result<()> {
     if !is_root {
         println!("Run the following as root (or re-run `sudo pheme setup`):");
         println!();
-        println!("  cat > {} <<'EOF'\n{}EOF", rule_path.display(), UDEV_RULE);
-        println!(
-            "  modprobe uinput && modprobe i2c-dev && printf 'uinput\\ni2c-dev\\n' > {}",
-            modules_path.display()
-        );
-        println!("  udevadm control --reload && udevadm trigger --name-match=uinput");
-        println!("  usermod -aG input {user}");
-        println!();
-        println!("Then log out and back in so the group change applies.");
+        print!("{}", recipe(rule_path, modules_path, &user));
         return Ok(());
     }
     std::fs::write(rule_path, UDEV_RULE)
@@ -131,6 +123,50 @@ pub fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The copy-and-paste form of everything the root path below does, for
+/// somebody who ran `pheme setup` without root.
+///
+/// Built from the same constants and listing the same commands, because a
+/// recipe that has drifted from the real thing is worse than no recipe at
+/// all: it leaves a machine that looks set up and is not. The two steps
+/// that were missing when this was a hand-written string are the ones with
+/// no symptom until a reboot -- `udevadm trigger --subsystem-match=i2c-dev`,
+/// without which the new rule never reaches the `/dev/i2c-*` nodes that
+/// already exist, and the `i2c` group fallback for systems `uaccess` does
+/// not cover.
+#[cfg(target_os = "linux")]
+fn recipe(rule_path: &std::path::Path, modules_path: &std::path::Path, user: &str) -> String {
+    let rule = rule_path.display();
+    let modules = modules_path.display();
+    // The file contents come from the constants rather than being written
+    // out again here, so the two cannot say different things. The heredoc
+    // bodies are the one part that must not be indented.
+    let commands = [
+        format!("cat > {rule} <<'EOF'\n{UDEV_RULE}EOF"),
+        "modprobe uinput && modprobe i2c-dev".to_string(),
+        format!("cat > {modules} <<'EOF'\n{MODULES_LOAD}EOF"),
+        "udevadm control --reload".to_string(),
+        // Not optional, and the one with no symptom until a reboot: a
+        // reload alone does not re-apply the new rule to the /dev/i2c-*
+        // nodes that already exist.
+        "udevadm trigger --name-match=uinput".to_string(),
+        "udevadm trigger --subsystem-match=i2c-dev".to_string(),
+        format!("usermod -aG input {user}"),
+    ];
+    let mut out = String::new();
+    for c in commands {
+        out.push_str("  ");
+        out.push_str(&c);
+        out.push('\n');
+    }
+    out.push_str(
+        "\nThen log out and back in so the group change applies.\n\
+         If DDC/CI still fails, add yourself to the i2c group as well:\n",
+    );
+    out.push_str(&format!("  usermod -aG i2c {user}\n"));
+    out
+}
+
 /// Runs `cmd`, printing a `warning:` line to stderr and returning `false` on
 /// spawn error or non-zero exit; returns `true` on success.
 #[cfg(target_os = "linux")]
@@ -208,5 +244,69 @@ mod tests {
         // uaccess is what makes this work without group membership, the
         // same way the uinput rule already does.
         assert_eq!(UDEV_RULE.matches(r#"TAG+="uaccess""#).count(), 2);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[cfg(test)]
+mod recipe_tests {
+    use super::*;
+    use std::path::Path;
+
+    fn text() -> String {
+        recipe(
+            Path::new("/etc/udev/rules.d/80-pheme.rules"),
+            Path::new("/etc/modules-load.d/pheme.conf"),
+            "ada",
+        )
+    }
+
+    /// The finding this exists for: the printed recipe reloaded udev and
+    /// triggered uinput, but never re-triggered the i2c nodes, so somebody
+    /// who pasted it exactly got the rule written, `i2c-dev` loaded, and
+    /// the permissions on the existing `/dev/i2c-*` nodes unchanged until
+    /// a reboot -- on the machine this command exists to set up.
+    ///
+    /// Break it by deleting the `udevadm trigger --subsystem-match=i2c-dev`
+    /// line from `recipe`.
+    #[test]
+    fn the_recipe_retriggers_the_i2c_nodes() {
+        let t = text();
+        assert!(t.contains("udevadm control --reload"), "{t}");
+        assert!(t.contains("udevadm trigger --name-match=uinput"), "{t}");
+        assert!(
+            t.contains("udevadm trigger --subsystem-match=i2c-dev"),
+            "{t}"
+        );
+    }
+
+    /// Break it by writing the module names out by hand again, the way
+    /// this printed them before: `MODULES_LOAD` and the recipe then drift
+    /// with nothing pinning them, which is how i2c-dev came to be in one
+    /// and not the other.
+    #[test]
+    fn the_recipe_writes_the_modules_file_from_the_constant() {
+        let t = text();
+        assert!(t.contains(MODULES_LOAD), "{t}");
+        assert!(t.contains(UDEV_RULE), "{t}");
+        for m in MODULES_LOAD.lines() {
+            assert!(
+                t.contains(&format!("modprobe {m}")),
+                "{m} is not loaded now: {t}"
+            );
+        }
+    }
+
+    /// The root path prints the `i2c` group fallback and explains why it
+    /// does not run it; the recipe omitted it entirely, so the person most
+    /// likely to need it -- one without root, on a system `uaccess` does
+    /// not cover -- was the one not told.
+    ///
+    /// Break it by deleting the last two lines of `recipe`.
+    #[test]
+    fn the_recipe_offers_the_i2c_group_fallback() {
+        let t = text();
+        assert!(t.contains("usermod -aG input ada"), "{t}");
+        assert!(t.contains("usermod -aG i2c ada"), "{t}");
     }
 }
