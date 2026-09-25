@@ -19,7 +19,9 @@ use std::time::Duration;
 use anyhow::Context as _;
 use eframe::egui;
 
-use crate::config::{config_dir, AudioCfg, ClientCfg, Config, HotkeysCfg, Role, SideCfg};
+use crate::config::{
+    config_dir, AudioCfg, ClientCfg, Config, DisplayCfg, HotkeysCfg, Role, SideCfg,
+};
 use crate::ipc::{Command, LinkState};
 use pheme_audio::devices::{list_devices, DeviceInfo, DeviceKind};
 
@@ -237,6 +239,12 @@ struct ConfigForm {
     /// discovery toggle -- but carried through unedited so that saving from
     /// this form never silently flips it back to its default.
     discovery: bool,
+    /// Not exposed in the panel, and carried through unedited for the same
+    /// reason `discovery` is: a `[display]` section written by hand must
+    /// survive a Save from this form.
+    display: DisplayCfg,
+    /// Likewise. `hotkeys.switch_display` has no widget either.
+    switch_display: Option<String>,
     lock_hotkey: String,
     clients: Vec<ClientForm>,
     /// Empty means "the operating system default", exactly as an absent
@@ -255,6 +263,8 @@ impl ConfigForm {
             listen: cfg.listen.to_string(),
             connect: cfg.connect.clone().unwrap_or_default(),
             discovery: cfg.discovery,
+            display: cfg.display.clone(),
+            switch_display: cfg.hotkeys.switch_display.clone(),
             lock_hotkey: cfg.hotkeys.lock.clone().unwrap_or_default(),
             clients: cfg.clients.iter().map(ClientForm::from_cfg).collect(),
             playback_device: cfg.audio.playback_device.clone().unwrap_or_default(),
@@ -322,12 +332,14 @@ impl ConfigForm {
             discovery: self.discovery,
             hotkeys: HotkeysCfg {
                 lock: trimmed_or_none(&self.lock_hotkey),
+                switch_display: self.switch_display.clone(),
             },
             audio: AudioCfg {
                 playback_device: trimmed_or_none(&self.playback_device),
                 capture_device: trimmed_or_none(&self.capture_device),
                 mic_device: trimmed_or_none(&self.mic_device),
             },
+            display: self.display.clone(),
             clients,
         };
 
@@ -1669,6 +1681,24 @@ mod tests {
         let cfg = Config::default();
         let form = ConfigForm::from_config(&cfg);
         assert_eq!(form.build().unwrap(), cfg);
+    }
+
+    /// Break it by dropping the carried fields and letting `build` fill
+    /// them from `Default`: a person who configured display switching by
+    /// hand loses it the first time they press Save, and the feature goes
+    /// quiet with nothing to explain why.
+    #[test]
+    fn the_form_carries_display_settings_it_cannot_edit() {
+        let mut cfg = Config::default();
+        cfg.display.input = Some(0x11);
+        cfg.display.monitor = Some("ULTRAGEAR".into());
+        cfg.display.cooldown_ms = 250;
+        cfg.hotkeys.switch_display = Some("F12".into());
+
+        let back = ConfigForm::from_config(&cfg).build().expect("valid config");
+
+        assert_eq!(back.display, cfg.display);
+        assert_eq!(back.hotkeys.switch_display.as_deref(), Some("F12"));
     }
 
     #[test]

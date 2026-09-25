@@ -57,12 +57,20 @@ pub struct ClientCfg {
 #[serde(deny_unknown_fields)]
 pub struct HotkeysCfg {
     pub lock: Option<String>,
+    /// Re-assert the monitor's input for whichever machine holds the
+    /// pointer (design section 8). `#[serde(default)]` is load-bearing:
+    /// `HotkeysCfg` is `deny_unknown_fields` with a hand-written `Default`,
+    /// so without it every existing `[hotkeys]` section naming only `lock`
+    /// would stop parsing.
+    #[serde(default)]
+    pub switch_display: Option<String>,
 }
 
 impl Default for HotkeysCfg {
     fn default() -> Self {
         HotkeysCfg {
             lock: Some("ScrollLock".into()),
+            switch_display: None,
         }
     }
 }
@@ -84,6 +92,41 @@ pub struct AudioCfg {
     /// platform default. There is no key to turn the microphone on or off: it opens only
     /// while the client reports that something is recording.
     pub mic_device: Option<String>,
+}
+
+/// Monitor input switching (sub-project 7). Off unless `input` is set:
+/// there is no sensible default for a number that names a physical cable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DisplayCfg {
+    /// The VCP 0x60 value of the input *this* machine is cabled to.
+    ///
+    /// Vendor-specific: MCCS assigns 0x0F to DisplayPort-1 and 0x11 to
+    /// HDMI-1 and vendors disregard it freely, which is what `pheme
+    /// displays` is for. TOML accepts `0x11`; `toml::to_string_pretty`
+    /// writes it back as `17`, which is the same number.
+    pub input: Option<u16>,
+    /// Which monitor, when more than one answers. A case-insensitive
+    /// substring of the identity or location `pheme displays` prints.
+    pub monitor: Option<String>,
+    /// Minimum gap between commands. Monitors take one to three seconds to
+    /// switch and re-sync, and a command arriving mid-switch is at best
+    /// ignored.
+    pub cooldown_ms: u64,
+}
+
+impl Default for DisplayCfg {
+    fn default() -> Self {
+        DisplayCfg {
+            input: None,
+            monitor: None,
+            cooldown_ms: default_cooldown_ms(),
+        }
+    }
+}
+
+fn default_cooldown_ms() -> u64 {
+    1000
 }
 
 fn default_name() -> String {
@@ -130,6 +173,8 @@ pub struct Config {
     #[serde(default)]
     pub audio: AudioCfg,
     #[serde(default)]
+    pub display: DisplayCfg,
+    #[serde(default)]
     pub clients: Vec<ClientCfg>,
 }
 
@@ -143,6 +188,7 @@ impl Default for Config {
             discovery: true,
             hotkeys: HotkeysCfg::default(),
             audio: AudioCfg::default(),
+            display: DisplayCfg::default(),
             clients: Vec::new(),
         }
     }
@@ -548,5 +594,49 @@ side = "top"
             1,
             "a temporary file survived a failed save: {left:?}"
         );
+    }
+
+    /// Break it by dropping `#[serde(default)]` from `Config::display`: a
+    /// config file without a [display] section stops parsing.
+    #[test]
+    fn a_config_without_a_display_section_leaves_the_feature_off() {
+        let c: Config = toml::from_str("name = \"a\"").unwrap();
+        assert_eq!(c.display.input, None);
+        assert_eq!(c.display.cooldown_ms, 1000);
+    }
+
+    /// Break it by typing `input` as a String: TOML's 0x11 then fails to
+    /// deserialize and every hex config in the README is rejected.
+    #[test]
+    fn a_hexadecimal_input_parses_as_a_number() {
+        let c: Config = toml::from_str("[display]\ninput = 0x11").unwrap();
+        assert_eq!(c.display.input, Some(17));
+    }
+
+    /// Break it by dropping `#[serde(default = "default_cooldown_ms")]`:
+    /// a [display] section naming only `input` gets a zero cooldown, and
+    /// every crossing commands the monitor mid-switch.
+    #[test]
+    fn a_display_section_without_a_cooldown_gets_the_default() {
+        let c: Config = toml::from_str("[display]\ninput = 15").unwrap();
+        assert_eq!(c.display.cooldown_ms, 1000);
+    }
+
+    /// Break it by dropping `#[serde(default)]` from
+    /// `HotkeysCfg::switch_display`: every existing config file that names
+    /// only `lock` stops parsing, because HotkeysCfg is
+    /// deny_unknown_fields with a hand-written Default.
+    #[test]
+    fn a_hotkeys_section_naming_only_lock_still_parses() {
+        let c: Config = toml::from_str("[hotkeys]\nlock = \"ScrollLock\"").unwrap();
+        assert_eq!(c.hotkeys.lock.as_deref(), Some("ScrollLock"));
+        assert_eq!(c.hotkeys.switch_display, None);
+    }
+
+    /// Break it by giving `switch_display` a non-None default: a person who
+    /// never asked for the feature gets a key of theirs swallowed by it.
+    #[test]
+    fn switch_display_has_no_default_key() {
+        assert_eq!(HotkeysCfg::default().switch_display, None);
     }
 }
