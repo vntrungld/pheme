@@ -50,12 +50,10 @@ pub fn list_devices() -> crate::Result<Vec<DeviceInfo>> {
     linux::list_devices()
 }
 
-/// The Windows half of this lands in the next task; a `todo!()` behind this
-/// `cfg` is what keeps the workspace compiling on Windows in the meantime
-/// without silently claiming an empty device list.
+/// Lists the audio devices WASAPI currently offers.
 #[cfg(target_os = "windows")]
 pub fn list_devices() -> crate::Result<Vec<DeviceInfo>> {
-    todo!("Windows audio device enumeration lands in the next task")
+    windows_backend::list_devices()
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -327,6 +325,100 @@ mod linux {
         let quoted = after_colon.strip_prefix('"')?;
         let end = quoted.find('"')?;
         Some(quoted[..end].to_string())
+    }
+}
+
+/// The Windows backend: active render and capture endpoints via `IMMDeviceEnumerator`,
+/// with the console default for each flow marked `is_default`.
+///
+/// Reuses `ComGuard` and `friendly_name` from `windows::wasapi` rather than inventing a
+/// second way of initialising COM or reading a property store in this crate.
+#[cfg(target_os = "windows")]
+mod windows_backend {
+    use windows::Win32::Media::Audio::{
+        eCapture, eConsole, eRender, EDataFlow, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator,
+        DEVICE_STATE_ACTIVE,
+    };
+    use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_ALL};
+
+    use super::{sort_devices, DeviceInfo, DeviceKind};
+    use crate::windows::wasapi::{friendly_name, ComGuard};
+    use crate::{Error, Result};
+
+    pub(super) fn list_devices() -> Result<Vec<DeviceInfo>> {
+        // SAFETY: a standard MMDevice enumeration, the same shape `open_render_device` and
+        // `open_capture_device` in `wasapi.rs` already use. Every raw pointer stays inside
+        // this module, and the one allocation `GetId` makes per device is freed right
+        // after it is read.
+        unsafe {
+            let _com = ComGuard::new()?;
+            let enumerator: IMMDeviceEnumerator =
+                CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+                    .map_err(|e| Error::Device(format!("creating the device enumerator: {e}")))?;
+
+            let mut devices = Vec::new();
+            for (flow, kind) in [
+                (eRender, DeviceKind::Playback),
+                (eCapture, DeviceKind::Capture),
+            ] {
+                let default_id = default_endpoint_id(&enumerator, flow);
+                collect_endpoints(&enumerator, flow, kind, default_id.as_deref(), &mut devices)?;
+            }
+            sort_devices(&mut devices);
+            Ok(devices)
+        }
+    }
+
+    /// The device id of the console default endpoint for `flow`.
+    ///
+    /// `None` covers both "there is no default" (e.g. no active device of that flow at
+    /// all, which `GetDefaultAudioEndpoint` reports as an error) and a `GetId` that could
+    /// not be read; either way, nothing in `devices` gets marked default rather than the
+    /// whole listing failing over a flow that simply has no default endpoint.
+    unsafe fn default_endpoint_id(
+        enumerator: &IMMDeviceEnumerator,
+        flow: EDataFlow,
+    ) -> Option<String> {
+        let dev = enumerator.GetDefaultAudioEndpoint(flow, eConsole).ok()?;
+        device_id(&dev)
+    }
+
+    /// Reads a device's id, freeing the string `GetId` allocates.
+    unsafe fn device_id(dev: &IMMDevice) -> Option<String> {
+        let id = dev.GetId().ok()?;
+        let s = id.to_string().ok();
+        CoTaskMemFree(Some(id.as_ptr() as *const _));
+        s
+    }
+
+    /// Appends every active endpoint of `flow` to `out`, each with its friendly name and
+    /// whether its id matches `default_id`.
+    unsafe fn collect_endpoints(
+        enumerator: &IMMDeviceEnumerator,
+        flow: EDataFlow,
+        kind: DeviceKind,
+        default_id: Option<&str>,
+        out: &mut Vec<DeviceInfo>,
+    ) -> Result<()> {
+        let collection = enumerator
+            .EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE)
+            .map_err(|e| Error::Device(format!("enumerating audio endpoints: {e}")))?;
+        let count = collection
+            .GetCount()
+            .map_err(|e| Error::Device(format!("counting audio endpoints: {e}")))?;
+        for i in 0..count {
+            let Ok(dev) = collection.Item(i) else {
+                continue;
+            };
+            let name = friendly_name(&dev);
+            let is_default = device_id(&dev).as_deref() == default_id;
+            out.push(DeviceInfo {
+                name,
+                kind,
+                is_default,
+            });
+        }
+        Ok(())
     }
 }
 
