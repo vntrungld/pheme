@@ -32,8 +32,12 @@ fn sort_devices(v: &mut [DeviceInfo]) {
 
 /// Not `cfg(target_os = "linux")`, although only the Linux backend calls it:
 /// its test runs on every platform, and a `cfg` here would break the Windows
-/// build of the test module. It is pure string matching and costs nothing
-/// where it is unused.
+/// build of the test module. `allow(dead_code)` off Linux is the other half
+/// of that trade: with the function unconditionally compiled but only the
+/// Linux arm calling it outside tests, the Windows *lib* target (which does
+/// not build under `cfg(test)`) has no caller for it, and `-D warnings` is
+/// enforced on a `windows-latest` runner in CI, not just here.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn kind_from_media_class(class: &str) -> Option<DeviceKind> {
     match class {
         "Audio/Sink" => Some(DeviceKind::Playback),
@@ -384,6 +388,17 @@ mod windows_backend {
     }
 
     /// Reads a device's id, freeing the string `GetId` allocates.
+    ///
+    /// `is_default` is decided by comparing this id, not `friendly_name`'s string, against
+    /// the flow's default id — unlike the Linux arm above, which matches PipeWire's
+    /// `default.audio.sink`/`source` metadata against each node's *name*. That is not an
+    /// oversight: PipeWire's metadata already names the default by `node.name`, a stable
+    /// per-node identifier distinct from the display name `friendly_name`'s WASAPI
+    /// equivalent would be. WASAPI has no such second string to match on — the endpoint id
+    /// from `GetId` is the only thing guaranteed unique per endpoint — and matching on
+    /// `friendly_name` instead would silently pick the wrong "default" the moment two
+    /// active endpoints of the same flow share a friendly name (two identical USB
+    /// headsets, say).
     unsafe fn device_id(dev: &IMMDevice) -> Option<String> {
         let id = dev.GetId().ok()?;
         let s = id.to_string().ok();
