@@ -106,6 +106,10 @@ fn default_listen() -> SocketAddr {
     SocketAddr::from(([0, 0, 0, 0], DEFAULT_PORT))
 }
 
+fn default_discovery() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -117,6 +121,10 @@ pub struct Config {
     pub listen: SocketAddr,
     #[serde(default)]
     pub connect: Option<String>,
+    /// Whether the server publishes itself on the local network. Clients are
+    /// unaffected: they look up whatever `connect` names regardless.
+    #[serde(default = "default_discovery")]
+    pub discovery: bool,
     #[serde(default)]
     pub hotkeys: HotkeysCfg,
     #[serde(default)]
@@ -132,6 +140,7 @@ impl Default for Config {
             name: default_name(),
             listen: default_listen(),
             connect: None,
+            discovery: true,
             hotkeys: HotkeysCfg::default(),
             audio: AudioCfg::default(),
             clients: Vec::new(),
@@ -442,5 +451,13 @@ side = "top"
     fn an_absent_microphone_device_means_the_platform_default() {
         let cfg: Config = toml::from_str("role = \"server\"\nname = \"desk\"\n").unwrap();
         assert_eq!(cfg.audio.mic_device, None);
+    }
+
+    #[test]
+    fn discovery_is_on_unless_it_is_turned_off() {
+        let c: Config = toml::from_str("role = \"server\"").unwrap();
+        assert!(c.discovery);
+        let c: Config = toml::from_str("role = \"server\"\ndiscovery = false").unwrap();
+        assert!(!c.discovery);
     }
 }

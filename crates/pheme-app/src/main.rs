@@ -51,6 +51,12 @@ enum Cmd {
     },
     /// Install OS prerequisites (Linux: uinput udev rule)
     Setup,
+    /// List the Pheme servers advertising on this network
+    Discover {
+        /// How many seconds to listen
+        #[arg(long, default_value_t = 3)]
+        timeout: u64,
+    },
 }
 
 fn init_logging(verbose: u8) {
@@ -92,5 +98,36 @@ async fn main() -> anyhow::Result<()> {
             pheme_app::client::pair(cfg, &host, &code).await
         }
         Cmd::Setup => pheme_app::setup::run(),
+        Cmd::Discover { timeout } => {
+            let found =
+                pheme_net::discovery::browse(std::time::Duration::from_secs(timeout)).await?;
+            if found.is_empty() {
+                println!("No Pheme servers found. If one is running, check that UDP port 5353 is not blocked.");
+                return Ok(());
+            }
+            println!("{:<24} {:<22} FINGERPRINT", "NAME", "ADDRESS");
+            for f in &found {
+                println!(
+                    "{:<24} {:<22} {}",
+                    f.name,
+                    f.addr.to_string(),
+                    f.fingerprint.as_deref().unwrap_or("-")
+                );
+            }
+            // Two servers with one name make `connect` ambiguous: whichever
+            // answers first wins, and that is not the user's choice.
+            for f in &found {
+                if found.iter().filter(|o| o.name == f.name).count() > 1 {
+                    println!(
+                        "\nWarning: more than one server is called {:?}. \
+                         `connect = {:?}` will reach whichever answers first; \
+                         give them different names, or use an address.",
+                        f.name, f.name
+                    );
+                    break;
+                }
+            }
+            Ok(())
+        }
     }
 }

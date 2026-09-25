@@ -712,6 +712,24 @@ pub async fn main(cfg: Config, pair: bool, stats: bool) -> anyhow::Result<()> {
     let endpoint = Endpoint::server(cfg.listen, &identity, trust.clone())?;
     info!(name = %cfg.name, listen = %cfg.listen, fingerprint = %identity.fingerprint, "pheme server");
 
+    // Held for the life of the server: dropping it unregisters the service.
+    let _advert = if cfg.discovery {
+        match pheme_net::discovery::advertise(&cfg.name, cfg.listen.port(), &identity.fingerprint) {
+            Ok(a) => {
+                info!(name = %cfg.name, "advertising on the local network");
+                Some(a)
+            }
+            Err(e) => {
+                // Not fatal. A client with an address in its config does not
+                // need discovery at all.
+                warn!("could not advertise on the local network: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     if pair {
         let code = generate_code();
         println!("Pairing code: {code}   (valid for 120 s, run `pheme pair <this-host> {code}` on the client)");

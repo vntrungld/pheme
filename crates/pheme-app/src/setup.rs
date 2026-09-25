@@ -20,6 +20,10 @@ pub fn run() -> anyhow::Result<()> {
         .or_else(|_| std::env::var("USER"))
         .unwrap_or_default();
     let is_root = unsafe { libc_geteuid() } == 0;
+    println!(
+        "Discovery uses mDNS on UDP port 5353. If `pheme discover` finds nothing, \
+         allow that port through the firewall, or put the server's address in `connect`."
+    );
     if !is_root {
         println!("Run the following as root (or re-run `sudo pheme setup`):");
         println!();
@@ -122,6 +126,10 @@ unsafe fn libc_geteuid() -> u32 {
 pub fn run() -> anyhow::Result<()> {
     println!("Nothing to set up for keyboard/mouse sharing on Windows.");
     println!("Audio forwarding (a later release) will need VB-CABLE: https://vb-audio.com/Cable/");
+    println!(
+        "Discovery uses mDNS on UDP port 5353. If `pheme discover` finds nothing, \
+         allow that port through the firewall, or put the server's address in `connect`."
+    );
     Ok(())
 }
 
