@@ -463,6 +463,12 @@ async fn session(
                     if let Some(c) = &clipboard {
                         c.send_to(sender.clone());
                     }
+                    // Unlike Leave, this does not switch the monitor. Bye
+                    // reaches the client on server shutdown or a
+                    // capture-backend failure, never on an ordinary
+                    // crossing -- and commanding the monitor toward a
+                    // machine that is going down would switch to an input
+                    // about to lose its signal.
                     for a in core.on_msg(&Msg::Bye { reason: reason.clone() }) { apply(inject, a); }
                     break Ok(());
                 }
@@ -484,8 +490,10 @@ async fn session(
                     // `&m`, not `m`: `Msg` is not `Copy` and the loop
                     // still passes it to `core.on_msg` below.
                     if let Msg::SwitchDisplay { input } = &m {
-                        // Review Focus 4: a no-op when this machine has no
-                        // monitor configured, which is the whole handling.
+                        // Forced through when this machine has a monitor
+                        // configured, and a no-op when it does not, so a
+                        // peer with monitor control can safely ask a peer
+                        // without one.
                         if let Some(d) = display {
                             d.force(*input);
                         }
