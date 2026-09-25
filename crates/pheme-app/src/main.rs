@@ -105,24 +105,61 @@ async fn main() -> anyhow::Result<()> {
                 println!("No Pheme servers found. If one is running, check that UDP port 5353 is not blocked.");
                 return Ok(());
             }
-            println!("{:<24} {:<22} FINGERPRINT", "NAME", "ADDRESS");
+            // A host with several network interfaces (Wi-Fi, Ethernet, a Docker
+            // bridge, ...) answers once per interface, so collapse rows by
+            // fingerprint: that is the host's real identity, not its name. An
+            // entry with no fingerprint cannot be matched to any other, so it
+            // stays its own row rather than silently merging into one that
+            // might be a different machine.
+            struct Host {
+                name: String,
+                fingerprint: Option<String>,
+                addrs: Vec<std::net::SocketAddr>,
+            }
+            let mut hosts: Vec<Host> = Vec::new();
             for f in &found {
+                if let Some(fp) = &f.fingerprint {
+                    if let Some(h) = hosts
+                        .iter_mut()
+                        .find(|h| h.fingerprint.as_deref() == Some(fp.as_str()))
+                    {
+                        h.addrs.push(f.addr);
+                        continue;
+                    }
+                }
+                hosts.push(Host {
+                    name: f.name.clone(),
+                    fingerprint: f.fingerprint.clone(),
+                    addrs: vec![f.addr],
+                });
+            }
+            println!("{:<24} {:<22} FINGERPRINT", "NAME", "ADDRESS");
+            for h in &hosts {
+                let addrs = h
+                    .addrs
+                    .iter()
+                    .map(|a| a.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 println!(
                     "{:<24} {:<22} {}",
-                    f.name,
-                    f.addr.to_string(),
-                    f.fingerprint.as_deref().unwrap_or("-")
+                    h.name,
+                    addrs,
+                    h.fingerprint.as_deref().unwrap_or("-")
                 );
             }
-            // Two servers with one name make `connect` ambiguous: whichever
-            // answers first wins, and that is not the user's choice.
-            for f in &found {
-                if found.iter().filter(|o| o.name == f.name).count() > 1 {
+            // Two distinct hosts with one name make `connect` ambiguous:
+            // whichever answers first wins, and that is not the user's
+            // choice. Rows are already collapsed by host, so two rows
+            // sharing a name are always two different machines (or one that
+            // could not be identified) -- never the same host counted twice.
+            for h in &hosts {
+                if hosts.iter().filter(|o| o.name == h.name).count() > 1 {
                     println!(
                         "\nWarning: more than one server is called {:?}. \
                          `connect = {:?}` will reach whichever answers first; \
                          give them different names, or use an address.",
-                        f.name, f.name
+                        h.name, h.name
                     );
                     break;
                 }
