@@ -150,7 +150,11 @@ pub async fn run_client(
         if *shutdown.borrow() {
             break;
         }
-        match target.resolve().await {
+        let resolved = tokio::select! {
+            r = target.resolve() => r,
+            _ = shutdown.changed() => break,
+        };
+        match resolved {
             Ok(server_addr) => {
                 let connect = tokio::select! {
                     r = endpoint.connect(server_addr) => r,

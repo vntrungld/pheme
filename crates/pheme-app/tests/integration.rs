@@ -418,6 +418,66 @@ async fn client_reconnects_after_server_restart() {
         .unwrap();
 }
 
+/// A shutdown that arrives while `target.resolve()` is in flight must be observed at
+/// once, not only once the resolution itself completes.
+///
+/// The target is an mDNS name nothing on the network advertises, so resolving it walks
+/// the mDNS lookup (bounded by `Target`'s multi-second timeout) and, on no answer, falls
+/// through to an unbounded system resolver call. Left unraced against `shutdown`, either
+/// one would hold `run_client` up well past the point the caller asked it to stop — the
+/// same shape this repository has already had to fix twice for the router thread. This
+/// asserts `run_client` returns in well under a second, which it can only do by racing
+/// the resolution itself against `shutdown.changed()`, exactly as the `connect` below it
+/// already does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_during_resolution_is_observed_promptly() {
+    let cdir = tempfile::tempdir().unwrap();
+    let cid = Identity::load_or_create(cdir.path(), "lap").unwrap();
+    let ctrust = TrustStore::load(cdir.path()).unwrap().shared();
+    let client_ep = Endpoint::client(&cid, ctrust).unwrap();
+    let (inject, _inj) = MockInject::new(screens(1000, 500));
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let client = tokio::spawn(run_client(
+        ClientDeps {
+            name: "lap".into(),
+            inject: Box::new(inject),
+            endpoint: client_ep,
+            target: Target::Mdns("nothing-on-this-network-advertises-this-name".into()),
+            stats: false,
+            audio: pheme_app::audio::CaptureSource::Disabled,
+            audio_counters: None,
+            mic: pheme_app::audio::PlaybackSource::Disabled,
+            mic_stats: None,
+            clipboard: None,
+        },
+        shutdown_rx,
+    ));
+
+    // Give the reconnect loop a moment to actually start resolving before shutdown
+    // arrives, so this exercises the race rather than the `shutdown.borrow()` check
+    // at the top of the loop.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let started = Instant::now();
+    shutdown_tx.send(true).unwrap();
+
+    tokio::time::timeout(Duration::from_millis(500), client)
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "run_client did not return within 500ms of shutdown; \
+                 the mDNS timeout alone is several seconds"
+            )
+        })
+        .unwrap()
+        .unwrap();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "shutdown took {elapsed:?} to be observed"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn server_releases_grab_when_client_vanishes_silently() {
     let sdir = tempfile::tempdir().unwrap();
