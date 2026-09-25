@@ -104,6 +104,23 @@ succeeds, `Enable` succeeds, and the session then sits forever without
 ever activating. This failure is completely silent unless
 `failed_barriers` is checked.
 
+A third rule, measured later than the two above and missed by the first
+implementation: **a barrier must span its zone's whole edge.** Measured
+by feeding `portal::geometry::barriers`' own output to KWin:
+
+```
+span (0.0, 1.0)   -> (2560,0)-(2560,1439)     accepted
+span (0.25, 0.75) -> (2560,360)-(2560,1079)   rejected
+span (0.0, 0.5)   -> (2560,0)-(2560,719)      rejected
+span (0.5, 1.0)   -> (2560,720)-(2560,1439)   rejected
+```
+
+A barrier one pixel short of the full edge, `(2560,0)-(2560,1438)`, is
+rejected too, so this is not an off-by-one in the endpoint convention —
+partial edges are simply not expressible. `ClientPlacement.span`
+therefore cannot be carried by the barrier. §5.3 says what carries it
+instead.
+
 ### 3.2 The activation position lies outside the zone
 
 `Activated` reports where the pointer *would* have gone had the barrier
@@ -184,6 +201,12 @@ pub struct CaptureEdge { pub side: Side, pub span: (f32, f32) }
 /// that detect crossings by observing the pointer ignore this. Default: no-op.
 fn set_edges(&mut self, edges: &[CaptureEdge]) -> Result<()> { let _ = edges; Ok(()) }
 ```
+
+A `CaptureEdge`'s `span` selects which *zones* take part — a span
+covering the left half of a two-monitor union puts a barrier on the left
+monitor only — but never narrows the barrier within a zone, which §3.1
+shows the compositor rejects. The span itself is applied exactly, by the
+core, when the activation arrives (§5.3).
 
 `pheme-app`'s server calls it whenever the set of connected clients
 changes, with one `CaptureEdge` per placement that currently has a
@@ -271,6 +294,14 @@ Activated { barrier_id, cursor_position, activation_id }
 it also **requires an answer**: `ServerCore::on_event` returns either the
 switch (`Grab`, `WarpCursor`, `Enter`) or, when the local path produced
 no `Grab`, an `Action::Ungrab { x, y }` that releases the capture.
+
+This is also where `ClientPlacement.span` is applied. Because a barrier
+covers its zone's whole edge (§3.1), an activation can arrive from a
+stretch of edge the configuration puts no client behind; the core finds
+no placement whose `EdgeSegment` contains it and declines, and the
+release below returns the pointer. The span stays exact — only the
+barrier is coarse — at the cost of one round trip's hesitation when the
+pointer crosses where no client is.
 
 Silence is not an available answer, and this is the correction to the
 first draft of this section, which assumed it was. Under X11 and Windows

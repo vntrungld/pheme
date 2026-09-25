@@ -9,6 +9,7 @@
 //!    extent along the edge stops at the last pixel, `x0 + W - 1`.
 //! 2. A barrier must lie on the outside boundary of the union of all zones **and**
 //!    be fully contained within a single zone.
+//! 3. A barrier must span its zone's **whole** edge. One pixel short is rejected.
 
 use std::num::NonZeroU32;
 
@@ -83,7 +84,11 @@ pub fn zone_bounds(zones: &[Zone]) -> Option<pheme_core::Rect> {
 /// let the compositor capture the pointer at a spot the core does not treat as an edge,
 /// so the crossing would go nowhere — the pointer would simply stop working there. Spans
 /// are resolved against this same bounding box for the same reason (`edge_segment`
-/// resolves them the same way), keeping the two consistent by construction. Widening
+/// resolves them the same way), keeping the two consistent by construction.
+///
+/// A span selects the zones that take part; it never narrows a barrier within one,
+/// because the compositor rejects a barrier that does not span its zone's whole edge.
+/// The core still applies the span exactly — see the comment on the widening below. Widening
 /// this to the true per-zone union needs `pheme_core`'s geometry widened first, since
 /// both `Rect::bounds` and `on_edge` would need it, and the X11 backend has the
 /// identical bounding-box limitation today.
@@ -124,11 +129,26 @@ pub fn barriers(zones: &[Zone], edges: &[CaptureEdge]) -> Vec<PortalBarrier> {
             } else {
                 (z.x, z.x1())
             };
-            let lo = want_lo.max(z_lo);
-            let hi = want_hi.min(z_hi);
-            if hi <= lo {
+            // The span decides *which* zones take part, not how much of one they cover.
+            if want_hi.min(z_hi) <= want_lo.max(z_lo) {
                 continue;
             }
+            // Rule 3: the barrier covers this zone's whole edge. Measured against
+            // KWin with this function's own output: span (0.0, 1.0) on a 2560x1440
+            // zone gives (2560,0)-(2560,1439) and is accepted, while (0.25, 0.75)
+            // gives (2560,360)-(2560,1079), (0.0, 0.5) gives (2560,0)-(2560,719) and
+            // (0.5, 1.0) gives (2560,720)-(2560,1439) -- every one of them rejected,
+            // as is a barrier one pixel short of the full edge. A narrowed barrier is
+            // therefore not a narrower crossing region, it is no crossing region at
+            // all, and `set_edges` turns the rejection into a startup error.
+            //
+            // Nothing is lost by widening it. An activation outside the configured
+            // span arrives as `CaptureEvent::CaptureActivated`, `ServerCore` finds no
+            // placement whose `EdgeSegment` contains it, and answers `Action::Ungrab`
+            // one pixel inside the edge -- the same path that already handles a
+            // crossing declined because the pointer is locked. The span stays exact;
+            // only the barrier is coarse.
+            let (lo, hi) = (z_lo, z_hi);
             let id = next_id;
             next_id = next_id
                 .checked_add(1)
@@ -244,17 +264,38 @@ mod tests {
     }
 
     #[test]
-    fn a_span_narrows_the_barrier_along_the_edge() {
+    fn a_span_never_narrows_the_barrier_within_a_zone() {
+        // Measured: (2560,360)-(2560,1079) -- the narrowed barrier this function used
+        // to produce for this very span -- is rejected by the compositor, as is every
+        // barrier short of the zone's full edge. The span is applied by the core when
+        // the activation arrives, not by the barrier.
+        for span in [(0.25, 0.75), (0.0, 0.5), (0.5, 1.0)] {
+            let e = CaptureEdge {
+                side: Side::Right,
+                span,
+            };
+            let b = barriers(&one_screen(), &[e]);
+            assert_eq!(b.len(), 1, "span {span:?}: {b:?}");
+            assert_eq!(
+                (b[0].x1, b[0].y1, b[0].x2, b[0].y2),
+                (2560, 0, 2560, 1439),
+                "span {span:?} must still cover the whole edge"
+            );
+        }
+    }
+
+    #[test]
+    fn a_span_still_chooses_which_zones_take_part() {
+        // Zone granularity is the one narrowing the compositor does accept: the left
+        // half of this union is the left monitor, so only it gets a barrier -- and
+        // that barrier covers the whole of its own edge.
         let e = CaptureEdge {
-            side: Side::Right,
-            span: (0.25, 0.75),
+            side: Side::Top,
+            span: (0.0, 0.5),
         };
-        let b = barriers(&one_screen(), &[e]);
-        assert_eq!(b.len(), 1);
-        assert_eq!(
-            (b[0].x1, b[0].y1, b[0].x2, b[0].y2),
-            (2560, 360, 2560, 1079)
-        );
+        let b = barriers(&two_screens(), &[e]);
+        assert_eq!(b.len(), 1, "{b:?}");
+        assert_eq!((b[0].x1, b[0].y1, b[0].x2, b[0].y2), (0, 0, 1919, 0));
     }
 
     #[test]
