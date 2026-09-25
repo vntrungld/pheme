@@ -160,8 +160,8 @@ mod tests {
         assert_eq!(identity_from_edid(&e), None);
     }
 
-    /// Break it by indexing `edid[54..]` without a length check: this
-    /// panics instead of returning None.
+    /// Break it by removing the `edid.get(..128)?` guard: the header
+    /// comparison against `block[..8]` then panics on a two-byte input.
     #[test]
     fn a_short_block_is_refused() {
         assert_eq!(identity_from_edid(&[0x00, 0xFF]), None);

@@ -63,12 +63,16 @@ fn find_ignore_case(haystack: &str, needle: &str) -> Option<usize> {
 mod tests {
     use super::*;
 
-    /// Break it by scanning for "60(" anywhere rather than inside `vcp(`:
-    /// the "60" inside "prot(monitor)" style text, or a model number, would
-    /// be read as an input list.
+    /// Break it by dropping the `section` call and scanning the whole
+    /// string for "60(": `model(A60(1))` then yields `[0x01]`.
+    ///
+    /// That token is the whole point of this input and it has to carry a
+    /// real "60(". A model number like `model(X60)` would not: it contains
+    /// "60" but not "60(", so a naive scan would skip past it, land on the
+    /// genuine list and return the right answer for the wrong reason.
     #[test]
     fn the_input_list_comes_from_the_vcp_section() {
-        let caps = "(prot(monitor)type(LCD)model(X60)cmds(01 02 03)\
+        let caps = "(prot(monitor)type(LCD)model(A60(1))cmds(01 02 03)\
                     vcp(02 10 12 14(05 08) 60(0F 11 12) AC)mccs_ver(2.1))";
         assert_eq!(input_values_from_caps(caps), vec![0x0F, 0x11, 0x12]);
     }
