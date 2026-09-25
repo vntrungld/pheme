@@ -292,3 +292,154 @@ async fn a_full_audio_channel_counts_the_frames_it_drops() {
     );
     peer.close("done");
 }
+
+#[tokio::test]
+async fn a_clipboard_message_crosses_on_its_own_stream() {
+    let s = side("server");
+    let c = side("client");
+    trust_each_other(&s, &c);
+    let server = Endpoint::server("127.0.0.1:0".parse().unwrap(), &s.id, s.trust.clone()).unwrap();
+    let addr: SocketAddr = server.local_addr().unwrap();
+    let client = Endpoint::client(&c.id, c.trust.clone()).unwrap();
+
+    let server_task = tokio::spawn(async move {
+        let Incoming::Peer(mut peer) = server.accept().await.unwrap() else {
+            panic!("expected peer")
+        };
+        let mut rx = peer.take_incoming();
+        let mut clip = peer.take_clipboard();
+        assert_eq!(rx.recv().await.unwrap(), hello("client"));
+        let m = clip.recv().await.unwrap();
+        assert_eq!(
+            m,
+            Msg::Clipboard {
+                mime: pheme_proto::CLIP_MIME.to_string(),
+                data: b"hello from the client".to_vec(),
+            }
+        );
+        // The control stream still works afterwards.
+        peer.sender().send_control(&Msg::Pong(9)).await.unwrap();
+        // Returned, not dropped here: `Peer`'s `Drop` closes the connection, and
+        // quinn's own docs warn that a close can discard data already accepted
+        // for send but not yet delivered to the peer's application. Keeping
+        // `peer` alive until the caller has confirmed the `Pong` arrived avoids
+        // racing the reply against the connection teardown.
+        peer
+    });
+
+    let mut peer = client.connect(addr).await.unwrap();
+    let mut rx = peer.take_incoming();
+    peer.sender().send_control(&hello("client")).await.unwrap();
+    peer.sender()
+        .send_clipboard(&Msg::Clipboard {
+            mime: pheme_proto::CLIP_MIME.to_string(),
+            data: b"hello from the client".to_vec(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(rx.recv().await.unwrap(), Msg::Pong(9));
+    server_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn an_oversized_clipboard_stream_is_dropped_and_the_connection_lives() {
+    let s = side("server");
+    let c = side("client");
+    trust_each_other(&s, &c);
+    let server = Endpoint::server("127.0.0.1:0".parse().unwrap(), &s.id, s.trust.clone()).unwrap();
+    let addr: SocketAddr = server.local_addr().unwrap();
+    let client = Endpoint::client(&c.id, c.trust.clone()).unwrap();
+
+    let server_task = tokio::spawn(async move {
+        let Incoming::Peer(mut peer) = server.accept().await.unwrap() else {
+            panic!("expected peer")
+        };
+        let mut rx = peer.take_incoming();
+        let mut clip = peer.take_clipboard();
+        assert_eq!(rx.recv().await.unwrap(), hello("client"));
+        // The oversized stream produces nothing, and the small one that follows
+        // still arrives: the reader rejects one stream, not the connection.
+        let m = clip.recv().await.unwrap();
+        assert_eq!(
+            m,
+            Msg::Clipboard {
+                mime: pheme_proto::CLIP_MIME.to_string(),
+                data: b"small".to_vec(),
+            }
+        );
+        peer.sender().send_control(&Msg::Pong(9)).await.unwrap();
+        // Returned, not dropped here: `Peer`'s `Drop` closes the connection, and
+        // quinn's own docs warn that a close can discard data already accepted
+        // for send but not yet delivered to the peer's application. Keeping
+        // `peer` alive until the caller has confirmed the `Pong` arrived avoids
+        // racing the reply against the connection teardown.
+        peer
+    });
+
+    let mut peer = client.connect(addr).await.unwrap();
+    let mut rx = peer.take_incoming();
+    peer.sender().send_control(&hello("client")).await.unwrap();
+    // The receiver rejects this stream and may signal STOP_SENDING, which can make
+    // this write fail on the sender's own side — that is correct behaviour, not a
+    // test failure, so the result is not unwrapped.
+    let _ = peer
+        .sender()
+        .send_clipboard(&Msg::Clipboard {
+            mime: pheme_proto::CLIP_MIME.to_string(),
+            data: vec![b'x'; pheme_proto::MAX_CLIP_BYTES + pheme_proto::CLIP_FRAME_SLACK + 1],
+        })
+        .await;
+    peer.sender()
+        .send_clipboard(&Msg::Clipboard {
+            mime: pheme_proto::CLIP_MIME.to_string(),
+            data: b"small".to_vec(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(rx.recv().await.unwrap(), Msg::Pong(9));
+    server_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_unidirectional_stream_carrying_something_else_is_ignored() {
+    let s = side("server");
+    let c = side("client");
+    trust_each_other(&s, &c);
+    let server = Endpoint::server("127.0.0.1:0".parse().unwrap(), &s.id, s.trust.clone()).unwrap();
+    let addr: SocketAddr = server.local_addr().unwrap();
+    let client = Endpoint::client(&c.id, c.trust.clone()).unwrap();
+
+    let server_task = tokio::spawn(async move {
+        let Incoming::Peer(mut peer) = server.accept().await.unwrap() else {
+            panic!("expected peer")
+        };
+        let mut rx = peer.take_incoming();
+        let mut clip = peer.take_clipboard();
+        assert_eq!(rx.recv().await.unwrap(), hello("client"));
+        // A `Ping` on a clipboard stream must not reach the clipboard channel,
+        // and must not be mistaken for input either.
+        let m = clip.recv().await.unwrap();
+        assert!(matches!(m, Msg::Clipboard { .. }), "got {m:?}");
+        peer.sender().send_control(&Msg::Pong(9)).await.unwrap();
+        // Returned, not dropped here: `Peer`'s `Drop` closes the connection, and
+        // quinn's own docs warn that a close can discard data already accepted
+        // for send but not yet delivered to the peer's application. Keeping
+        // `peer` alive until the caller has confirmed the `Pong` arrived avoids
+        // racing the reply against the connection teardown.
+        peer
+    });
+
+    let mut peer = client.connect(addr).await.unwrap();
+    let mut rx = peer.take_incoming();
+    peer.sender().send_control(&hello("client")).await.unwrap();
+    peer.sender().send_clipboard(&Msg::Ping(1)).await.unwrap();
+    peer.sender()
+        .send_clipboard(&Msg::Clipboard {
+            mime: pheme_proto::CLIP_MIME.to_string(),
+            data: b"after the ping".to_vec(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(rx.recv().await.unwrap(), Msg::Pong(9));
+    server_task.await.unwrap();
+}

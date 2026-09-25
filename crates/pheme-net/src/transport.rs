@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use pheme_proto::{decode, encode, Msg};
+use pheme_proto::{decode, encode, Msg, CLIP_FRAME_SLACK, MAX_CLIP_BYTES};
 use quinn::crypto::rustls::{HandshakeData, QuicClientConfig, QuicServerConfig};
 use quinn::{Connection, RecvStream, SendStream};
 use rustls_pki_types::CertificateDer;
@@ -25,6 +25,11 @@ const CONTROL_BUFFER: usize = 256;
 /// dropping a frame is a loss the jitter buffer conceals, whereas a full *shared* channel
 /// used to mean a mouse event waiting behind 1.28 s of audio.
 const AUDIO_BUFFER: usize = 32;
+/// Clipboard messages queued for the application. Shallow on purpose: the
+/// clipboard is exchanged when the pointer crosses, so more than a couple in
+/// flight means something is wrong, and dropping the oldest is correct — only
+/// the newest clipboard matters.
+const CLIP_BUFFER: usize = 4;
 /// How long `accept()` waits for a connected, trusted peer to open its control stream before
 /// giving up on it and moving on to the next connection.
 const CONTROL_STREAM_TIMEOUT: Duration = Duration::from_secs(5);
@@ -386,6 +391,32 @@ impl PeerSender {
             debug!("datagram dropped: {e}");
         }
     }
+
+    /// Sends one clipboard message on a unidirectional stream of its own.
+    ///
+    /// Never the control stream. A one-megabyte payload written there would hold
+    /// every `Key` and `Button` behind it until the transfer finished, because
+    /// QUIC delivers one stream in order — head-of-line blocking on the path
+    /// this project optimises before all others.
+    ///
+    /// The stream boundary is the message boundary, so nothing is
+    /// length-prefixed: a stream that carries exactly one message needs no
+    /// framing of its own.
+    ///
+    /// `async` rather than self-spawning because its caller is the clipboard
+    /// worker, an ordinary OS thread with no reactor; that caller spawns this
+    /// onto the runtime, so nothing on the input path ever waits for it.
+    pub async fn send_clipboard(&self, m: &Msg) -> Result<()> {
+        let mut send = self.conn.open_uni().await.map_err(conn_err)?;
+        let mut buf = Vec::with_capacity(256);
+        encode(m, &mut buf);
+        send.write_all(&buf)
+            .await
+            .map_err(|e| NetError::Connection(e.to_string()))?;
+        send.finish()
+            .map_err(|e| NetError::Connection(e.to_string()))?;
+        Ok(())
+    }
 }
 
 /// A connected, authenticated peer. Dropping a `Peer` closes its underlying QUIC connection
@@ -400,6 +431,7 @@ pub struct Peer {
     sender: PeerSender,
     incoming: Option<mpsc::Receiver<Msg>>,
     audio: Option<mpsc::Receiver<Msg>>,
+    clipboard: Option<mpsc::Receiver<Msg>>,
     audio_dropped: Arc<AtomicU64>,
 }
 
@@ -468,6 +500,45 @@ impl Peer {
                 }
             }
         });
+        let (clip_tx, clip_rx) = mpsc::channel(CLIP_BUFFER);
+        let clip_conn = conn.clone();
+        tokio::spawn(async move {
+            loop {
+                let mut recv = match clip_conn.accept_uni().await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        debug!("unidirectional stream reader ended: {e}");
+                        break;
+                    }
+                };
+                let tx = clip_tx.clone();
+                // Each stream is read in its own task so one oversized or slow
+                // sender cannot hold up the stream behind it.
+                tokio::spawn(async move {
+                    let limit = MAX_CLIP_BYTES + CLIP_FRAME_SLACK;
+                    let bytes = match recv.read_to_end(limit).await {
+                        Ok(b) => b,
+                        Err(e) => {
+                            debug!("clipboard stream refused: {e}");
+                            return;
+                        }
+                    };
+                    match decode(&bytes) {
+                        Ok(m @ Msg::Clipboard { .. }) => {
+                            // Dropping the oldest is right here: only the newest
+                            // clipboard is worth having.
+                            if tx.try_send(m).is_err() {
+                                debug!("clipboard channel full; dropping a message");
+                            }
+                        }
+                        Ok(other) => {
+                            debug!("a unidirectional stream carried {other:?}, not a clipboard")
+                        }
+                        Err(e) => debug!("undecodable clipboard message: {e}"),
+                    }
+                });
+            }
+        });
         let sender = PeerSender {
             conn: conn.clone(),
             send: Arc::new(Mutex::new(send)),
@@ -479,6 +550,7 @@ impl Peer {
             sender,
             incoming: Some(rx),
             audio: Some(audio_rx),
+            clipboard: Some(clip_rx),
             audio_dropped,
         }
     }
@@ -512,6 +584,14 @@ impl Peer {
     /// but not a deadline. Input must never wait behind audio.
     pub fn take_audio(&mut self) -> mpsc::Receiver<Msg> {
         self.audio.take().expect("audio receiver already taken")
+    }
+
+    /// Takes the receiver carrying `Msg::Clipboard` and nothing else. Panics if
+    /// called twice.
+    pub fn take_clipboard(&mut self) -> mpsc::Receiver<Msg> {
+        self.clipboard
+            .take()
+            .expect("clipboard receiver already taken")
     }
 
     /// Audio frames dropped because this peer's audio channel was full, cumulative for
