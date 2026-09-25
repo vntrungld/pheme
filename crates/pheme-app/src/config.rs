@@ -258,6 +258,35 @@ impl Config {
         let host = override_host.or(self.connect.as_deref()).unwrap_or("");
         Target::parse(host)
     }
+
+    /// Writes this configuration to `path`.
+    ///
+    /// Atomically: a temporary file in the same directory, then a rename. The
+    /// rename is what makes it safe — writing in place means a crash or a full
+    /// disk between truncating and finishing leaves a file that no longer
+    /// parses, and the next start has no configuration at all. That is the one
+    /// failure this path cannot afford, because its whole purpose is to keep
+    /// the user out of a text editor.
+    ///
+    /// Comments in a hand-written file do not survive. The window warns before
+    /// its first write; there is nothing to do about it here, since a TOML
+    /// serializer has no comments to preserve.
+    pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        let text = toml::to_string_pretty(self).context("serializing the configuration")?;
+        let dir = path.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(&tmp, text).with_context(|| format!("writing {}", tmp.display()))?;
+        match std::fs::rename(&tmp, path) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // Leave nothing behind on the way out: a stray .tmp beside a
+                // config file invites someone to wonder which one is real.
+                let _ = std::fs::remove_file(&tmp);
+                Err(anyhow::Error::from(e).context(format!("replacing {}", path.display())))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -459,5 +488,65 @@ side = "top"
         assert!(c.discovery);
         let c: Config = toml::from_str("role = \"server\"\ndiscovery = false").unwrap();
         assert!(!c.discovery);
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn a_saved_config_loads_back_equal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut c = Config::default();
+        c.name = "desk-linux".into();
+        c.connect = Some("laptop-win".into());
+        c.clients.push(ClientCfg {
+            name: "laptop-win".into(),
+            side: SideCfg::Right,
+            span: Some([0.25, 0.75]),
+        });
+        c.save(&path).unwrap();
+        assert_eq!(Config::load(Some(&path)).unwrap(), c);
+    }
+
+    #[test]
+    fn saving_creates_a_missing_directory() {
+        // The first run has no config directory at all, and that is the one
+        // run this path exists for.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("deeper").join("config.toml");
+        Config::default().save(&path).unwrap();
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn saving_leaves_no_temporary_file_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        Config::default().save(&path).unwrap();
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left.len(), 1, "stray files: {left:?}");
+    }
+
+    #[test]
+    fn a_failed_save_leaves_no_temporary_file_behind() {
+        // The rename is what makes the write atomic, and when it fails the
+        // temporary file must go with it — a stray .tmp beside a real config
+        // invites someone to wonder which one is live. Simulated by making the
+        // destination a directory, so the write succeeds and the rename fails.
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("config.toml");
+        std::fs::create_dir(&blocked).unwrap();
+        assert!(Config::default().save(&blocked).is_err());
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            left.len(),
+            1,
+            "a temporary file survived a failed save: {left:?}"
+        );
     }
 }
