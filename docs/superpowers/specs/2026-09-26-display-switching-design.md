@@ -642,7 +642,7 @@ cabled to both machines.
 - `cargo fmt`, `cargo clippy --workspace --all-targets -- -D warnings` and
   `cargo test --workspace` clean on both CI legs; `Cargo.lock` committed
   with the manifest change.
-- `README.md` documents `[display]`; `docs/testing.md` carries E1–E9;
+- `README.md` documents `[display]`; `docs/testing.md` carries E1–E10;
   architecture §9 lists this sub-project and renumbers packaging to 8.
 
 ## 15. Known risks
