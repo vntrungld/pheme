@@ -113,6 +113,17 @@ impl Supervisor {
         self.stop_current().await;
     }
 
+    /// Stops the child if one is running and starts it again from the
+    /// configuration already held. Unlike [`apply_config`][Self::apply_config],
+    /// this never touches disk: starting a child back up is not a
+    /// configuration change, and `restart` takes no `path` at all because
+    /// there is nothing for it to write. `NoConfig` if nothing has ever been
+    /// configured, same as a fresh [`Supervisor::start`].
+    pub async fn restart(&mut self) -> anyhow::Result<()> {
+        self.stop_current().await;
+        self.spawn_current().await
+    }
+
     /// The child's process id while one is running.
     pub fn child_pid(&self) -> Option<u32> {
         self.current.as_ref().map(|gen| gen.pid)

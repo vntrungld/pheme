@@ -43,7 +43,7 @@ pub fn run() -> anyhow::Result<()> {
 
     let exe = std::env::current_exe().context("locating the running executable")?;
     let supervisor = rt
-        .block_on(Supervisor::start(exe, cfg.clone()))
+        .block_on(Supervisor::start(exe, cfg))
         .context("starting the supervised core")?;
 
     // `Tray`'s own Linux backend is GTK-based and panics unless something
@@ -59,9 +59,11 @@ pub fn run() -> anyhow::Result<()> {
         supervisor,
         tray,
         has_tray,
-        cfg,
+        hiding_works: hiding_works(),
         view: StatusView::default(),
         quitting: false,
+        close_ineffective: false,
+        action_error: None,
     };
 
     let viewport = egui::ViewportBuilder::default()
@@ -128,6 +130,20 @@ fn pump_gtk() {
     target_os = "openbsd"
 )))]
 fn pump_gtk() {}
+
+/// Whether hiding the window (`ViewportCommand::Visible(false)`) can
+/// actually take effect on this session, decided once at startup.
+///
+/// winit's Wayland backend never reads back the visibility it is asked
+/// for -- `set_visible` is a documented no-op there ("Not possible on
+/// Wayland"), and nothing else in its Linux tree reads it either except
+/// the X11 backend, which does. A Wayland session is therefore the one
+/// case this crate can name concretely; anywhere else (X11, Windows,
+/// macOS) hiding is assumed to work, matching what winit actually
+/// implements for those backends today.
+fn hiding_works() -> bool {
+    !pheme_input::is_wayland_session()
+}
 
 /// The pure reduction of [`CoreState`] into what the status panel draws.
 ///
@@ -196,10 +212,10 @@ struct PhemeApp {
     /// Cached from `tray.is_some()` at startup: `Tray` does not outlive
     /// `run`'s own construction of it, but this needs checking every frame.
     has_tray: bool,
-    /// The configuration last started or applied, kept so the tray's
-    /// Start/Stop item can restart the same role without a config panel's
-    /// help. `None` until one exists on disk.
-    cfg: Option<Config>,
+    /// Decided once at startup by [`hiding_works`]: whether
+    /// `ViewportCommand::Visible(false)` can actually hide the window on
+    /// this session.
+    hiding_works: bool,
     view: StatusView,
     /// Set once something has decided the application should actually
     /// exit -- the tray's Quit item, or the window's own close button when
@@ -207,6 +223,13 @@ struct PhemeApp {
     /// close-request handling below from re-cancelling a close it asked
     /// for itself.
     quitting: bool,
+    /// Set the moment a close request was cancelled but could not actually
+    /// hide the window (`!hiding_works`): the panel says so, so a click
+    /// that visibly did nothing is not mistaken for a hung application.
+    close_ineffective: bool,
+    /// The reason the tray's Start/Stop item last failed to do what it
+    /// asked, if it did. Cleared at the start of every new attempt.
+    action_error: Option<String>,
 }
 
 impl eframe::App for PhemeApp {
@@ -236,20 +259,29 @@ impl eframe::App for PhemeApp {
                             self.handle.block_on(self.supervisor.send(cmd));
                         }
                     }
-                    TrayEvent::StartStop => match self.supervisor.state() {
-                        CoreState::Running(_) => {
-                            self.handle.block_on(self.supervisor.shutdown());
-                        }
-                        CoreState::Stopped(_) => {
-                            if let Some(cfg) = self.cfg.clone() {
-                                let path = Config::default_path();
-                                let _ = self
-                                    .handle
-                                    .block_on(self.supervisor.apply_config(cfg, &path));
+                    TrayEvent::StartStop => {
+                        self.action_error = None;
+                        match self.supervisor.state() {
+                            CoreState::Running(_) => {
+                                self.handle.block_on(self.supervisor.shutdown());
+                            }
+                            // `restart` respawns from whatever `Supervisor` is
+                            // already holding; starting a child back up is not
+                            // a configuration change, so this never touches
+                            // disk the way `apply_config` does. A `NoConfig`
+                            // restart is a harmless no-op, so there is
+                            // nothing to report there either.
+                            CoreState::Stopped(_) | CoreState::NoConfig => {
+                                if let Err(e) = self.handle.block_on(self.supervisor.restart()) {
+                                    // Surfaced the same way a link failure is:
+                                    // a silently discarded error here would
+                                    // leave a Start click with no visible
+                                    // effect and no reason anywhere.
+                                    self.action_error = Some(format!("could not start: {e:#}"));
+                                }
                             }
                         }
-                        CoreState::NoConfig => {}
-                    },
+                    }
                 }
             }
         }
@@ -262,7 +294,15 @@ impl eframe::App for PhemeApp {
         if ctx.input(|i| i.viewport().close_requested()) && !self.quitting {
             if self.has_tray {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                if self.hiding_works {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                } else {
+                    // The close is still cancelled -- the core keeps
+                    // running either way -- but nothing here can make the
+                    // window disappear, and a click that visibly does
+                    // nothing reads as a hung application. Say so instead.
+                    self.close_ineffective = true;
+                }
             } else {
                 self.quitting = true;
             }
@@ -275,11 +315,40 @@ impl eframe::App for PhemeApp {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
+            if let Some(err) = &self.action_error {
+                ui.colored_label(egui::Color32::RED, err);
+                ui.separator();
+            }
+            if self.close_ineffective {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    "Pheme is still running. Use Quit in the tray to exit.",
+                );
+                ui.separator();
+            }
             draw_status(ui, &self.view);
         });
 
         // The core pushes a `Status` at most once a second; this just needs
         // to keep noticing it without spinning the CPU polling faster.
+        //
+        // Called unconditionally, whether or not the window is currently
+        // visible: this is also what keeps `update` -- and so `pump_gtk`,
+        // above -- being called at all while the window is hidden on a
+        // platform where hiding actually works (X11). Without it, a hidden
+        // window would stop pumping GTK, the tray menu would go dead, and
+        // the tray -- the only way back to a hidden window -- would be
+        // unresponsive. `eframe`'s repaint scheduling is a per-window
+        // timer independent of visibility (`WindowId` -> next repaint
+        // `Instant`, driven by `ControlFlow::WaitUntil`), and winit's own
+        // X11 `request_redraw` is an unconditional channel send with no
+        // visibility check (`platform_impl/linux/x11/window.rs`) -- so this
+        // timer keeps firing, and `update` keeps being called, regardless
+        // of whether the window is mapped. Deliberately not moved onto a
+        // separate thread: GTK's main context has thread affinity to
+        // wherever `gtk::init()` ran, and `Tray`'s widgets are also touched
+        // from this same thread below, so pumping it from anywhere else
+        // would violate GTK's single-thread rule instead of fixing this.
         ctx.request_repaint_after(Duration::from_millis(200));
     }
 

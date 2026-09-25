@@ -279,6 +279,45 @@ async fn applying_a_configuration_restarts_the_child() {
 }
 
 #[tokio::test]
+async fn restart_respawns_from_the_held_config_without_a_path() {
+    // Starting a child back up is not a configuration change: `restart`
+    // takes no `path` at all, so there is structurally nothing it could
+    // write to, unlike `apply_config`.
+    let mut s = Supervisor::start(stub_exe(), Some(server_config()))
+        .await
+        .unwrap();
+    wait_until(
+        || matches!(s.state(), CoreState::Running(_)),
+        Duration::from_secs(5),
+    )
+    .await;
+    let first_pid = s.child_pid().expect("a running child");
+    s.shutdown().await;
+    assert!(
+        !process_exists(first_pid),
+        "shutdown left the first child behind"
+    );
+
+    s.restart().await.unwrap();
+    assert!(
+        wait_until(
+            || matches!(s.state(), CoreState::Running(_)),
+            Duration::from_secs(5)
+        )
+        .await,
+        "the child did not come back after restart"
+    );
+}
+
+#[tokio::test]
+async fn restarting_with_no_configuration_is_a_harmless_no_op() {
+    let mut s = Supervisor::start(stub_exe(), None).await.unwrap();
+    assert!(matches!(s.state(), CoreState::NoConfig));
+    s.restart().await.unwrap();
+    assert!(matches!(s.state(), CoreState::NoConfig));
+}
+
+#[tokio::test]
 async fn shutdown_leaves_no_child_behind() {
     let mut s = Supervisor::start(stub_exe(), Some(server_config()))
         .await
