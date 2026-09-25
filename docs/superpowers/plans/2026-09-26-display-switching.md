@@ -506,9 +506,9 @@ implementation, would leave the monitor stuck showing the machine the
 pointer just left whenever someone brushes the edge and comes back.
 
 confirm/forget exist because sub-project 5 shipped the same defect in
-ClipSync: it recorded text before the write carrying it succeeded, so one
-failure refused every later retry. Here the policy records a selected
-input only after the command succeeds.
+ClipSync: it recorded text before the write carrying it succeeded, so
+one failure refused every later retry. Here the policy records a
+selected input only after the command succeeds.
 
 ddc-i2c is declared with default-features = false so its
 with-linux-enumerate feature, and the libudev-sys dependency behind it,
@@ -1422,21 +1422,22 @@ and pulls udev and libudev-sys. Reading the directory costs nothing.
 A bus is kept only when something on it answers a read of VCP 0x60. That
 is the membership test rather than a check on connector type because a
 laptop's internal eDP panel enumerates as a bus and returns a valid EDID
-while having no input to select; failing the read keeps it out on its own.
+while having no input to select; failing the read keeps it out on its
+own.
 
 Buses are ordered by the number in their name, not by read_dir order and
 not lexically, so "the first monitor" is the same one on every run and
 i2c-10 does not sort before i2c-2.
 
-The Monitor trait is not Send: ddc_winapi::Monitor holds a raw HANDLE with
-no unsafe impl Send, so the bound would have failed to compile on Windows
-alone. It is not needed -- the handle is created on the service thread and
-never leaves it.
+The Monitor trait is not Send: ddc_winapi::Monitor holds a raw HANDLE
+with no unsafe impl Send, so the bound would have failed to compile on
+Windows alone. It is not needed -- the handle is created on the service
+thread and never leaves it.
 
 pick() carries the choice open() makes so that selection is testable
 without hardware; MockMonitor counts attempted sets separately from the
-input last set successfully, so a refused command and a failed one cannot
-be confused by a test.
+input last set successfully, so a refused command and a failed one
+cannot be confused by a test.
 
 Co-Authored-By: Claude <noreply@anthropic.com>
 EOF
@@ -1604,10 +1605,10 @@ git add crates/pheme-app/src/config.rs
 git commit -F - <<'EOF'
 Update: add the display section to the configuration
 
-Each machine declares the VCP 0x60 value of the input it is itself cabled
-to, which is a question a person can answer from their monitor's on-screen
-menu, and which stays one number per machine when a server has several
-clients configured. The peer's value travels in the handshake.
+Each machine declares the VCP 0x60 value of the input it is itself
+cabled to, which is a question a person can answer from their monitor's
+on-screen menu, and which stays one number per machine when a server has
+several clients configured. The peer's value travels in the handshake.
 
 The section is absent by default and absent means off. There is no
 sensible default for a number that names a physical cable, and guessing
@@ -1777,10 +1778,11 @@ appended for the recovery hotkey. Nothing reads either yet; this keeps
 the wire change on its own commit so a bisect separates "the protocol
 changed" from "the server started using it".
 
-Each end declares the input it is itself cabled to rather than the one it
-wants the peer to select. DDC/CI is answered only by the input currently
-displayed, so the machine handing the pointer over is the one that must
-issue the command, and it needs the other machine's value to do it.
+Each end declares the input it is itself cabled to rather than the one
+it wants the peer to select. DDC/CI is answered only by the input
+currently displayed, so the machine handing the pointer over is the one
+that must issue the command, and it needs the other machine's value to
+do it.
 
 PROTOCOL_VERSION goes to 3. postcard is not self-describing, so an added
 field is a wire change; both ends already compare versions for equality
@@ -2672,9 +2674,9 @@ git commit -F - <<'EOF'
 Update: switch the monitor when the server hands the pointer over
 
 The hook sits beside the clipboard's, in the Msg::Enter branch, because
-both cross for the same reason and at the same moment. That moment is the
-only one at which the server's command can reach the monitor: DDC/CI is
-answered by the displayed input alone, and the server is still it.
+both cross for the same reason and at the same moment. That moment is
+the only one at which the server's command can reach the monitor: DDC/CI
+is answered by the displayed input alone, and the server is still it.
 
 The client's declared input rides on Link rather than in a new Mutex on
 Shared. run_actions already clones the link at its top, so reading it
@@ -2980,13 +2982,13 @@ and re-running the command reads the number straight off the hardware.
 
 Finding nothing is not an error. It is the common case, it exits zero,
 and the message names the three things that actually cause it: an i2c
-device nobody can read, a DDC/CI switch turned off in the monitor's menu,
-and a dock or adapter that does not carry the i2c lines.
+device nobody can read, a DDC/CI switch turned off in the monitor's
+menu, and a dock or adapter that does not carry the i2c lines.
 
 setup appends i2c-dev beside uinput and adds a udev rule for the i2c
-buses, tagged uaccess so the logged-in user needs no group membership. It
-prints the usermod fallback rather than running it: group membership is a
-lasting change to an account, for a feature the person may not use.
+buses, tagged uaccess so the logged-in user needs no group membership.
+It prints the usermod fallback rather than running it: group membership
+is a lasting change to an account, for a feature the person may not use.
 
 Co-Authored-By: Claude <noreply@anthropic.com>
 EOF
@@ -3154,12 +3156,12 @@ Update: put Switch display in the window and the tray
 Both callers go through one method, the way Start/Stop and Lock already
 do after sub-project 6's final review found them duplicated. The button
 lives in the window as well as the tray because GNOME without the
-AppIndicator extension -- the README's own stated default there -- has no
-tray at all.
+AppIndicator extension -- the README's own stated default there -- has
+no tray at all.
 
 The button is the convenience and the hotkey is the one that matters:
-when the monitor is showing the wrong machine, the person cannot see this
-window, which is the entire case the feature exists for.
+when the monitor is showing the wrong machine, the person cannot see
+this window, which is the entire case the feature exists for.
 
 Command::SwitchDisplay is appended after Stop so no existing variant's
 postcard index moves, and a test pins those indices: a front-end and a
@@ -3292,9 +3294,9 @@ the one rule a person can get wrong from the instructions alone: each
 machine names its own cable, so the two values must differ.
 
 E1 to E10 are the only tests that touch real hardware. Everything
-automated runs against a mock, and the development machine's monitor does
-not answer DDC/CI at all, so these rows carry the whole of the evidence
-that the feature works.
+automated runs against a mock, and the development machine's monitor
+does not answer DDC/CI at all, so these rows carry the whole of the
+evidence that the feature works.
 
 Co-Authored-By: Claude <noreply@anthropic.com>
 EOF
