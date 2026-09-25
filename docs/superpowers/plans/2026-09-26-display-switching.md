@@ -243,16 +243,29 @@ mod tests {
         assert_eq!(s.deadline(), None);
     }
 
-    /// Review Focus 3. Break it by writing `t + self.cooldown` in
-    /// `deadline`: this panics with "overflow when adding duration".
+    /// Review Focus 3. `cooldown_ms` is a `u64` a person can set to
+    /// anything, and `Instant + Duration` panics on overflow. Break it by
+    /// writing `t + self.cooldown` in `deadline`.
+    ///
+    /// Two magnitudes, because they take different branches. The largest
+    /// value the config can actually produce -- `from_millis(u64::MAX)`,
+    /// about 584 million years -- is still well inside `Instant`'s range on
+    /// both Linux and Windows, so the deadline is real and simply never
+    /// arrives. `Duration::MAX` is outside it, and that is the branch
+    /// `checked_add` exists for.
     #[test]
     fn an_enormous_cooldown_does_not_panic() {
-        let t0 = Instant::now();
-        let mut s = DisplaySwitch::new(Duration::from_millis(u64::MAX));
-        assert_eq!(s.request(0x11, t0), Some(0x11));
-        s.confirm(0x11);
-        assert_eq!(s.request(0x0f, at(t0, 1)), None);
-        assert_eq!(s.deadline(), None);
+        for (cooldown, deadline_exists) in [
+            (Duration::from_millis(u64::MAX), true),
+            (Duration::MAX, false),
+        ] {
+            let t0 = Instant::now();
+            let mut s = DisplaySwitch::new(cooldown);
+            assert_eq!(s.request(0x11, t0), Some(0x11));
+            s.confirm(0x11);
+            assert_eq!(s.request(0x0f, at(t0, 1)), None);
+            assert_eq!(s.deadline().is_some(), deadline_exists, "{cooldown:?}");
+        }
     }
 }
 ```
