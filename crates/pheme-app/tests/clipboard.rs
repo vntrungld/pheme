@@ -156,6 +156,8 @@ async fn spawn_clip_pair(with_client_clip: bool) -> ClipPair {
             mic: pheme_app::audio::PlaybackSource::Disabled,
             mic_stats: None,
             clipboard: client_clipboard,
+            display: None,
+            display_input: None,
             ipc: None,
         },
         shutdown_tx.clone(),

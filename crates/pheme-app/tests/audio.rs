@@ -148,6 +148,8 @@ fn spawn_pair(fail_capture: bool) -> Pair {
             mic: PlaybackSource::Disabled,
             mic_stats: None,
             clipboard: None,
+            display: None,
+            display_input: None,
             ipc: None,
         },
         shutdown_tx.clone(),

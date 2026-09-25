@@ -19,6 +19,7 @@ use crate::audio::{CaptureSource, InStats, OutCounters, PlaybackSource, RecvSide
 use crate::backoff::Backoff;
 use crate::clipboard::ClipboardService;
 use crate::config::{config_dir, Config, Role};
+use crate::display::DisplayService;
 use crate::ipc::{Command, CoreLink, LinkState, Status};
 use crate::target::Target;
 
@@ -47,6 +48,14 @@ pub struct ClientDeps {
     pub mic_stats: Option<Arc<InStats>>,
     /// The clipboard worker, or `None` where no clipboard is reachable.
     pub clipboard: Option<ClipboardService>,
+    /// The monitor worker, or `None` when `[display] input` is unset.
+    /// `None` disables input switching and nothing else.
+    pub display: Option<DisplayService>,
+    /// The VCP 0x60 value of the monitor input this machine is cabled to,
+    /// straight from `[display] input`. Told to the server in `Hello`, so
+    /// the server knows which input to command when the pointer crosses
+    /// here. `None` when the feature is off.
+    pub display_input: Option<u16>,
     /// Report status to a front-end over this socket and take commands from
     /// it. `None` for every invocation a person types themselves; only
     /// `pheme` with no subcommand, supervising this as a child, sets it.
@@ -83,6 +92,12 @@ struct SessionExtras<'a> {
     mic: &'a RecvSide,
     mic_stats: &'a InStats,
     status_tx: Option<mpsc::Sender<Status>>,
+    /// The monitor worker, or `None` when `[display] input` is unset.
+    /// Bundled here rather than as its own positional parameter to keep
+    /// `session` under clippy's argument-count lint.
+    display: &'a Option<DisplayService>,
+    /// This machine's own `[display] input`, sent in `Hello`.
+    display_input: Option<u16>,
 }
 
 /// Pushes a `Status` carrying only `state`, with every other field at its
@@ -173,6 +188,8 @@ pub async fn run_client(
         mic,
         mic_stats,
         clipboard,
+        display,
+        display_input,
         ipc,
     } = deps;
     let counters = audio_counters.unwrap_or_default();
@@ -290,6 +307,8 @@ pub async fn run_client(
                                 mic: &mic,
                                 mic_stats: &mic_stats,
                                 status_tx: status_tx.clone(),
+                                display: &display,
+                                display_input,
                             },
                             clipboard.clone(),
                             &mut shutdown,
@@ -355,6 +374,8 @@ async fn session(
         mic,
         mic_stats,
         status_tx,
+        display,
+        display_input,
     } = audio;
     let screens = inject.screens();
     let mut rx = peer.take_incoming();
@@ -369,7 +390,7 @@ async fn session(
             os: Os::current(),
             screens: screens.clone(),
             audio: AudioParams::DEFAULT,
-            display_input: None,
+            display_input,
         })
         .await?;
     let ack = tokio::select! {
@@ -381,12 +402,16 @@ async fn session(
             r.context("waiting for HelloAck")?
         }
     };
-    match ack {
+    // The server's own `[display] input`, kept so the crossing back to it
+    // (the `Msg::Leave` branch below) can name the target: this machine is
+    // the one the monitor is showing at that moment, so it is the only one
+    // whose DDC/CI command the monitor will answer.
+    let server_display_input = match ack {
         Some(Msg::HelloAck {
             version,
             name: server_name,
             audio: audio_params,
-            display_input: _,
+            display_input: server_display_input,
         }) if version == PROTOCOL_VERSION => {
             info!(server = %server_name, addr = %peer.remote_addr(), "connected");
             if audio_params == AudioParams::DEFAULT {
@@ -398,10 +423,11 @@ async fn session(
                      running this session without audio"
                 );
             }
+            server_display_input
         }
         Some(Msg::Bye { reason }) => bail!("server refused: {reason}"),
         other => bail!("unexpected handshake reply: {other:?}"),
-    }
+    };
 
     // The server starts every session with its microphone closed, so without this the
     // first demand is never sent and the microphone never opens.
@@ -446,6 +472,22 @@ async fn session(
                     if matches!(m, Msg::Leave { .. }) {
                         if let Some(c) = &clipboard {
                             c.send_to(sender.clone());
+                        }
+                        // The pointer is going back to the server and the
+                        // picture goes with it. The client is the displayed
+                        // input at this moment, so this is the only command
+                        // that can reach the monitor.
+                        if let (Some(d), Some(v)) = (display, server_display_input) {
+                            d.switch_to(v);
+                        }
+                    }
+                    // `&m`, not `m`: `Msg` is not `Copy` and the loop
+                    // still passes it to `core.on_msg` below.
+                    if let Msg::SwitchDisplay { input } = &m {
+                        // Review Focus 4: a no-op when this machine has no
+                        // monitor configured, which is the whole handling.
+                        if let Some(d) = display {
+                            d.force(*input);
                         }
                     }
                     received += 1;
@@ -587,6 +629,16 @@ pub async fn main(
         let _ = ctrlc_shutdown.send(true);
     });
     let clipboard = ClipboardService::spawn(pheme_clip::open);
+    // `monitor` is captured by the closure rather than read on the service
+    // thread through `cfg`, because `pheme_display::Monitor` is not `Send`
+    // and the handle has to be created where it is used.
+    let display = {
+        let monitor = cfg.display.monitor.clone();
+        DisplayService::spawn(
+            &cfg.display,
+            Box::new(move || pheme_display::open(monitor.as_deref())),
+        )
+    };
     run_client(
         ClientDeps {
             name: cfg.name.clone(),
@@ -599,6 +651,8 @@ pub async fn main(
             mic: PlaybackSource::DetectVirtualMic(None),
             mic_stats: None,
             clipboard,
+            display,
+            display_input: cfg.display.input,
             ipc,
         },
         shutdown_tx,
