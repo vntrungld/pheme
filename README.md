@@ -316,7 +316,9 @@ follow the pointer: crossing the screen edge switches the monitor's input
 source to the machine that now has the keyboard and mouse.
 
 Run `pheme displays` on each machine to find the value for the input that
-machine is cabled to:
+machine is cabled to. `CURRENT` is the input the monitor is showing now,
+and `SUPPORTED` is what it claims to accept -- advisory, often empty, and
+never a substitute for switching the input by hand and re-running this:
 
     IDENTITY                             LOCATION      CURRENT  SUPPORTED
     GSM LG ULTRAGEAR (106NTMXE1579)      /dev/i2c-10   0x11     0x0f 0x11 0x12
@@ -327,8 +329,8 @@ Then set it on **each machine**, to that machine's own input:
 [display]
 # The VCP 0x60 value of the input THIS machine is cabled to.
 input = 0x11
-# Optional: a substring of the identity above, when more than one monitor
-# answers.
+# Optional: a substring of the IDENTITY or the LOCATION above, matched
+# without regard to case, when more than one monitor answers.
 monitor = "ULTRAGEAR"
 # Optional: minimum gap between switches, in milliseconds.
 cooldown_ms = 1000

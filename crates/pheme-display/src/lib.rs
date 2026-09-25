@@ -41,7 +41,10 @@ pub trait Monitor {
     /// `display.monitor`, and printed by `pheme displays`.
     fn identity(&self) -> &str;
     /// Where the backend found it: an i2c device path on Linux, the physical
-    /// monitor description on Windows. Printed, never matched.
+    /// monitor description on Windows. Printed, and matched against
+    /// `display.monitor` as well -- a monitor whose EDID carried no name
+    /// has its bus path for an identity, and then this is the only thing
+    /// left to choose it by (see `pick`).
     fn location(&self) -> &str;
     fn get_input(&mut self) -> Result<u16, DisplayError>;
     fn set_input(&mut self, value: u16) -> Result<(), DisplayError>;

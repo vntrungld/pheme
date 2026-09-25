@@ -275,8 +275,8 @@ fn format_vcp_value(v: u16) -> String {
 }
 
 /// The capability string's advisory input list, space-joined, or `-` when it
-/// named none -- which is common and is not an error (see `pick`'s doc
-/// comment in `pheme_display` for why the list cannot be relied on).
+/// named none -- which is common and is not an error (see the module
+/// header of `pheme_display::caps` for why the list cannot be relied on).
 fn format_supported(vals: &[u16]) -> String {
     if vals.is_empty() {
         "-".to_string()

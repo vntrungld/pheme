@@ -9,10 +9,13 @@
 //! *client's* rather than this machine's, and that the recovery hotkey asks
 //! both machines rather than one.
 //!
-//! The stand-in client is hand-rolled rather than `run_client` because the
-//! client half is task 9: `run_client` still declares `display_input: None`
-//! in its `Hello`, so a real client could not yet tell the server which
-//! input it is cabled to.
+//! The stand-in client is hand-rolled rather than `run_client` so that the
+//! test can drive the client's side of the link by hand -- send a `Hello`
+//! naming an input this machine is not cabled to, press the hotkey at a
+//! chosen moment, read the `SwitchDisplay` that comes back. A real
+//! `run_client` does declare its `display_input` (`display_client.rs` is
+//! the mirror of this file, and pins that), and a real pair of them
+//! crossing the edge repeatedly is `display_crossing.rs`.
 
 use std::time::{Duration, Instant};
 

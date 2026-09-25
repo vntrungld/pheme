@@ -86,7 +86,9 @@ pub trait Monitor: Send {
     /// `display.monitor`, and printed by `pheme displays`.
     fn identity(&self) -> &str;
     /// Where the backend found it: an i2c device path on Linux, the
-    /// physical monitor description on Windows. Printed, never matched.
+    /// physical monitor description on Windows. Printed, and matched
+    /// after the identity: a monitor whose EDID carried no name has its
+    /// bus path for an identity, and nothing else to choose it by.
     fn location(&self) -> &str;
     fn get_input(&mut self) -> Result<u16, DisplayError>;
     fn set_input(&mut self, value: u16) -> Result<(), DisplayError>;
@@ -102,8 +104,8 @@ pub trait Monitor: Send {
 /// at startup (§4).
 pub fn enumerate() -> Vec<Box<dyn Monitor>>;
 
-/// The monitor whose `identity()` contains `want` (case-insensitive), or
-/// the first one when `want` is `None`.
+/// The monitor whose `identity()` or `location()` contains `want`
+/// (case-insensitive), or the first one when `want` is `None`.
 pub fn open(want: Option<&str>) -> Result<Box<dyn Monitor>, DisplayError>;
 ```
 
@@ -380,8 +382,8 @@ when a server has several clients configured.
 [display]
 # The VCP 0x60 value of the input THIS machine is cabled to.
 input = 0x11
-# Optional. A case-insensitive substring of the identity `pheme displays`
-# prints. Only needed when more than one monitor answers.
+# Optional. A case-insensitive substring of the identity or the location
+# `pheme displays` prints. Only needed when more than one monitor answers.
 monitor = "ULTRAGEAR"
 # Optional. Minimum gap between commands, milliseconds.
 cooldown_ms = 1000

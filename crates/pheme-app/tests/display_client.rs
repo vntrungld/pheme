@@ -1,13 +1,13 @@
 //! The client's half of monitor input switching (task 9), over a real QUIC
 //! link to a stand-in server and a `MockMonitor`.
 //!
-//! `display_server.rs` pins the server's half the same way, and its own
-//! header explains why: a real client had nothing to test against until
-//! this half existed, because `run_client` still declared `display_input:
-//! None` in its `Hello`. Now the situation is mirrored -- a real client's
-//! own `Hello`/`HelloAck`/`Msg::Leave`/`Msg::SwitchDisplay` handling is
-//! exercised against a hand-rolled server, the same trade `display_server.rs`
-//! makes in the other direction.
+//! `display_server.rs` is the mirror of this file: there a real
+//! `run_server` is driven by a hand-rolled client, and here a real
+//! `run_client`'s own `Hello`/`HelloAck`/`Msg::Leave`/`Msg::SwitchDisplay`
+//! handling is driven by a hand-rolled server. Both trade one real end for
+//! a peer the test can drive message by message. The pair of them running
+//! against each other, which is where a belief about the monitor can go
+//! stale, is `display_crossing.rs`.
 
 use std::time::{Duration, Instant};
 
