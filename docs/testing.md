@@ -220,13 +220,13 @@ automated runs against a mock.
 
 | # | Action | Pass |
 |---|---|---|
-| E1 | `pheme displays` on each machine | each monitor is listed with a plausible identity and a current input |
-| E2 | Set `display.input` on both, cross the edge | the monitor shows the client within ~2 s |
-| E3 | Cross back | the monitor shows the server |
-| E4 | Sweep across the edge and back inside one second | the monitor ends on the machine the pointer ended on, and switches at most once |
+| E1 | `pheme displays` on each machine, **without** switching the monitor to that machine first — run it on the machine the monitor is *not* showing | each monitor is listed with a plausible identity and a current input. Record, per machine, whether it answered while off screen: a machine that lists nothing until the monitor is switched to it is the case E1 exists to find, and the client is the machine it matters on |
+| E2 | Set `display.input` on both, then cross the edge and back **twice**, slowly, waiting for the picture each time | all four transitions switch: out → the client, back → the server, out → the client, back → the server. The second round trip is the one that matters; the first one passed even with the defect this row was rewritten for |
+| E3 | Restart the client while the monitor is showing the **server**, then cross the edge | the monitor shows the client. A client that enumerated no monitor at startup must still find one once it is on screen |
+| E4 | Sweep the pointer across the edge and back inside one second | the monitor switches **at least once and at most twice**, and ends on the machine the pointer ended on. Zero switches is a failure, not a pass: a feature that is wedged also "ends" on the right machine |
 | E5 | Press the `switch_display` hotkey while the monitor is on the wrong machine | the monitor corrects itself |
-| E6 | Click "Switch display" in the window | the same |
+| E6 | Click "Switch display" in the window twice: once on the machine that both holds the pointer and is on screen, and once on the client while the client is on screen but the pointer is on the server | the first click leaves the monitor where it is, because it is already right; the second switches the monitor to the server. A click that moves the picture away from the machine holding the pointer is a failure |
 | E7 | Run with `display.input` set where the monitor ignores DDC/CI | one warning at startup, nothing later, input and audio unaffected |
-| E8 | Remove `[display]`, cross the edge | no DDC traffic, no warning, everything else unchanged |
+| E8 | Remove `[display]`, cross the edge | the startup log never says "display switching is on", no DDC warning appears, and everything else is unchanged |
 | E9 | Unplug the monitor's second cable, cross the edge | the failed command warns once and does not repeat on later crossings |
 | E10 | Give both machines the same `display.input` and connect | the "same monitor input" warning appears on the server |
