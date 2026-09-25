@@ -19,8 +19,9 @@ use std::time::Duration;
 use anyhow::Context as _;
 use eframe::egui;
 
-use crate::config::{config_dir, Config, Role};
+use crate::config::{config_dir, AudioCfg, ClientCfg, Config, HotkeysCfg, Role, SideCfg};
 use crate::ipc::{Command, LinkState};
+use pheme_audio::devices::{list_devices, DeviceInfo, DeviceKind};
 
 use super::{CoreState, Supervisor, Tray, TrayEvent};
 
@@ -56,6 +57,10 @@ pub fn run() -> anyhow::Result<()> {
     let tray = Tray::new();
     let has_tray = tray.is_some();
 
+    // `cfg` was moved into `Supervisor::start` above; read it back from the
+    // supervisor rather than cloning it earlier just for this.
+    let config_form = ConfigForm::from_config(&supervisor.config().unwrap_or_default());
+
     let app = PhemeApp {
         handle: rt.handle().clone(),
         supervisor,
@@ -70,7 +75,14 @@ pub fn run() -> anyhow::Result<()> {
         selected_server: None,
         pair_code: String::new(),
         pairing: Arc::new(Mutex::new(PairingState::Idle)),
+        config_form,
+        config_errors: ConfigFormErrors::default(),
+        config_warned: false,
+        devices: Arc::new(Mutex::new(DeviceListState::Loading)),
     };
+    // Fetched once, here, off the repaint thread -- never on a repaint or a
+    // menu open. See the doc comment on `start_device_fetch`.
+    start_device_fetch(&app);
 
     let viewport = egui::ViewportBuilder::default()
         .with_title("Pheme")
@@ -207,6 +219,266 @@ impl StatusView {
     }
 }
 
+/// The in-progress edits behind the configuration panel: what a person has
+/// typed, not yet a [`Config`]. A listen address and a span bound are text
+/// here, exactly as they are in a text field, until [`ConfigForm::build`]
+/// either turns them into one or explains why it could not.
+///
+/// Kept separate from `Config` for the same reason [`StatusView`] is kept
+/// separate from `CoreState`: a pure reduction ([`ConfigForm::from_config`])
+/// and its inverse ([`ConfigForm::build`]), each testable without a window.
+#[derive(Debug, Clone, PartialEq)]
+struct ConfigForm {
+    role: Role,
+    name: String,
+    listen: String,
+    connect: String,
+    /// Not exposed anywhere in the panel -- task 12 does not ask for a
+    /// discovery toggle -- but carried through unedited so that saving from
+    /// this form never silently flips it back to its default.
+    discovery: bool,
+    lock_hotkey: String,
+    clients: Vec<ClientForm>,
+    /// Empty means "the operating system default", exactly as an absent
+    /// key does in the file (`AudioCfg`'s doc comment).
+    playback_device: String,
+    capture_device: String,
+    mic_device: String,
+}
+
+impl ConfigForm {
+    /// Reduces `cfg` into what the panel shows.
+    fn from_config(cfg: &Config) -> Self {
+        ConfigForm {
+            role: cfg.role,
+            name: cfg.name.clone(),
+            listen: cfg.listen.to_string(),
+            connect: cfg.connect.clone().unwrap_or_default(),
+            discovery: cfg.discovery,
+            lock_hotkey: cfg.hotkeys.lock.clone().unwrap_or_default(),
+            clients: cfg.clients.iter().map(ClientForm::from_cfg).collect(),
+            playback_device: cfg.audio.playback_device.clone().unwrap_or_default(),
+            capture_device: cfg.audio.capture_device.clone().unwrap_or_default(),
+            mic_device: cfg.audio.mic_device.clone().unwrap_or_default(),
+        }
+    }
+
+    /// Builds the `Config` this form describes, or the reasons it cannot --
+    /// one attached to the field that produced it, so the panel can show a
+    /// rejection beside the field rather than in a dialog that takes the
+    /// context away.
+    ///
+    /// Two passes. The first is plain syntax nothing but this form can
+    /// check -- is `listen` an address at all, is a span bound a number --
+    /// because the form holds text and `Config` does not. Only once every
+    /// field parses does the second pass run, and it runs the *same*
+    /// checks `Config` itself already performs when the command line loads
+    /// one: [`Config::hotkeys`], [`Config::placements`], and, for a client,
+    /// [`Config::connect_target`]. Nothing here re-implements what a valid
+    /// hotkey name or a valid span looks like -- that would risk the panel
+    /// and the command line disagreeing about what counts as valid, which
+    /// is exactly the situation this method exists to prevent.
+    fn build(&self) -> Result<Config, Box<ConfigFormErrors>> {
+        let mut errors = ConfigFormErrors {
+            clients: vec![None; self.clients.len()],
+            ..ConfigFormErrors::default()
+        };
+
+        let listen: Option<SocketAddr> = match self.listen.trim().parse() {
+            Ok(a) => Some(a),
+            Err(e) => {
+                errors.listen = Some(format!("not a valid address: {e}"));
+                None
+            }
+        };
+
+        let mut clients = Vec::with_capacity(self.clients.len());
+        for (i, c) in self.clients.iter().enumerate() {
+            match c.build() {
+                Ok(built) => clients.push(built),
+                Err(e) => errors.clients[i] = Some(e),
+            }
+        }
+
+        if errors.has_any() {
+            return Err(Box::new(errors));
+        }
+        let listen = listen.expect("no listen error was recorded above");
+
+        let trimmed_or_none = |s: &str| {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        };
+
+        let cfg = Config {
+            role: self.role,
+            name: self.name.clone(),
+            listen,
+            connect: trimmed_or_none(&self.connect),
+            discovery: self.discovery,
+            hotkeys: HotkeysCfg {
+                lock: trimmed_or_none(&self.lock_hotkey),
+            },
+            audio: AudioCfg {
+                playback_device: trimmed_or_none(&self.playback_device),
+                capture_device: trimmed_or_none(&self.capture_device),
+                mic_device: trimmed_or_none(&self.mic_device),
+            },
+            clients,
+        };
+
+        // From here on: `Config`'s own checks, not a second copy of them.
+        if let Err(e) = cfg.hotkeys() {
+            errors.hotkey_lock = Some(e.to_string());
+        }
+        if let Err(e) = cfg.placements() {
+            attribute_placement_error(&mut errors, &cfg, &e.to_string());
+        }
+        if cfg.role == Role::Client {
+            if let Err(e) = cfg.connect_target(None) {
+                errors.connect = Some(e.to_string());
+            }
+        }
+
+        if errors.has_any() {
+            Err(Box::new(errors))
+        } else {
+            Ok(cfg)
+        }
+    }
+}
+
+/// One row of the client list being edited: [`ClientCfg`]'s fields, with the
+/// span written out as the two text fields a person actually edits.
+#[derive(Debug, Clone, PartialEq)]
+struct ClientForm {
+    name: String,
+    side: SideCfg,
+    span_start: String,
+    span_end: String,
+}
+
+impl Default for ClientForm {
+    fn default() -> Self {
+        ClientForm {
+            name: String::new(),
+            side: SideCfg::Right,
+            span_start: String::new(),
+            span_end: String::new(),
+        }
+    }
+}
+
+impl ClientForm {
+    fn from_cfg(c: &ClientCfg) -> Self {
+        let (start, end) = c.span.map(|s| (s[0], s[1])).unzip();
+        ClientForm {
+            name: c.name.clone(),
+            side: c.side,
+            span_start: start.map(|v| v.to_string()).unwrap_or_default(),
+            span_end: end.map(|v| v.to_string()).unwrap_or_default(),
+        }
+    }
+
+    /// Parses this row's own text into a [`ClientCfg`], or says why it
+    /// could not -- the syntax pass [`ConfigForm::build`] needs before it
+    /// can even ask `Config::placements` about the semantics of a span.
+    fn build(&self) -> Result<ClientCfg, String> {
+        let start = self.span_start.trim();
+        let end = self.span_end.trim();
+        let span = match (start.is_empty(), end.is_empty()) {
+            (true, true) => None,
+            (false, false) => {
+                let s: f32 = start
+                    .parse()
+                    .map_err(|_| format!("span start {start:?} is not a number"))?;
+                let e: f32 = end
+                    .parse()
+                    .map_err(|_| format!("span end {end:?} is not a number"))?;
+                Some([s, e])
+            }
+            _ => return Err("span needs both a start and an end, or neither".to_string()),
+        };
+        Ok(ClientCfg {
+            name: self.name.trim().to_string(),
+            side: self.side,
+            span,
+        })
+    }
+}
+
+/// A rejected field's reason, one slot per field on [`ConfigForm`] --
+/// `clients` is aligned by row index with `ConfigForm::clients`. `general`
+/// is for the one case a reason cannot be attached to any single field (see
+/// [`attribute_placement_error`]'s fallback); the panel shows it above the
+/// Save button rather than dropping it.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct ConfigFormErrors {
+    general: Option<String>,
+    name: Option<String>,
+    listen: Option<String>,
+    connect: Option<String>,
+    hotkey_lock: Option<String>,
+    clients: Vec<Option<String>>,
+}
+
+impl ConfigFormErrors {
+    fn has_any(&self) -> bool {
+        self.general.is_some()
+            || self.name.is_some()
+            || self.listen.is_some()
+            || self.connect.is_some()
+            || self.hotkey_lock.is_some()
+            || self.clients.iter().any(Option::is_some)
+    }
+}
+
+/// Attaches `message` -- `Config::placements`'s own error text -- to the
+/// client row it names. `placements` reports the *first* invalid span it
+/// finds and stops there (it is built on `Iterator::collect` into a
+/// `Result`), so only one row is ever attributed per call; a second Save
+/// click surfaces the next one once the first is fixed, the same way the
+/// command line would only ever report one line at a time either.
+///
+/// The message always starts with `"client {name:?}: "` (see
+/// `Config::placements`'s `bail!`), so matching that prefix against each
+/// row's own name finds the row without re-deriving the rule the message
+/// is about. Falls back to `errors.general` on the message shape ever
+/// changing underneath this -- so a validation failure can never silently
+/// vanish, even if it can no longer be pinned to one row.
+fn attribute_placement_error(errors: &mut ConfigFormErrors, cfg: &Config, message: &str) {
+    for (i, c) in cfg.clients.iter().enumerate() {
+        let prefix = format!("client {:?}: ", c.name);
+        if let Some(rest) = message.strip_prefix(&prefix) {
+            errors.clients[i] = Some(rest.to_string());
+            return;
+        }
+    }
+    errors.general = Some(message.to_string());
+}
+
+fn side_label(side: SideCfg) -> &'static str {
+    match side {
+        SideCfg::Left => "Left",
+        SideCfg::Right => "Right",
+        SideCfg::Top => "Top",
+        SideCfg::Bottom => "Bottom",
+    }
+}
+
+/// The audio device menus' contents, fetched once off the repaint thread
+/// and refreshed only when asked. Filled by [`start_device_fetch`].
+#[derive(Debug, Clone)]
+enum DeviceListState {
+    Loading,
+    Loaded(Vec<DeviceInfo>),
+    Failed(String),
+}
+
 /// The eframe application: the window plus everything `run` handed it.
 struct PhemeApp {
     /// A handle to `run`'s tokio runtime, so this can drive `Supervisor`'s
@@ -252,6 +524,24 @@ struct PhemeApp {
     /// talks to another machine, so like discovery this is filled by a
     /// background task on `handle` rather than awaited here.
     pairing: Arc<Mutex<PairingState>>,
+    /// The configuration panel's in-progress edits. Loaded once from
+    /// `Supervisor::config()` in `run`, then owned here: the panel is a
+    /// draft that survives a rejected Save, not something re-read from the
+    /// supervisor on every frame.
+    config_form: ConfigForm,
+    /// A rejected field's reason from the last Save attempt, one slot per
+    /// field. Cleared the moment a Save actually goes through.
+    config_errors: ConfigFormErrors,
+    /// Whether the "comments do not survive" warning has been shown yet
+    /// this session. Starts `false`; the panel shows the warning until the
+    /// first Save click, then stops -- it is a warning to say once, not a
+    /// standing disclaimer.
+    config_warned: bool,
+    /// The audio device menus' contents. Filled once by `start_device_fetch`
+    /// at startup and again only when "Refresh devices" is clicked -- never
+    /// on a repaint, never on a menu open. See that function's doc comment
+    /// for why.
+    devices: Arc<Mutex<DeviceListState>>,
 }
 
 impl eframe::App for PhemeApp {
@@ -361,6 +651,7 @@ impl eframe::App for PhemeApp {
                 }
                 draw_status(ui, &self.view);
                 draw_pairing(ui, role, &state, self);
+                draw_config(ui, self);
             });
         });
 
@@ -767,6 +1058,35 @@ fn start_discovery(app: &PhemeApp) {
     });
 }
 
+/// Starts a background audio-device enumeration, and marks the device menus
+/// as loading. Split out from `draw_config` for the same reason
+/// `start_discovery` is: this call itself must return at once, with
+/// `list_devices` running on `handle` rather than blocking the caller, and
+/// splitting it out lets that be exercised directly in a test.
+///
+/// `list_devices` already bounds its own wait for PipeWire to one second and
+/// abandons the listening thread, detached, on timeout (see
+/// `pheme_audio::devices::list_devices`'s own doc comment) -- what this
+/// function guards against is calling it *at all* on every repaint or every
+/// menu open, which would pile up one abandoned thread per attempt against a
+/// wedged sound server. It runs exactly once, here, at startup (`run`), and
+/// again only when the panel's "Refresh devices" button is clicked.
+/// `spawn_blocking` rather than `spawn`: `list_devices` is a synchronous,
+/// blocking call in its own right (it joins or abandons its own thread
+/// before returning), so it belongs on the blocking pool, not an async
+/// worker.
+fn start_device_fetch(app: &PhemeApp) {
+    *app.devices.lock().expect("devices mutex poisoned") = DeviceListState::Loading;
+    let devices = app.devices.clone();
+    app.handle.spawn_blocking(move || {
+        let result = list_devices();
+        *devices.lock().expect("devices mutex poisoned") = match result {
+            Ok(list) => DeviceListState::Loaded(list),
+            Err(e) => DeviceListState::Failed(e.to_string()),
+        };
+    });
+}
+
 /// Starts a background pairing attempt against `addr`, as the client
 /// identified by `name`. Split out from `draw_pairing_client` for the same
 /// reason as [`start_discovery`]: `client_pair` talks to another machine and
@@ -797,6 +1117,206 @@ async fn pair_with(name: &str, addr: SocketAddr, code: &str) -> anyhow::Result<S
     let server_name =
         pheme_net::pairing::client_pair(&endpoint, addr, code.trim(), &identity, trust).await?;
     Ok(server_name)
+}
+
+/// Draws the configuration panel: role, name, the address field the role
+/// implies, the client list, the lock hotkey, and the three device menus --
+/// everything `config.toml` holds, so a person never has to open a text
+/// editor to reach it. Always drawn, including with no configuration yet
+/// (`role` in `draw_pairing`'s sense may be `None` then): this panel is
+/// exactly how that first configuration gets created.
+fn draw_config(ui: &mut egui::Ui, app: &mut PhemeApp) {
+    ui.separator();
+    ui.heading("Configuration");
+
+    if let Some(msg) = &app.config_errors.general {
+        ui.colored_label(egui::Color32::RED, msg);
+    }
+
+    ui.horizontal(|ui| {
+        ui.label("Role:");
+        ui.radio_value(&mut app.config_form.role, Role::Server, "Server");
+        ui.radio_value(&mut app.config_form.role, Role::Client, "Client");
+    });
+
+    ui.horizontal(|ui| {
+        ui.label("Name:");
+        ui.text_edit_singleline(&mut app.config_form.name);
+    });
+    if let Some(err) = &app.config_errors.name {
+        ui.colored_label(egui::Color32::RED, err);
+    }
+
+    match app.config_form.role {
+        Role::Server => {
+            ui.horizontal(|ui| {
+                ui.label("Listen address:");
+                ui.text_edit_singleline(&mut app.config_form.listen);
+            });
+            if let Some(err) = &app.config_errors.listen {
+                ui.colored_label(egui::Color32::RED, err);
+            }
+        }
+        Role::Client => {
+            ui.horizontal(|ui| {
+                ui.label("Server address:");
+                ui.text_edit_singleline(&mut app.config_form.connect);
+            });
+            if let Some(err) = &app.config_errors.connect {
+                ui.colored_label(egui::Color32::RED, err);
+            }
+        }
+    }
+
+    ui.horizontal(|ui| {
+        ui.label("Lock hotkey:");
+        ui.text_edit_singleline(&mut app.config_form.lock_hotkey);
+    });
+    ui.label("Empty disables the lock hotkey.");
+    if let Some(err) = &app.config_errors.hotkey_lock {
+        ui.colored_label(egui::Color32::RED, err);
+    }
+
+    ui.separator();
+    ui.label("Clients");
+    let mut remove: Option<usize> = None;
+    for (i, client) in app.config_form.clients.iter_mut().enumerate() {
+        ui.push_id(i, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Name:");
+                ui.add(egui::TextEdit::singleline(&mut client.name).desired_width(100.0));
+                ui.label("Side:");
+                egui::ComboBox::from_id_salt("client_side")
+                    .selected_text(side_label(client.side))
+                    .show_ui(ui, |ui| {
+                        for side in [SideCfg::Left, SideCfg::Right, SideCfg::Top, SideCfg::Bottom] {
+                            ui.selectable_value(&mut client.side, side, side_label(side));
+                        }
+                    });
+                ui.label("Span:");
+                ui.add(egui::TextEdit::singleline(&mut client.span_start).desired_width(48.0));
+                ui.label("to");
+                ui.add(egui::TextEdit::singleline(&mut client.span_end).desired_width(48.0));
+                if ui.button("Remove").clicked() {
+                    remove = Some(i);
+                }
+            });
+            if let Some(err) = app.config_errors.clients.get(i).and_then(|e| e.as_ref()) {
+                ui.colored_label(egui::Color32::RED, err);
+            }
+        });
+    }
+    if let Some(i) = remove {
+        app.config_form.clients.remove(i);
+    }
+    if ui.button("Add client").clicked() {
+        app.config_form.clients.push(ClientForm::default());
+    }
+
+    ui.separator();
+    ui.label("Audio devices (empty means the operating system default)");
+    let device_state = app.devices.lock().expect("devices mutex poisoned").clone();
+    let loading = matches!(device_state, DeviceListState::Loading);
+    let list = match &device_state {
+        DeviceListState::Loaded(v) => v.as_slice(),
+        DeviceListState::Loading | DeviceListState::Failed(_) => &[],
+    };
+    if ui
+        .add_enabled(!loading, egui::Button::new("Refresh devices"))
+        .clicked()
+    {
+        start_device_fetch(app);
+    }
+    match &device_state {
+        DeviceListState::Loading => {
+            ui.label("Loading audio devices...");
+        }
+        DeviceListState::Failed(e) => {
+            ui.colored_label(
+                egui::Color32::RED,
+                format!("Could not list audio devices: {e}"),
+            );
+        }
+        DeviceListState::Loaded(_) => {}
+    }
+    device_combo(
+        ui,
+        "Playback device (server, plays received audio):",
+        &mut app.config_form.playback_device,
+        list,
+        DeviceKind::Playback,
+    );
+    device_combo(
+        ui,
+        "Capture device (client, Windows loopback source):",
+        &mut app.config_form.capture_device,
+        list,
+        DeviceKind::Playback,
+    );
+    device_combo(
+        ui,
+        "Microphone device (server):",
+        &mut app.config_form.mic_device,
+        list,
+        DeviceKind::Capture,
+    );
+
+    ui.separator();
+    if !app.config_warned {
+        ui.colored_label(
+            egui::Color32::YELLOW,
+            "Saving rewrites config.toml from scratch. Comments in a \
+             hand-edited file will not survive it -- a TOML writer has \
+             none to preserve.",
+        );
+    }
+    if ui.button("Save").clicked() {
+        app.config_warned = true;
+        match app.config_form.build() {
+            Ok(cfg) => {
+                app.config_errors = ConfigFormErrors::default();
+                app.action_error = None;
+                let path = Config::default_path();
+                // The only path that writes the file and restarts the
+                // child -- `restart` is for starting back up without a
+                // configuration change, which this is not.
+                if let Err(e) = app.handle.block_on(app.supervisor.apply_config(cfg, &path)) {
+                    app.action_error = Some(format!("could not save the configuration: {e:#}"));
+                }
+            }
+            Err(errors) => {
+                app.config_errors = *errors;
+            }
+        }
+    }
+}
+
+/// One audio device menu: an empty selection (the operating system default)
+/// plus every known device of `kind`, in whatever order `list` already has
+/// them (`list_devices` sorts playback-first, then alphabetical).
+fn device_combo(
+    ui: &mut egui::Ui,
+    label: &str,
+    selected: &mut String,
+    list: &[DeviceInfo],
+    kind: DeviceKind,
+) {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        let shown = if selected.is_empty() {
+            "(operating system default)".to_string()
+        } else {
+            selected.clone()
+        };
+        egui::ComboBox::from_id_salt(label)
+            .selected_text(shown)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(selected, String::new(), "(operating system default)");
+                for d in list.iter().filter(|d| d.kind == kind) {
+                    ui.selectable_value(selected, d.name.clone(), &d.name);
+                }
+            });
+    });
 }
 
 #[cfg(test)]
@@ -971,6 +1491,10 @@ mod tests {
             selected_server: None,
             pair_code: String::new(),
             pairing: Arc::new(Mutex::new(PairingState::Idle)),
+            config_form: ConfigForm::from_config(&Config::default()),
+            config_errors: ConfigFormErrors::default(),
+            config_warned: false,
+            devices: Arc::new(Mutex::new(DeviceListState::Loading)),
         }
     }
 
@@ -1037,5 +1561,152 @@ mod tests {
             server.fingerprint.as_deref(),
             Some("window-test-fingerprint")
         );
+    }
+
+    // --- `ConfigForm` ---------------------------------------------------
+    //
+    // The configuration panel's own validation and conversion, reachable
+    // without a window -- in the same spirit as `StatusView` and
+    // `PairingCodeStatus::from_parts` above.
+
+    #[test]
+    fn a_form_round_trips_to_an_equal_config() {
+        let mut cfg = Config {
+            role: Role::Server,
+            name: "desk-linux".into(),
+            connect: Some("laptop-win".into()),
+            ..Config::default()
+        };
+        cfg.clients.push(ClientCfg {
+            name: "laptop-win".into(),
+            side: SideCfg::Right,
+            span: Some([0.25, 0.75]),
+        });
+        cfg.clients.push(ClientCfg {
+            name: "tv".into(),
+            side: SideCfg::Top,
+            span: None,
+        });
+        cfg.audio.playback_device = Some("Speakers (Realtek)".into());
+
+        let form = ConfigForm::from_config(&cfg);
+        assert_eq!(
+            form.build()
+                .expect("a form built from a valid config must build back"),
+            cfg
+        );
+    }
+
+    #[test]
+    fn a_default_config_round_trips_too() {
+        let cfg = Config::default();
+        let form = ConfigForm::from_config(&cfg);
+        assert_eq!(form.build().unwrap(), cfg);
+    }
+
+    #[test]
+    fn an_invalid_span_is_rejected_beside_its_row_not_written() {
+        let mut form = ConfigForm::from_config(&Config::default());
+        form.clients.push(ClientForm {
+            name: "backwards".into(),
+            side: SideCfg::Left,
+            span_start: "0.9".into(),
+            span_end: "0.1".into(),
+        });
+        let errors = form.build().expect_err("a reversed span must be rejected");
+        assert!(
+            errors.clients[0]
+                .as_deref()
+                .is_some_and(|e| e.contains("span")),
+            "no reason attached to the offending row: {errors:?}"
+        );
+        // Nothing else on the struct should have a stray reason: this is
+        // the one thing wrong with the form.
+        assert!(errors.listen.is_none());
+        assert!(errors.hotkey_lock.is_none());
+    }
+
+    #[test]
+    fn a_span_bound_that_is_not_a_number_is_rejected_before_any_semantic_check() {
+        let mut form = ConfigForm::from_config(&Config::default());
+        form.clients.push(ClientForm {
+            name: "typo".into(),
+            side: SideCfg::Left,
+            span_start: "half".into(),
+            span_end: "1".into(),
+        });
+        let errors = form.build().expect_err("non-numeric span must be rejected");
+        assert!(errors.clients[0]
+            .as_deref()
+            .is_some_and(|e| e.contains("not a number")));
+    }
+
+    #[test]
+    fn an_unknown_hotkey_name_is_rejected_with_configs_own_reason() {
+        let mut form = ConfigForm::from_config(&Config::default());
+        form.lock_hotkey = "NoSuchKey".into();
+        let errors = form
+            .build()
+            .expect_err("an unknown key name must be rejected");
+        assert!(errors.hotkey_lock.is_some());
+    }
+
+    #[test]
+    fn a_client_role_with_no_server_address_is_rejected() {
+        let mut form = ConfigForm::from_config(&Config::default());
+        form.role = Role::Client;
+        form.connect = "   ".into();
+        let errors = form
+            .build()
+            .expect_err("a client with nothing to connect to must be rejected");
+        assert!(errors.connect.is_some());
+    }
+
+    #[test]
+    fn an_invalid_listen_address_is_rejected_beside_the_field() {
+        let mut form = ConfigForm::from_config(&Config::default());
+        form.listen = "not an address".into();
+        let errors = form.build().expect_err("a bad address must be rejected");
+        assert!(errors.listen.is_some());
+    }
+
+    #[test]
+    fn empty_device_selections_mean_the_operating_system_default() {
+        let form = ConfigForm::from_config(&Config::default());
+        assert_eq!(form.playback_device, "");
+        assert_eq!(form.capture_device, "");
+        assert_eq!(form.mic_device, "");
+
+        let cfg = form.build().unwrap();
+        assert_eq!(cfg.audio.playback_device, None);
+        assert_eq!(cfg.audio.capture_device, None);
+        assert_eq!(cfg.audio.mic_device, None);
+
+        // And the other direction: a config with a device set shows it,
+        // never blank.
+        let mut with_device = Config::default();
+        with_device.audio.mic_device = Some("Blue Yeti".into());
+        let form = ConfigForm::from_config(&with_device);
+        assert_eq!(form.mic_device, "Blue Yeti");
+    }
+
+    #[tokio::test]
+    async fn start_device_fetch_returns_before_list_devices_finishes() {
+        // The rule `start_discovery`'s own test pins for `browse`, pinned
+        // here for `list_devices`: a menu must never freeze the repaint
+        // thread waiting on it, however long a wedged PipeWire takes to
+        // answer (up to its own one-second bound, plus scheduling).
+        let app = test_app().await;
+        let started = std::time::Instant::now();
+        start_device_fetch(&app);
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "start_device_fetch blocked its caller for {:?}",
+            started.elapsed()
+        );
+        assert!(matches!(
+            *app.devices.lock().unwrap(),
+            DeviceListState::Loading
+        ));
     }
 }
