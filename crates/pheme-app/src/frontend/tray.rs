@@ -65,6 +65,26 @@ struct Applied {
     running: bool,
 }
 
+/// The reduction from [`CoreState`] to what the icon and the menu show --
+/// the actual function [`Tray::set_state`] calls, not a copy of it. Split
+/// out so this one small, easy-to-get-wrong piece of logic (connected
+/// tracks the link, not merely "a child exists") can be pinned by a test
+/// that runs against the real thing, rather than a `fn reduce` the test
+/// wrote for itself, which is what a prior version of this test did and
+/// which could not fail no matter how `set_state` changed underneath it.
+fn reduce_core_state(s: &CoreState) -> Applied {
+    let (running, locked) = match s {
+        CoreState::Running(status) => (true, status.locked),
+        CoreState::NoConfig | CoreState::Stopped(_) => (false, false),
+    };
+    let connected = matches!(s, CoreState::Running(status) if status.state == LinkState::Connected);
+    Applied {
+        connected,
+        locked,
+        running,
+    }
+}
+
 impl Tray {
     /// Builds the tray icon, or returns `None` if this platform has nowhere
     /// to put it.
@@ -156,24 +176,13 @@ impl Tray {
     /// Start/Stop label follow `CoreState` the same way: never set from the
     /// event a menu click produced, only from the state that came back.
     pub fn set_state(&mut self, s: &CoreState) {
-        let (running, locked) = match s {
-            CoreState::Running(status) => (true, status.locked),
-            CoreState::NoConfig | CoreState::Stopped(_) => (false, false),
-        };
-        let connected =
-            matches!(s, CoreState::Running(status) if status.state == LinkState::Connected);
-
-        let next = Applied {
-            connected,
-            locked,
-            running,
-        };
+        let next = reduce_core_state(s);
         if self.applied == Some(next) {
             return;
         }
 
-        if self.applied.map(|a| a.connected) != Some(connected) {
-            let icon = if connected {
+        if self.applied.map(|a| a.connected) != Some(next.connected) {
+            let icon = if next.connected {
                 self.icon_connected.clone()
             } else {
                 self.icon_disconnected.clone()
@@ -182,10 +191,10 @@ impl Tray {
                 warn!("could not update the tray icon: {err}");
             }
         }
-        self.lock.set_checked(locked);
-        self.lock.set_enabled(running);
+        self.lock.set_checked(next.locked);
+        self.lock.set_enabled(next.running);
         self.start_stop
-            .set_text(if running { "Stop" } else { "Start" });
+            .set_text(if next.running { "Stop" } else { "Start" });
         self.start_stop.set_enabled(true);
 
         self.applied = Some(next);
@@ -450,40 +459,55 @@ mod tests {
     #[test]
     fn set_state_reduction_matches_core_state() {
         // `Tray::set_state` needs a built `Tray`, which needs a tray host
-        // that CI does not have. The reduction from `CoreState` to
-        // (connected, locked, running) is the part worth pinning without
-        // one, since it is the part the brief calls out as easy to get
-        // wrong: connected tracks the link, not merely "a child exists".
-        fn reduce(s: &CoreState) -> (bool, bool, bool) {
-            let (running, locked) = match s {
-                CoreState::Running(status) => (true, status.locked),
-                CoreState::NoConfig | CoreState::Stopped(_) => (false, false),
-            };
-            let connected =
-                matches!(s, CoreState::Running(status) if status.state == LinkState::Connected);
-            (connected, locked, running)
-        }
-
-        assert_eq!(reduce(&CoreState::NoConfig), (false, false, false));
+        // that CI does not have. `reduce_core_state` is the part worth
+        // pinning without one, since it is the part the brief calls out as
+        // easy to get wrong: connected tracks the link, not merely "a
+        // child exists" -- and, unlike an earlier version of this test,
+        // this calls the *actual* function `Tray::set_state` runs, not a
+        // local copy that could drift from it and still pass.
         assert_eq!(
-            reduce(&CoreState::Stopped("exited".into())),
-            (false, false, false)
+            reduce_core_state(&CoreState::NoConfig),
+            Applied {
+                connected: false,
+                locked: false,
+                running: false
+            }
         );
         assert_eq!(
-            reduce(&CoreState::Running(status(LinkState::Connecting, false))),
-            (false, false, true),
+            reduce_core_state(&CoreState::Stopped("exited".into())),
+            Applied {
+                connected: false,
+                locked: false,
+                running: false
+            }
+        );
+        assert_eq!(
+            reduce_core_state(&CoreState::Running(status(LinkState::Connecting, false))),
+            Applied {
+                connected: false,
+                locked: false,
+                running: true
+            },
             "running but not yet linked must not show connected"
         );
         assert_eq!(
-            reduce(&CoreState::Running(status(LinkState::Connected, true))),
-            (true, true, true)
+            reduce_core_state(&CoreState::Running(status(LinkState::Connected, true))),
+            Applied {
+                connected: true,
+                locked: true,
+                running: true
+            }
         );
         assert_eq!(
-            reduce(&CoreState::Running(status(
+            reduce_core_state(&CoreState::Running(status(
                 LinkState::Failed("boom".into()),
                 true
             ))),
-            (false, true, true),
+            Applied {
+                connected: false,
+                locked: true,
+                running: true
+            },
             "a failed link is not connected even while the core still runs and stays locked"
         );
     }
