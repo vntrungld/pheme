@@ -1332,9 +1332,15 @@ fn draw_config(ui: &mut egui::Ui, app: &mut PhemeApp) {
         );
     }
     if ui.button("Save").clicked() {
-        app.config_warned = true;
         match app.config_form.build() {
             Ok(cfg) => {
+                // FINDING 6 (final review): setting this on the click,
+                // before `build()` ran, meant a first Save that failed
+                // validation already suppressed the warning on the retry
+                // that actually writes -- exactly the case manual row G5
+                // is meant to catch. Set only once validation has actually
+                // passed, in the arm that goes on to write the file.
+                app.config_warned = true;
                 app.config_errors = ConfigFormErrors::default();
                 app.action_error = None;
                 let path = Config::default_path();
