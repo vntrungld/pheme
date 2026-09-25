@@ -3477,3 +3477,57 @@ evidence that the feature works.
 Co-Authored-By: Claude <noreply@anthropic.com>
 EOF
 ```
+
+---
+
+## As built
+
+This plan records what was planned. Execution departed from it in the places
+below, each for a reason found while building. The commits are the record;
+this section exists so nobody reads the plan as a description of the code.
+
+**Two defects the plan could not have caught, found by the whole-branch
+review after all twelve tasks passed their own reviews** (`c9c0490`):
+
+- `DisplaySwitch.selected` is a belief about a monitor that *both* machines
+  command, but `observe()` had one call site, at startup. The belief never
+  learned that the peer had commanded the monitor, so after the first
+  crossing rule 1 refused correct commands and the picture stopped following
+  the pointer — silently, because a refused request logs nothing. Each side
+  is now told when it becomes the displayed input: `Msg::Enter` on the
+  client, the pointer returning to local on the server.
+- Because only the displayed input answers DDC/CI, and answering is the
+  membership test for `enumerate()`, a client started while the monitor
+  showed the server found nothing and gave up permanently — on the one
+  machine able to bring the picture back. Opening is now retried at that
+  same hook, bounded, never on a timer.
+
+Spec §3.4, §7 and §15 were amended to match.
+
+**Tests the plan did not ask for, added because the plan's coverage was
+thin:** `tests/display_crossing.rs` (a real server and a real client against
+one shared mock monitor, asserting the monitor after all four transitions of
+two round trips — no test in the plan crossed the edge more than once, which
+is what hid the first defect above), `tests/display_server.rs` and
+`tests/display_client.rs`.
+
+**Other deviations, all reviewed:** `ConfigForm` carries `display` and
+`switch_display` through unedited rather than rebuilding them from the panel
+(Task 4), which would have discarded a hand-written `[display]` section on
+the first Save; `DisplayService` gained `Clone` and the client threads the
+server's input through an `Arc<Mutex<Option<u16>>>`, because the IPC command
+loop outlives `session()`'s locals (Task 11); `pheme setup` also
+`modprobe`s `i2c-dev` and re-triggers the i2c subsystem, without which the
+udev rule it writes applies to nothing until a reboot (Task 10); the client's
+`Command::SwitchDisplay` computes the pointer's machine and asks both ends,
+rather than always asserting the server's input (final wave); `format_vcp_value`
+and `format_supported` were factored out of `pheme displays` so the formatting
+could be tested; and seven `Hotkeys { .. }` and four `ServerDeps { .. }`
+literals beyond the ones this plan names had to be widened.
+
+**Eleven claims in this plan about what its own tests pinned were false** and
+were corrected as they were found — a mutation named on unreachable code, a
+guard that another guard answered for, an assertion whose precondition was
+never asserted, a `#[serde(default)]` described as load-bearing on an
+`Option<T>` field where serde already defaults it. Each correction is its own
+commit.
