@@ -76,11 +76,23 @@ pub fn list_devices() -> crate::Result<Vec<DeviceInfo>> {
 mod linux {
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     use pipewire as pw;
+    use tracing::warn;
 
     use super::{kind_from_media_class, sort_devices, DeviceInfo, DeviceKind};
     use crate::{Error, Result};
+
+    /// How long `list_devices` waits for PipeWire to answer before giving up. Matches
+    /// `linux_pipewire.rs`'s `START_TIMEOUT`, both in value and in what it guards against: a
+    /// daemon that is running but never replies must not hang the caller forever. Unlike that
+    /// file's device threads, there is nothing useful to keep running past this deadline — a
+    /// one-shot enumeration that has not answered is just wrong, not degraded — so on timeout
+    /// this reports an error rather than the empty list a caller could mistake for "no
+    /// devices."
+    const ENUMERATE_TIMEOUT: Duration = Duration::from_secs(1);
 
     /// A node global as reported by the registry, before it is known whether
     /// it is the default. `node_name` (not the display `name`, which prefers
@@ -92,7 +104,42 @@ mod linux {
         node_name: String,
     }
 
+    /// Runs the enumeration on its own thread and bounds the wait for it, the same shape as
+    /// `crate::device::DeviceThread::start`: a PipeWire loop that has not yet reached the point
+    /// where it can observe a stop request may never act on one, so joining it would turn this
+    /// bounded wait into an unbounded one. On timeout the thread is abandoned, detached, never
+    /// joined, exactly as that type documents doing.
     pub(super) fn list_devices() -> Result<Vec<DeviceInfo>> {
+        let (tx, rx) = mpsc::channel::<Result<Vec<DeviceInfo>>>();
+        let thread = std::thread::Builder::new()
+            .name("pheme-pw-devices".into())
+            .spawn(move || {
+                let _ = tx.send(enumerate());
+            })
+            .map_err(|e| {
+                Error::Device(format!("spawning the PipeWire device-listing thread: {e}"))
+            })?;
+
+        match rx.recv_timeout(ENUMERATE_TIMEOUT) {
+            Ok(result) => {
+                let _ = thread.join();
+                result
+            }
+            Err(_) => {
+                warn!(
+                    "PipeWire did not answer within {ENUMERATE_TIMEOUT:?}; abandoning the \
+                     device-listing thread detached rather than blocking `list_devices` further"
+                );
+                drop(thread);
+                Err(Error::Device(format!(
+                    "PipeWire did not answer within {ENUMERATE_TIMEOUT:?}"
+                )))
+            }
+        }
+    }
+
+    /// The actual PipeWire work, run on the thread `list_devices` spawns and bounds.
+    fn enumerate() -> Result<Vec<DeviceInfo>> {
         pw::init();
 
         let mainloop = pw::main_loop::MainLoopRc::new(None)
@@ -200,10 +247,19 @@ mod linux {
                 Error::Device(format!("starting the PipeWire sync: {e}"))
             })?));
 
+        // Set when the core reports a fatal, non-recoverable error (the daemon going away, the
+        // connection breaking) — the same signal `linux_pipewire.rs`'s backends end their main
+        // loop on. Without this, a connection that fails *after* `connect_rc` already succeeded
+        // would either hang (nothing ever quits the loop) or, worse, quit some other way and
+        // silently report whatever partial list had been collected as if it were complete.
+        let core_error: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+
         let quit_loop = mainloop.clone();
         let core_for_done = core.clone();
         let phase_for_done = phase.clone();
         let pending_for_done = pending.clone();
+        let core_error_for_listener = core_error.clone();
+        let quit_loop_for_error = mainloop.clone();
         let _core_listener = core
             .add_listener_local()
             .done(move |id, seq| {
@@ -221,9 +277,23 @@ mod linux {
                     quit_loop.quit();
                 }
             })
+            .error(move |id, seq, res, message| {
+                warn!(
+                    id,
+                    seq, res, message, "the PipeWire connection failed while listing devices"
+                );
+                core_error_for_listener.set(true);
+                quit_loop_for_error.quit();
+            })
             .register();
 
         mainloop.run();
+
+        if core_error.get() {
+            return Err(Error::Device(
+                "the PipeWire connection failed while listing devices".into(),
+            ));
+        }
 
         let raw = nodes.borrow();
         let default_sink = default_sink.borrow();
