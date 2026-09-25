@@ -306,6 +306,18 @@ async fn the_recovery_hotkey_asks_both_machines() {
         "the core never returned to local"
     );
 
+    // The precondition of the last assertion, asserted rather than assumed,
+    // the way `a_switch_display_from_the_client_reaches_the_monitor` does
+    // at its top. The monitor has to be on the *client's* input here for
+    // the final `SERVER_INPUT` to mean anything: a monitor already showing
+    // this machine would satisfy it without a command ever being issued.
+    let mon = rig.mon.clone();
+    assert!(
+        wait_until(|| mon.input() == CLIENT_INPUT, Duration::from_secs(5)).await,
+        "the monitor should be on the client's input by now; it is on {:#04x}",
+        mon.input()
+    );
+
     rig.cap.push(CaptureEvent::Key {
         code: SWITCH,
         down: true,
@@ -315,7 +327,6 @@ async fn the_recovery_hotkey_asks_both_machines() {
         SERVER_INPUT,
         "while the pointer is here, the peer must be asked for this machine's input"
     );
-    let mon = rig.mon.clone();
     assert!(
         wait_until(|| mon.input() == SERVER_INPUT, Duration::from_secs(5)).await,
         "the local half of the hotkey never reached the monitor; it was left on {:#04x}",
