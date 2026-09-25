@@ -1411,7 +1411,7 @@ Append to the `tests` module in `crates/pheme-display/src/lib.rs`:
 - [ ] **Step 8: Run the tests to verify they pass**
 
 Run: `cargo test -p pheme-display`
-Expected: PASS, 23 tests, 1 ignored.
+Expected: PASS, 24 tests, 1 ignored (19 from Tasks 1 and 2, plus this task's 5 `pick` tests; `manual_smoke` is the ignored one).
 
 - [ ] **Step 9: Check the Windows arm compiles**
 
