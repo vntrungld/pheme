@@ -1,0 +1,17 @@
+[package]
+name = "pheme-display"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }
+ddc = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ddc-i2c = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+ddc-winapi = { workspace = true }

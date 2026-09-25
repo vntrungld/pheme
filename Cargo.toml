@@ -6,6 +6,7 @@ members = [
     "crates/pheme-input",
     "crates/pheme-audio",
     "crates/pheme-clip",
+    "crates/pheme-display",
     "crates/pheme-net",
     "crates/pheme-app",
 ]
@@ -23,6 +24,7 @@ pheme-core = { path = "crates/pheme-core" }
 pheme-input = { path = "crates/pheme-input" }
 pheme-audio = { path = "crates/pheme-audio" }
 pheme-clip = { path = "crates/pheme-clip" }
+pheme-display = { path = "crates/pheme-display" }
 pheme-net = { path = "crates/pheme-net" }
 
 serde = { version = "1", features = ["derive"] }
@@ -53,6 +55,9 @@ reis = { version = "0.7", features = ["async-io"] }
 futures-lite = "2"
 async-channel = "2"
 arboard = { version = "3.6", default-features = false, features = ["wayland-data-control"] }
+ddc = "0.2"
+ddc-i2c = { version = "0.2", default-features = false, features = ["with-linux"] }
+ddc-winapi = "0.2"
 mdns-sd = "0.21"
 tray-icon = "0.24"
 png = "0.18"
