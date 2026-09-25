@@ -48,8 +48,16 @@ fn name_from_instance(full: &str) -> String {
 }
 
 /// A live advertisement. Dropping it unregisters the service, so a server that
-/// exits cleanly stops answering at once instead of leaving a stale record to
-/// time out.
+/// exits cleanly stops answering at once instead of leaving a stale record for
+/// other machines to time out.
+///
+/// **Dropping blocks the calling thread** for up to 500 ms, waiting for the
+/// daemon to acknowledge the unregister before the daemon is shut down;
+/// without that wait the goodbye packet can go unsent. The acknowledgement
+/// comes from a thread inside this process, so the wait is normally
+/// microseconds. It is still a blocking wait: an `Advertiser` dropped inside
+/// an async task blocks that executor thread, so hold it somewhere that is
+/// dropped at teardown rather than on a hot path.
 pub struct Advertiser {
     daemon: ServiceDaemon,
     full_name: String,
@@ -59,9 +67,11 @@ impl Drop for Advertiser {
     fn drop(&mut self) {
         // Wait briefly for the unregister (goodbye packet) to actually go
         // out before shutting the daemon thread down, or the shutdown can
-        // race the unregister and the goodbye never gets sent.
+        // race the unregister and the goodbye never gets sent. The ack
+        // comes from the daemon thread in this same process, not over the
+        // network, so 500ms is already a generous bound for it.
         if let Ok(rx) = self.daemon.unregister(&self.full_name) {
-            let _ = rx.recv_timeout(Duration::from_secs(1));
+            let _ = rx.recv_timeout(Duration::from_millis(500));
         }
         let _ = self.daemon.shutdown();
     }
