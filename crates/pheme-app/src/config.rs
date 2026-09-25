@@ -58,10 +58,12 @@ pub struct ClientCfg {
 pub struct HotkeysCfg {
     pub lock: Option<String>,
     /// Re-assert the monitor's input for whichever machine holds the
-    /// pointer (design section 8). `#[serde(default)]` is load-bearing:
-    /// `HotkeysCfg` is `deny_unknown_fields` with a hand-written `Default`,
-    /// so without it every existing `[hotkeys]` section naming only `lock`
-    /// would stop parsing.
+    /// pointer (design section 8).
+    ///
+    /// `#[serde(default)]` is explicit here, not load-bearing: serde's
+    /// derive already reads an absent `Option<T>` field as `None`, which is
+    /// how the `lock` field above parses without one. Written out so the
+    /// intent is visible at the field rather than resting on that rule.
     #[serde(default)]
     pub switch_display: Option<String>,
 }
@@ -622,10 +624,11 @@ side = "top"
         assert_eq!(c.display.cooldown_ms, 1000);
     }
 
-    /// Break it by dropping `#[serde(default)]` from
-    /// `HotkeysCfg::switch_display`: every existing config file that names
-    /// only `lock` stops parsing, because HotkeysCfg is
-    /// deny_unknown_fields with a hand-written Default.
+    /// Break it by giving `switch_display` a type other than `Option<T>`,
+    /// or a hand-written deserializer that requires the key: serde's derive
+    /// reads an absent `Option<T>` as `None` on its own, so removing
+    /// `#[serde(default)]` alone does not break this — the attribute
+    /// documents the intent rather than carrying it.
     #[test]
     fn a_hotkeys_section_naming_only_lock_still_parses() {
         let c: Config = toml::from_str("[hotkeys]\nlock = \"ScrollLock\"").unwrap();
