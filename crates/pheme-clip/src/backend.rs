@@ -6,6 +6,15 @@
 //! wrapper — X11 has no clipboard, only selections, and a process that sets one
 //! must own `CLIPBOARD` and answer every `SelectionRequest` from every other
 //! client for as long as it holds it.
+//!
+//! On Linux Wayland, `arboard` tries the compositor's data-control protocol
+//! and falls back to its X11 backend when that protocol is not offered. On
+//! GNOME, whose Mutter compositor implements neither `wlr-data-control` nor
+//! `ext-data-control`, that fallback is what runs: it succeeds through
+//! Xwayland, which GNOME starts by default, so `open()` returns `Ok` there,
+//! not `Err(Unavailable)`. `Err(Unavailable)` is reached only where the
+//! fallback has nothing to fall back to — no Xwayland and no data-control
+//! protocol, as on a bare compositor or a headless session.
 
 use arboard::Clipboard as Arboard;
 

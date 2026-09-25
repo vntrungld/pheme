@@ -26,10 +26,12 @@ Out:
   second MIME type is a later addition to `pheme-clip`, not a redesign.
 - **Continuous clipboard monitoring.** The clipboard is read when the
   pointer crosses, never in the background (§3.1).
-- **GNOME Wayland clipboard.** Mutter implements neither
-  `wlr-data-control` nor `ext-data-control` and has declined to; there
-  is no other route for a window-less process (§3.3). Input and audio
-  are unaffected.
+- **A direct Wayland clipboard on GNOME.** Mutter implements neither
+  `wlr-data-control` nor `ext-data-control` and has declined to; `arboard`
+  falls back to X11 there instead, through Xwayland (§3.3). The clipboard
+  still works on a stock GNOME session; only a compositor with no
+  Xwayland and no data-control protocol has no route at all, and that is
+  where input and audio keep running with clipboard sharing off.
 - **Zero-configuration connection.** Discovery resolves the name the
   user configured. It never picks a server on its own (§5.3).
 
@@ -122,12 +124,22 @@ an event loop and a conversion table — roughly three hundred lines whose
 bugs appear only when a particular other application asks for a
 particular target.
 
-`open()` fails on GNOME Wayland, where no data-control protocol exists.
-That is a supported outcome: the failure is logged once at `warn` with
-the reason, the clipboard feature stays off for the process lifetime,
-and input and audio run untouched. The same path covers a headless
-session or a compositor that offers nothing at all, so there is one
-degraded mode, not several.
+GNOME Wayland has no data-control protocol, but `open()` still succeeds
+there: `arboard`'s Linux backend tries the Wayland data-control path when
+`WAYLAND_DISPLAY` is set, and when that fails — as it does on Mutter —
+it logs its own warning and falls back to its X11 backend, which
+succeeds on a stock GNOME session because Xwayland is running and
+`DISPLAY` is set. The clipboard this way is bridged by the compositor
+rather than owned directly, and, as on any X11 session, text this
+process set disappears when it exits unless a clipboard manager has
+taken it.
+
+`open()` fails only where neither route exists: a bare compositor with
+no Xwayland and no data-control protocol, or a headless session. That is
+a supported outcome: the failure is logged once at `warn` with the
+reason, the clipboard feature stays off for the process lifetime, and
+input and audio run untouched. The same path covers every compositor
+that offers nothing at all, so there is one degraded mode, not several.
 
 The `arboard` API is blocking, and on X11 it owns a selection, which
 ties it to the thread that created it. One dedicated OS thread therefore
@@ -407,7 +419,7 @@ Not on CI:
 | C3 | KDE Wayland server → Windows client, both directions | the text pastes both ways |
 | C4 | Unicode: emoji, Vietnamese diacritics, CRLF from a Windows editor | pastes unchanged, no mojibake |
 | C5 | A 1 MiB paste, then a 2 MiB one | the first crosses; the second is refused with a log line and input keeps working |
-| C6 | GNOME Wayland server | one `warn` at startup, clipboard silently inactive, input and audio normal |
+| C6 | GNOME Wayland server: copy on the server, cross, paste | the text pastes, via arboard's X11 fallback; the log shows arboard's own warning that the Wayland data-control path failed and it fell back to X11 |
 | C7 | Copy, cross, copy again on the far side, cross back | each side ends with what the other last copied; nothing bounces |
 | D1 | `pheme discover` with a server running | one row, correct name, address and fingerprint |
 | D2 | `connect = "<name>"`, then change the server's IP and restart it | the client reconnects without being restarted |
@@ -431,16 +443,21 @@ Not on CI:
   -- -D warnings` and `cargo test --workspace` are clean on Linux and
   Windows.
 - `README.md` states that the clipboard is text only, crosses with the
-  pointer, and does not work on GNOME Wayland.
+  pointer, and works on GNOME Wayland only through arboard's X11
+  fallback via Xwayland, with the compositor-bridged trade-offs that
+  implies.
 - `docs/testing.md` carries C1–C7 and D1–D4.
 - The architecture document's crate table no longer places clipboard
   sync in `pheme-core` (§3.6).
 
 ## 10. Known risks
 
-- **GNOME Wayland has no clipboard.** Accepted and documented. If Mutter
-  ever ships `ext-data-control`, `arboard` picks it up with no change
-  here.
+- **GNOME Wayland has no direct clipboard route, but `arboard` falls back
+  to X11 through Xwayland,** so the clipboard still works there today;
+  documented as a compositor-bridged mode with X11's own exit-loses-it
+  caveat, not as unsupported. If Mutter ever ships `ext-data-control`,
+  `arboard` picks it up with no change here. A compositor with neither
+  Xwayland nor a data-control protocol still lands in `Err(Unavailable)`.
 - **Windows Firewall blocks UDP 5353 by default for some profiles**, so
   `pheme discover` can come back empty on a machine that is otherwise
   working. `pheme setup` reports it; the fallback is an IP address,
@@ -451,9 +468,10 @@ Not on CI:
   reason.
 - **`wl-clipboard-rs` needs the compositor to offer a data-control
   protocol at the version it knows.** KWin and wlroots do today. A
-  compositor that offers neither lands in the same degraded mode as
-  GNOME, which is why that mode is a supported state rather than an
-  error path.
+  compositor that offers neither falls back to X11 through Xwayland when
+  Xwayland is present — the GNOME case — and only lands in the degraded,
+  clipboard-off mode when Xwayland is absent too, which is why that mode
+  is a supported state rather than an error path.
 - **Two machines with the same name** make `resolve` non-deterministic.
   `discover` warns; the fix is a unique `name`, and the config already
   requires one for the client list.

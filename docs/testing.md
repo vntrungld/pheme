@@ -184,7 +184,7 @@ backends and the real mDNS round trip are actually exercised (design §7).
 | C3 | KDE Wayland server → Windows client, both directions | the text pastes both ways |
 | C4 | Unicode: emoji, Vietnamese diacritics, CRLF from a Windows editor | pastes unchanged, no mojibake |
 | C5 | A 1 MiB paste, then a 2 MiB one | the first crosses; the second is refused with a log line and input keeps working |
-| C6 | GNOME Wayland server | one `warn` at startup, clipboard silently inactive, input and audio normal |
+| C6 | GNOME Wayland server: copy on the server, cross, paste | the text pastes, via arboard's X11 fallback; the log shows arboard's own warning that the Wayland data-control path failed and it fell back to X11 |
 | C7 | Copy, cross, copy again on the far side, cross back | each side ends with what the other last copied; nothing bounces |
 | D1 | `pheme discover` with a server running | one row, correct name, address and fingerprint |
 | D2 | `connect = "<name>"`, then change the server's IP and restart it | the client reconnects without being restarted |

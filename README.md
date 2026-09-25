@@ -249,13 +249,26 @@ Deskflow have made for years, not a bug to report. It also means nothing
 leaves a machine that you did not carry it to: something copied to paste
 locally stays local.
 
-**It does not work on GNOME Wayland.** Mutter implements neither
+**GNOME Wayland works, through Xwayland.** Mutter implements neither
 `wlr-data-control` nor `ext-data-control`, the two protocols a window-less
-process like pheme needs to reach the clipboard, and has declined to add
-either. There is simply no route to the clipboard on that compositor — it
-is not a Pheme bug and not something you can configure around. One `warn`
-line is logged at startup and clipboard sharing stays off for the session;
-keyboard, mouse and audio are unaffected there.
+process like pheme could use to reach the Wayland clipboard directly, and
+has declined to add either. `arboard`, the clipboard crate pheme uses,
+tries that Wayland path first and, when it fails, falls back to its X11
+backend — which succeeds on a stock GNOME session because Xwayland is
+running and `DISPLAY` is set. `arboard` logs its own warning when it takes
+this fallback, so that line in your logs is how you can tell the Xwayland
+route was used.
+
+The Xwayland route has a real cost worth knowing about: the clipboard is
+bridged by the compositor rather than owned directly, and, as on any X11
+session, text pheme put on the clipboard disappears when pheme exits
+unless a clipboard manager has taken it.
+
+A session with no Xwayland and no data-control protocol at all — a bare
+compositor, or a headless session — is where the clipboard is genuinely
+unreachable. There, opening the clipboard fails, clipboard sharing stays
+off for the process lifetime, and keyboard, mouse and audio are
+unaffected.
 
 Content over 1 MiB stays local: the transfer is refused with a log line,
 and nothing else stops working.
@@ -272,7 +285,9 @@ and nothing else stops working.
   **client** works under X11 or Wayland on any compositor (injection goes
   through uinput).
 - macOS support comes in a later sub-project.
-- The clipboard is text only, does not work on GNOME Wayland (see
+- The clipboard is text only, works on GNOME Wayland only through the
+  Xwayland fallback and is unreachable on a compositor or headless
+  session with neither Xwayland nor a data-control protocol (see
   "Clipboard" above), and syncs on the crossing, not on every copy.
 - A Windows client cannot receive the server's microphone: creating a recording
   device on Windows needs a signed kernel driver (VB-CABLE), which is deferred. A

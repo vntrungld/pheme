@@ -58,8 +58,10 @@ pub struct ServerDeps {
     pub mic: CaptureSource,
     /// Counters the mic packer thread publishes. `None` allocates a private set.
     pub mic_counters: Option<Arc<OutCounters>>,
-    /// The clipboard worker, or `None` where no clipboard is reachable — GNOME
-    /// Wayland, or a headless session. `None` disables clipboard sharing and
+    /// The clipboard worker, or `None` where no clipboard is reachable — a
+    /// compositor with neither a data-control protocol nor Xwayland, or a
+    /// headless session. (GNOME Wayland still gets a clipboard, through
+    /// arboard's Xwayland fallback.) `None` disables clipboard sharing and
     /// nothing else.
     pub clipboard: Option<ClipboardService>,
 }

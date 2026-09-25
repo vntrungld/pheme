@@ -40,9 +40,11 @@ impl ClipboardService {
     /// use of it. Taking a factory rather than a handle is what makes that true
     /// by construction — and it is also how a test injects a mock.
     ///
-    /// `None` is a supported state, not a failure: GNOME's Wayland compositor
-    /// implements no data-control protocol. Callers keep running without
-    /// clipboard sharing.
+    /// `None` is a supported state, not a failure: it is reached by a
+    /// compositor with neither a data-control protocol nor Xwayland (GNOME
+    /// itself still gets a clipboard, via `arboard`'s Xwayland fallback — see
+    /// `pheme_clip::open`) and by a headless session. Callers keep running
+    /// without clipboard sharing.
     ///
     /// Must be called from within a tokio runtime: it captures the current
     /// `Handle` via `Handle::current()`, which panics otherwise. It also
@@ -208,8 +210,10 @@ mod tests {
 
     #[tokio::test]
     async fn an_unavailable_clipboard_yields_no_service() {
-        // GNOME Wayland and a headless session both land here, and both must
-        // leave the rest of the program running.
+        // A bare compositor with no Xwayland and no data-control protocol, and
+        // a headless session, both land here, and both must leave the rest of
+        // the program running. (GNOME itself does not: arboard falls back to
+        // X11 through Xwayland there.)
         let s = ClipboardService::spawn(|| Err(ClipError::Unavailable("no display".into())));
         assert!(s.is_none());
     }
