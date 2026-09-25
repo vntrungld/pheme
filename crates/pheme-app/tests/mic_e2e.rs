@@ -215,6 +215,8 @@ fn spawn_server_instance(
             mic: CaptureSource::Backend(Box::new(mic_backend)),
             mic_counters: None,
             clipboard: None,
+            display: None,
+            display_input: None,
             ipc: None,
         },
         shutdown_tx.clone(),

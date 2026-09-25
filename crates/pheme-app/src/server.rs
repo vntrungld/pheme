@@ -18,6 +18,7 @@ use tracing::{debug, error, info, warn};
 use crate::audio::{CaptureSource, InStats, OutCounters, PlaybackSource, RecvSide, SendSide};
 use crate::clipboard::ClipboardService;
 use crate::config::{config_dir, Config, Role};
+use crate::display::DisplayService;
 use crate::ipc::{Command, CoreLink, LinkState, Status};
 
 /// How long shutdown waits for the router thread to notice that every `CaptureEvent`
@@ -66,6 +67,14 @@ pub struct ServerDeps {
     /// arboard's Xwayland fallback.) `None` disables clipboard sharing and
     /// nothing else.
     pub clipboard: Option<ClipboardService>,
+    /// The monitor worker, or `None` when `[display] input` is unset.
+    /// `None` disables input switching and nothing else.
+    pub display: Option<DisplayService>,
+    /// The VCP 0x60 value of the monitor input this machine is cabled to,
+    /// straight from `[display] input`. Told to the client in `HelloAck`,
+    /// and the target the recovery hotkey asks for while the pointer is
+    /// here. `None` when the feature is off.
+    pub display_input: Option<u16>,
     /// Report status to a front-end over this socket and take commands from
     /// it. `None` for every invocation a person types themselves; only
     /// `pheme` with no subcommand, supervising this as a child, sets it.
@@ -76,6 +85,11 @@ pub struct ServerDeps {
 #[derive(Clone)]
 struct Link {
     name: String,
+    /// The VCP 0x60 value the client says it is cabled to, from its
+    /// `Hello`. Kept here rather than in a `Mutex` on `Shared` because
+    /// `run_actions` already clones the link at its top, and a disconnect
+    /// clears this for free by replacing the whole `Link`.
+    display_input: Option<u16>,
     sender: PeerSender,
     control: mpsc::UnboundedSender<Msg>,
     /// The peer's own count of audio frames dropped because its audio channel was full.
@@ -98,6 +112,18 @@ struct Shared {
     audio: RecvSide,
     mic: SendSide,
     clipboard: Option<ClipboardService>,
+    /// The monitor worker, or `None` when `[display] input` is unset.
+    /// `None` disables input switching and nothing else.
+    ///
+    /// Owned here, and so kept alive by every `Arc<Shared>` -- including
+    /// the router thread's own clone. `DisplayService` has no shutdown:
+    /// dropping it disconnects the channel and its thread exits silently,
+    /// so anything shorter-lived than the router would turn switching off
+    /// mid-session with nothing in the log to say why.
+    display: Option<DisplayService>,
+    /// This machine's own `[display] input`, the hotkey's target while the
+    /// pointer is here.
+    display_input: Option<u16>,
     /// Set when an edge set could not be pushed to the backend because the core was
     /// remote, and cleared by the push that finally happens on the way back to local.
     /// Always locked *inside* `core`, never the other way round, so the "is the core
@@ -153,6 +179,15 @@ impl Shared {
                             if let Some(c) = &self.clipboard {
                                 c.send_to(l.sender.clone());
                             }
+                            // The picture crosses with the pointer. The
+                            // server is the displayed input right now, which
+                            // is the only moment its own DDC/CI command can
+                            // reach the monitor -- afterwards the monitor is
+                            // listening to the client's cable and would not
+                            // answer this machine at all.
+                            if let (Some(d), Some(v)) = (&self.display, l.display_input) {
+                                d.switch_to(v);
+                            }
                         }
                         let _ = l.control.send(m);
                         self.counters.control_sent.fetch_add(1, Ordering::Relaxed);
@@ -182,8 +217,32 @@ impl Shared {
                     // actively running.
                     self.publish_edges();
                 }
-                // Task 8 wires this to DisplayService and the peer.
-                Action::SwitchDisplay { .. } => {}
+                Action::SwitchDisplay { local } => {
+                    // The target is the input of whichever machine holds the
+                    // pointer, and both machines are asked for it. DDC/CI is
+                    // answered only by the input currently displayed, so the
+                    // one that is on screen succeeds and the other fails
+                    // harmlessly. Without the pair of them the hotkey could
+                    // never bring the screen back from a client, which is the
+                    // case it exists for.
+                    //
+                    // No lock is taken here: `local` comes from the core with
+                    // the action, and `link` was cloned at the top of this
+                    // function.
+                    let target = if local {
+                        self.display_input
+                    } else {
+                        link.as_ref().and_then(|l| l.display_input)
+                    };
+                    if let Some(v) = target {
+                        if let Some(d) = &self.display {
+                            d.force(v);
+                        }
+                        if let Some(l) = &link {
+                            let _ = l.control.send(Msg::SwitchDisplay { input: v });
+                        }
+                    }
+                }
             }
         }
     }
@@ -357,6 +416,8 @@ pub async fn run_server(
         mic,
         mic_counters,
         clipboard,
+        display,
+        display_input,
         ipc,
     } = deps;
     let audio_stats = audio_stats.unwrap_or_default();
@@ -386,6 +447,8 @@ pub async fn run_server(
         audio: audio_in,
         mic,
         clipboard,
+        display,
+        display_input,
         edges_deferred: Mutex::new(false),
     });
 
@@ -717,6 +780,16 @@ fn playback_frame(m: &Msg) -> Option<Frame> {
     }
 }
 
+/// Whether both machines claim the same monitor input.
+///
+/// A crossing then commands the monitor to the cable it is already on, so
+/// the picture never moves and nothing says why. It is the likeliest way
+/// to misconfigure this feature, because both ends are configured from the
+/// same instructions and the value is easy to copy across.
+fn display_input_conflict(ours: Option<u16>, theirs: Option<u16>) -> bool {
+    matches!((ours, theirs), (Some(a), Some(b)) if a == b)
+}
+
 /// Runs one client session to completion (disconnect or shutdown).
 async fn handle_peer(
     mut peer: Peer,
@@ -743,7 +816,7 @@ async fn handle_peer(
         os,
         screens,
         audio,
-        display_input: _,
+        display_input: client_display_input,
     }) = hello
     else {
         peer.close("expected Hello");
@@ -758,6 +831,15 @@ async fn handle_peer(
         peer.close("version mismatch");
         bail!("client {name} uses protocol {version}");
     }
+    if display_input_conflict(shared.display_input, client_display_input) {
+        warn!(
+            input = ?shared.display_input,
+            client = %name,
+            "this machine and the client claim the same monitor input; crossing the \
+             edge will command the monitor to the cable it is already on. Set \
+             display.input on each machine to the input that machine is cabled to."
+        );
+    }
     if name != peer.remote_name() {
         warn!(hello = %name, trusted = %peer.remote_name(), "client name differs from paired name; using paired name");
     }
@@ -767,7 +849,7 @@ async fn handle_peer(
             version: PROTOCOL_VERSION,
             name: server_name.to_string(),
             audio: AudioParams::DEFAULT,
-            display_input: None,
+            display_input: shared.display_input,
         })
         .await?;
     info!(client = %name, ?os, addr = %peer.remote_addr(), "client connected");
@@ -793,6 +875,7 @@ async fn handle_peer(
         }
         *link = Some(Link {
             name: name.clone(),
+            display_input: client_display_input,
             sender: peer.sender(),
             control: control_tx,
             audio_dropped: peer.audio_dropped_counter(),
@@ -821,6 +904,16 @@ async fn handle_peer(
                 Some(Msg::MicWanted { wanted }) => {
                     if audio_ok {
                         shared.mic.set_wanted(wanted);
+                    }
+                }
+                Some(Msg::SwitchDisplay { input }) => {
+                    // The client pressed the recovery hotkey and is asking
+                    // every machine to select its own input, because it
+                    // cannot know which one the monitor is listening to. A
+                    // server with no monitor control has `display` as `None`
+                    // and this is a no-op, which is the whole handling.
+                    if let Some(d) = &shared.display {
+                        d.force(input);
                     }
                 }
                 Some(other) => tracing::debug!(?other, "ignoring message from client"),
@@ -937,6 +1030,16 @@ pub async fn main(
         let _ = ctrlc_shutdown.send(true);
     });
     let clipboard = ClipboardService::spawn(pheme_clip::open);
+    // `monitor` is captured by the closure rather than read on the service
+    // thread through `cfg`, because `pheme_display::Monitor` is not `Send`
+    // and the handle has to be created where it is used.
+    let display = {
+        let monitor = cfg.display.monitor.clone();
+        DisplayService::spawn(
+            &cfg.display,
+            Box::new(move || pheme_display::open(monitor.as_deref())),
+        )
+    };
     run_server(
         ServerDeps {
             name: cfg.name.clone(),
@@ -951,6 +1054,8 @@ pub async fn main(
             mic: CaptureSource::Detect(cfg.audio.mic_device.clone()),
             mic_counters: None,
             clipboard,
+            display,
+            display_input: cfg.display.input,
             ipc,
         },
         shutdown_tx,
@@ -980,5 +1085,27 @@ mod tests {
             samples: vec![0; 960],
         })
         .is_none());
+    }
+
+    /// Review Focus 1: the likeliest misconfiguration. Both machines
+    /// declare the same input, so every crossing commands the monitor to
+    /// the cable it is already on and nothing ever visibly happens.
+    ///
+    /// The truth table is all this pins. It catches a comparison flipped to
+    /// `!=`, an answer hard-coded either way, and -- on the last line --
+    /// dropping the `Some`/`Some` restriction so that two machines with the
+    /// feature off are reported as clashing.
+    ///
+    /// What it does not pin is that the warning is ever emitted: deleting
+    /// the call site in `handle_peer` leaves this green. What catches that
+    /// is `dead_code` under CI's `-D warnings`, because the call site in
+    /// `handle_peer` is the only non-test caller.
+    #[test]
+    fn matching_display_inputs_are_reported() {
+        assert!(display_input_conflict(Some(0x11), Some(0x11)));
+        assert!(!display_input_conflict(Some(0x11), Some(0x0f)));
+        assert!(!display_input_conflict(None, Some(0x11)));
+        assert!(!display_input_conflict(Some(0x11), None));
+        assert!(!display_input_conflict(None, None));
     }
 }
