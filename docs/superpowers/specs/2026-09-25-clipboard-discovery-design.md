@@ -129,9 +129,13 @@ and input and audio run untouched. The same path covers a headless
 session or a compositor that offers nothing at all, so there is one
 degraded mode, not several.
 
-The `arboard` API is blocking. Every call runs on a blocking thread
-(`tokio::task::spawn_blocking`), never on the runtime, and never on the
-input path.
+The `arboard` API is blocking, and on X11 it owns a selection, which
+ties it to the thread that created it. One dedicated OS thread therefore
+owns the `Box<dyn Clipboard>` and the `ClipSync` for the process
+lifetime, and takes commands on a channel. Nothing clipboard-related
+ever runs on the tokio runtime or on the input path, and because one
+thread owns both the handle and the policy, two clipboard messages
+arriving at once cannot interleave.
 
 ### 3.4 Policy: `ClipSync`
 
@@ -173,6 +177,9 @@ the sender believed it had delivered. `pheme-net` already depends on
 // pheme-proto
 /// The largest clipboard payload Pheme sends or accepts, in bytes.
 pub const MAX_CLIP_BYTES: usize = 1024 * 1024;
+/// Room above `MAX_CLIP_BYTES` for the encoding around the payload: the
+/// enum tag, the MIME string and two length prefixes.
+pub const CLIP_FRAME_SLACK: usize = 256;
 ```
 
 `ClipSync` touches no OS and no network. It is the unit-tested core of
@@ -195,14 +202,18 @@ specifies, and this is why.
 
 `pheme-net/src/transport.rs` gains:
 
-- `PeerSender::send_clipboard(&self, m: &Msg)` — opens a uni-stream,
-  writes one frame, finishes, all in a spawned task. It never blocks the
-  caller and never fails the connection; an error is logged at `debug`.
+- `PeerSender::send_clipboard(&self, m: &Msg) -> Result<()>` — opens a
+  uni-stream, writes the encoded message, finishes. The stream boundary
+  *is* the message boundary: no length prefix, unlike the control
+  stream, because a stream that carries exactly one message needs no
+  framing. It is `async` rather than self-spawning because its caller is
+  an ordinary OS thread with no reactor of its own (§3.6); the caller
+  spawns, so nothing on the input path ever waits for it.
 - An `accept_uni` reader task in `Peer::new`, alongside the existing
-  control-stream and datagram readers. It reads the stream to its end
+  control-stream and datagram readers. It reads each stream to its end
   under a limit of `MAX_CLIP_BYTES + CLIP_FRAME_SLACK` bytes, where the
-  slack covers the postcard header, the MIME string and the length
-  prefix. A stream that reaches the limit is reset without being
+  slack covers the postcard enum tag, the MIME string and the byte-array
+  length. A stream that reaches the limit is dropped without being
   decoded; what fits is decoded as one `Msg` and forwarded on a new
   bounded channel.
 - `Peer::take_clipboard() -> mpsc::Receiver<Msg>`, matching the existing
