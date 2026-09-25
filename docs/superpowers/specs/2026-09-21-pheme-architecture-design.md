@@ -70,7 +70,7 @@ pheme/
 │   ├── pheme-audio/           AudioCapture / AudioPlayback / VirtualSource traits,
 │   │   └── src/{jitter,drift,pipewire,wasapi,mock}/
 │   ├── pheme-core/            ScreenLayout, ActiveScreen state machine,
-│   │                          shadow key state, clipboard sync — NO cfg(target_os)
+│   │                          shadow key state — NO cfg(target_os)
 │   └── pheme-app/             `pheme` binary: CLI, TOML config, tray + egui
 └── docs/
     ├── superpowers/specs/     per-sub-project specs

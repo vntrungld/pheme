@@ -170,3 +170,23 @@ delivers a global shortcut while an application holds an InputCapture
 grab is compositor-defined and can only be settled by running it. A
 failure here shows up as the lock ending up back where it started (or an
 extra toggle) instead of flipping exactly once.
+
+## Clipboard and discovery (sub-project 5)
+
+Neither of these runs on CI: no runner has a display, a compositor or
+reliable multicast, so this matrix is the only place the real clipboard
+backends and the real mDNS round trip are actually exercised (design §7).
+
+| ID | What | Pass |
+|---|---|---|
+| C1 | Linux X11 server → Windows client: copy on the server, cross, paste | the text pastes |
+| C2 | Windows server → Linux X11 client: copy on the client, cross back, paste on the server | the text pastes |
+| C3 | KDE Wayland server → Windows client, both directions | the text pastes both ways |
+| C4 | Unicode: emoji, Vietnamese diacritics, CRLF from a Windows editor | pastes unchanged, no mojibake |
+| C5 | A 1 MiB paste, then a 2 MiB one | the first crosses; the second is refused with a log line and input keeps working |
+| C6 | GNOME Wayland server | one `warn` at startup, clipboard silently inactive, input and audio normal |
+| C7 | Copy, cross, copy again on the far side, cross back | each side ends with what the other last copied; nothing bounces |
+| D1 | `pheme discover` with a server running | one row, correct name, address and fingerprint |
+| D2 | `connect = "<name>"`, then change the server's IP and restart it | the client reconnects without being restarted |
+| D3 | Two servers with the same name | `discover` lists both and warns |
+| D4 | Windows with the firewall at its default | `discover` finds the Linux server, or the firewall prompt appears and `pheme setup` explains it |

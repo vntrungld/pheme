@@ -29,6 +29,24 @@ Status: early development — see `docs/superpowers/specs/` for the design.
 
 `ScrollLock` toggles the input lock. `--stats` prints RTT and traffic counters.
 
+## Finding the server
+
+A server advertises itself on the local network by default, so a client can
+find it by name instead of by IP address. `pheme discover` lists what it can
+see:
+
+    pheme discover
+
+`connect` (in the config, or the `host` argument to `pheme client` and
+`pheme pair`) takes either a name or an address. A name is resolved again on
+every reconnect attempt, so a server that changes address, or restarts on a
+different port, is reachable again without restarting the client.
+
+Discovery uses mDNS on UDP port 5353. A firewall blocking that port makes
+`pheme discover` come back empty even though the server is running; the
+fallback is to put the server's address in `connect` directly. Set
+`discovery = false` in the server's config to turn advertising off.
+
 ## Wayland capture (server)
 
 A Linux **server** running under a Wayland session uses the
@@ -220,6 +238,28 @@ sudo pacman -S pipewire clang pkgconf
 sudo dnf install pipewire-devel clang pkgconf
 ```
 
+## Clipboard
+
+The clipboard is **text only** — no images, no files.
+
+It crosses **when the pointer crosses**, not when you copy. Copying
+something without switching machines leaves the other side with whatever
+it already had; that is a deliberate trade, the same one Synergy and
+Deskflow have made for years, not a bug to report. It also means nothing
+leaves a machine that you did not carry it to: something copied to paste
+locally stays local.
+
+**It does not work on GNOME Wayland.** Mutter implements neither
+`wlr-data-control` nor `ext-data-control`, the two protocols a window-less
+process like pheme needs to reach the clipboard, and has declined to add
+either. There is simply no route to the clipboard on that compositor — it
+is not a Pheme bug and not something you can configure around. One `warn`
+line is logged at startup and clipboard sharing stays off for the session;
+keyboard, mouse and audio are unaffected there.
+
+Content over 1 MiB stays local: the transfer is refused with a log line,
+and nothing else stops working.
+
 ## Limitations
 
 - One client at a time: the server serves a single client connection; another
@@ -231,8 +271,9 @@ sudo dnf install pipewire-devel clang pkgconf
   be a Wayland server, though they can still be a client. A Linux
   **client** works under X11 or Wayland on any compositor (injection goes
   through uinput).
-- macOS support comes in a later sub-project; clipboard forwarding is not
-  implemented yet.
+- macOS support comes in a later sub-project.
+- The clipboard is text only, does not work on GNOME Wayland (see
+  "Clipboard" above), and syncs on the crossing, not on every copy.
 - A Windows client cannot receive the server's microphone: creating a recording
   device on Windows needs a signed kernel driver (VB-CABLE), which is deferred. A
   Windows server's microphone reaching a Linux client works normally.
