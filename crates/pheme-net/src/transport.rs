@@ -107,6 +107,15 @@ fn transport_config() -> Arc<quinn::TransportConfig> {
     // silent to the application as the send-side eviction above.
     t.datagram_receive_buffer_size(Some(1024 * 1024));
     t.max_concurrent_bidi_streams(4u32.into());
+    // Quinn's default is 100 concurrent uni streams, and each accepted stream
+    // spawns a task that buffers up to `MAX_CLIP_BYTES + CLIP_FRAME_SLACK`
+    // bytes before it is decoded or dropped (see `accept_uni` below). Left at
+    // the default, one authenticated peer could hold ~100 MiB and 100 tasks
+    // on the runtime that also carries input. The clipboard only ever needs
+    // one stream open at a time -- a new crossing opens a new one after the
+    // last one finished -- so this matches the bidi cap above and bounds
+    // what a peer can make this side hold.
+    t.max_concurrent_uni_streams(4u32.into());
     Arc::new(t)
 }
 
