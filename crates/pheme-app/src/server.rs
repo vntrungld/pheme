@@ -280,6 +280,13 @@ impl LockHandle {
         };
         self.0.execute(actions);
     }
+
+    /// The lock's current value, for the one immediate `Status` sent right
+    /// when the IPC link connects -- before the first per-second tick would
+    /// otherwise report it.
+    fn locked(&self) -> bool {
+        self.0.core.lock().unwrap().locked()
+    }
 }
 
 /// Binds the lock hotkey through `org.freedesktop.portal.GlobalShortcuts` when this
@@ -484,6 +491,13 @@ pub async fn run_server(
                     );
                 }
                 if let Some(tx) = &status_tx {
+                    // Hoisted out of the literal below and not inlined there: inlined,
+                    // the `link` guard this produces would still be alive (the literal
+                    // is one statement) when the `core` lock is taken for `locked`
+                    // right after it, opening a link-then-core ordering this file
+                    // documents no other path taking. Ending it here first keeps the
+                    // two locks from ever being held together.
+                    let peer = s.link.lock().unwrap().as_ref().map(|l| l.name.clone());
                     let status = Status {
                         role: Role::Server,
                         state: if connected {
@@ -491,7 +505,7 @@ pub async fn run_server(
                         } else {
                             LinkState::Listening
                         },
-                        peer: s.link.lock().unwrap().as_ref().map(|l| l.name.clone()),
+                        peer,
                         rtt_us: 0,
                         locked: s.core.lock().unwrap().locked(),
                         events: now.0 - last.0,
@@ -516,6 +530,26 @@ pub async fn run_server(
     // device or a global keyboard hook.
     if let Some(path) = &ipc {
         let mut link = CoreLink::connect(&path.to_string_lossy()).await?;
+        // `Status`'s own doc comment promises one "once immediately on connect",
+        // ahead of the per-second ones above: nothing has accepted a client yet at
+        // this point in startup, so the front-end's first word is `Listening`
+        // rather than a blank window for however long the first tick takes.
+        let initial = Status {
+            role: Role::Server,
+            state: LinkState::Listening,
+            peer: None,
+            rtt_us: 0,
+            locked: lock_handle.locked(),
+            events: 0,
+            lost: 0,
+            audio_depth_ms: 0,
+            audio_lost: 0,
+            mic_depth_ms: 0,
+            mic_lost: 0,
+        };
+        if let Err(e) = link.send_status(&initial).await {
+            debug!("status send failed: {e}");
+        }
         let shutdown_tx = shutdown_tx.clone();
         let lock = lock_handle.clone();
         let mut status_rx = status_rx.expect("status channel exists whenever ipc does");

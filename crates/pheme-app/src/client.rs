@@ -85,6 +85,30 @@ struct SessionExtras<'a> {
     status_tx: Option<mpsc::Sender<Status>>,
 }
 
+/// Pushes a `Status` carrying only `state`, with every other field at its
+/// "nothing to report yet" value: there is no peer, no rtt and nothing
+/// counted until a session actually starts. Used by the reconnect loop, which
+/// has nothing else to report while it is resolving or connecting -- unlike
+/// `session`'s per-second tick, which has real figures to send alongside
+/// `Connected`.
+fn send_link_state(status_tx: &Option<mpsc::Sender<Status>>, state: LinkState) {
+    if let Some(tx) = status_tx {
+        let _ = tx.try_send(Status {
+            role: Role::Client,
+            state,
+            peer: None,
+            rtt_us: 0,
+            locked: false,
+            events: 0,
+            lost: 0,
+            audio_depth_ms: 0,
+            audio_lost: 0,
+            mic_depth_ms: 0,
+            mic_lost: 0,
+        });
+    }
+}
+
 fn apply(inject: &mut dyn InputInject, a: InjectAction) {
     let r = match a {
         InjectAction::MoveAbs { x, y } => inject.mouse_move_abs(x, y),
@@ -175,6 +199,27 @@ pub async fn run_client(
     // devices or an input-injection handle.
     if let Some(path) = &ipc {
         let mut link = CoreLink::connect(&path.to_string_lossy()).await?;
+        // `Status`'s own doc comment promises one "once immediately on connect",
+        // ahead of the per-second ones inside a session: the reconnect loop below
+        // sends its own `Connecting` at the top of every attempt, but that is a
+        // second event away if `target.resolve()` is slow, so the front-end's
+        // very first word does not wait on it.
+        let initial = Status {
+            role: Role::Client,
+            state: LinkState::Connecting,
+            peer: None,
+            rtt_us: 0,
+            locked: false,
+            events: 0,
+            lost: 0,
+            audio_depth_ms: 0,
+            audio_lost: 0,
+            mic_depth_ms: 0,
+            mic_lost: 0,
+        };
+        if let Err(e) = link.send_status(&initial).await {
+            debug!("status send failed: {e}");
+        }
         let shutdown_tx = shutdown_tx.clone();
         let mut status_rx = status_rx.expect("status channel exists whenever ipc does");
         tokio::spawn(async move {
@@ -216,6 +261,11 @@ pub async fn run_client(
         if *shutdown.borrow() {
             break;
         }
+        // Reported before the attempt is even made, not after it succeeds:
+        // this is the state a person meets first when the server has a typo
+        // in `connect`, hasn't started yet, or sits behind a firewall, and
+        // it is what distinguishes "retrying" from "hung" on the front-end.
+        send_link_state(&status_tx, LinkState::Connecting);
         let resolved = tokio::select! {
             r = target.resolve() => r,
             _ = shutdown.changed() => break,
@@ -252,15 +302,27 @@ pub async fn run_client(
                         backoff.note_connected_for(started.elapsed());
                     }
                     Err(NetError::Untrusted(reason)) => {
-                        warn!("connect to {server_addr} rejected: untrusted server ({reason})")
+                        let msg = format!(
+                            "connect to {server_addr} rejected: untrusted server ({reason})"
+                        );
+                        warn!("{msg}");
+                        send_link_state(&status_tx, LinkState::Failed(msg));
                     }
-                    Err(e) => debug!("connect to {server_addr} failed: {e}"),
+                    Err(e) => {
+                        let msg = format!("connect to {server_addr} failed: {e}");
+                        debug!("{msg}");
+                        send_link_state(&status_tx, LinkState::Failed(msg));
+                    }
                 }
             }
             // The target may simply not be up yet (a fresh DHCP lease, an mDNS
             // name whose owner hasn't announced yet): this waits out the same
             // backoff as a failed connection, below, rather than being fatal.
-            Err(e) => debug!("could not resolve {target:?}: {e}"),
+            Err(e) => {
+                let msg = format!("could not resolve {target:?}: {e}");
+                debug!("{msg}");
+                send_link_state(&status_tx, LinkState::Failed(msg));
+            }
         }
         if *shutdown.borrow() {
             break;
