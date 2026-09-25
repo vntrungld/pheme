@@ -378,6 +378,7 @@ async fn count_control_messages(
             version: PROTOCOL_VERSION,
             name: "server".into(),
             audio: AudioParams::DEFAULT,
+            display_input: None,
         })
         .await
         .unwrap();

@@ -369,6 +369,7 @@ async fn session(
             os: Os::current(),
             screens: screens.clone(),
             audio: AudioParams::DEFAULT,
+            display_input: None,
         })
         .await?;
     let ack = tokio::select! {
@@ -385,6 +386,7 @@ async fn session(
             version,
             name: server_name,
             audio: audio_params,
+            display_input: _,
         }) if version == PROTOCOL_VERSION => {
             info!(server = %server_name, addr = %peer.remote_addr(), "connected");
             if audio_params == AudioParams::DEFAULT {

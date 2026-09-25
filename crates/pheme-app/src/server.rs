@@ -741,6 +741,7 @@ async fn handle_peer(
         os,
         screens,
         audio,
+        display_input: _,
     }) = hello
     else {
         peer.close("expected Hello");
@@ -764,6 +765,7 @@ async fn handle_peer(
             version: PROTOCOL_VERSION,
             name: server_name.to_string(),
             audio: AudioParams::DEFAULT,
+            display_input: None,
         })
         .await?;
     info!(client = %name, ?os, addr = %peer.remote_addr(), "client connected");

@@ -33,6 +33,7 @@ fn hello(name: &str) -> Msg {
         os: Os::Linux,
         screens: vec![],
         audio: AudioParams::DEFAULT,
+        display_input: None,
     }
 }
 

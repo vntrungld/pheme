@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 /// released, so this costs nothing in practice; restructuring the handshake so the
 /// version survives an encoding change is not worth doing for a pre-release protocol.
 /// See §2.4 of the sub-project 3 spec.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// The largest clipboard payload Pheme sends or accepts, in bytes.
 ///
@@ -146,11 +146,21 @@ pub enum Msg {
         /// client's, so each end can refuse a format it does not understand instead of
         /// transmitting into one.
         audio: AudioParams,
+        /// The VCP 0x60 value of the monitor input this peer is cabled to, or
+        /// `None` when it has no monitor control configured. The peer switching
+        /// away from itself needs the *other* machine's value, so each end
+        /// declares its own here (sub-project 7 design section 6).
+        display_input: Option<u16>,
     },
     HelloAck {
         version: u16,
         name: String,
         audio: AudioParams,
+        /// The VCP 0x60 value of the monitor input this peer is cabled to, or
+        /// `None` when it has no monitor control configured. The peer switching
+        /// away from itself needs the *other* machine's value, so each end
+        /// declares its own here (sub-project 7 design section 6).
+        display_input: Option<u16>,
     },
     Bye {
         reason: String,
@@ -214,6 +224,16 @@ pub enum Msg {
         mime: String,
         data: Vec<u8>,
     },
+    /// Either direction: "if you are the input the monitor is showing,
+    /// select `input`".
+    ///
+    /// Sent by the recovery hotkey only, never on a crossing. DDC/CI is
+    /// answered only by the input currently displayed, so the machine that
+    /// wants the screen back cannot command the monitor itself; it asks the
+    /// machine that is on screen to do it, and both try.
+    SwitchDisplay {
+        input: u16,
+    },
 }
 
 impl Msg {
@@ -266,11 +286,13 @@ mod tests {
                 primary: true,
             }],
             audio: AudioParams::DEFAULT,
+            display_input: None,
         });
         roundtrip(Msg::HelloAck {
             version: 1,
             name: "lap".into(),
             audio: AudioParams::DEFAULT,
+            display_input: None,
         });
         roundtrip(Msg::Bye {
             reason: "bye".into(),
@@ -315,6 +337,7 @@ mod tests {
             mime: "text/plain".into(),
             data: b"hi".to_vec(),
         });
+        roundtrip(Msg::SwitchDisplay { input: 0x11 });
     }
 
     #[test]
@@ -417,6 +440,7 @@ mod tests {
             os: Os::Linux,
             screens: Vec::new(),
             audio: AudioParams::DEFAULT,
+            display_input: None,
         };
         let mut buf = Vec::new();
         encode(&m, &mut buf);
@@ -426,12 +450,53 @@ mod tests {
         }
     }
 
+    /// The guard that makes a wire change deliberate. postcard is not
+    /// self-describing, so an added field is a wire change: both ends
+    /// compare versions for equality and refuse a mismatch, which is the
+    /// correct outcome and means both machines upgrade together.
     #[test]
-    fn the_protocol_version_is_two() {
-        // Bumped when Hello gained `audio`. Note that a version-1 Hello now fails to
-        // decode before its `version` field can be read, so a mismatched peer reports a
-        // malformed handshake rather than a version mismatch.
-        assert_eq!(PROTOCOL_VERSION, 2);
+    fn protocol_version_is_pinned() {
+        assert_eq!(PROTOCOL_VERSION, 3);
+    }
+
+    /// Break it by typing `display_input` as `u16` rather than
+    /// `Option<u16>`: a peer with no monitor has no value to send, and 0 is
+    /// a legal VCP input value on some hardware.
+    #[test]
+    fn hello_carries_an_optional_display_input() {
+        for v in [None, Some(0x11u16)] {
+            let m = Msg::Hello {
+                version: PROTOCOL_VERSION,
+                name: "a".into(),
+                os: Os::Linux,
+                screens: Vec::new(),
+                audio: AudioParams::DEFAULT,
+                display_input: v,
+            };
+            let bytes = postcard::to_stdvec(&m).unwrap();
+            assert_eq!(postcard::from_bytes::<Msg>(&bytes).unwrap(), m);
+        }
+    }
+
+    #[test]
+    fn hello_ack_carries_an_optional_display_input() {
+        for v in [None, Some(0x0fu16)] {
+            let m = Msg::HelloAck {
+                version: PROTOCOL_VERSION,
+                name: "s".into(),
+                audio: AudioParams::DEFAULT,
+                display_input: v,
+            };
+            let bytes = postcard::to_stdvec(&m).unwrap();
+            assert_eq!(postcard::from_bytes::<Msg>(&bytes).unwrap(), m);
+        }
+    }
+
+    #[test]
+    fn switch_display_round_trips() {
+        let m = Msg::SwitchDisplay { input: 0x12 };
+        let bytes = postcard::to_stdvec(&m).unwrap();
+        assert_eq!(postcard::from_bytes::<Msg>(&bytes).unwrap(), m);
     }
 
     #[test]
