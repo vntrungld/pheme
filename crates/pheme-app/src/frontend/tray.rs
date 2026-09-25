@@ -86,10 +86,36 @@ impl Tray {
             );
             return None;
         }
-        match Self::build() {
-            Ok(tray) => Some(tray),
-            Err(err) => {
+        // `libappindicator-sys` `panic!()`s -- rather than returning an
+        // `Err` -- when it cannot `dlopen` either ayatana-appindicator3 or
+        // appindicator3's shared library: a tray host is on the bus (this
+        // runs after `tray_host_available` already said yes) but the
+        // library backing it is not installed. That is the ordinary case
+        // on KDE, XFCE or Cinnamon with GTK3 but not
+        // `libayatana-appindicator` installed. Left uncaught, that panic
+        // unwinds straight out of this function, through `frontend::run`,
+        // and out of `main` -- no `panic = "abort"` is set in any profile,
+        // so the unwind is real and catchable, but nothing above
+        // `Tray::new` ever gets the chance to degrade gracefully, and the
+        // whole application exits with nothing on screen at all. Design §5
+        // promises the opposite: one warning, then the window opens
+        // without a tray. `catch_unwind` is what makes that promise hold
+        // for this failure mode too, alongside the ordinary `Err` path
+        // below, which is left exactly as it was.
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(Self::build)) {
+            Ok(Ok(tray)) => Some(tray),
+            Ok(Err(err)) => {
                 warn!("could not create the tray icon, continuing without one: {err:#}");
+                None
+            }
+            Err(panic) => {
+                warn!(
+                    "the tray icon library panicked while creating the tray icon ({}); this \
+                     usually means the shared library it needs is not installed -- try \
+                     installing libayatana-appindicator3-1 (or, on some distributions, \
+                     libappindicator3-1) and restarting; continuing without a tray icon",
+                    panic_message(&*panic)
+                );
                 None
             }
         }
@@ -170,6 +196,23 @@ impl Tray {
     pub fn poll(&mut self) -> Option<TrayEvent> {
         let event = MenuEvent::receiver().try_recv().ok()?;
         event_for_id(event.id.as_ref())
+    }
+}
+
+/// Extracts a human-readable message from a `catch_unwind` payload.
+///
+/// A panic's payload is `Box<dyn Any + Send>`, and in practice is always
+/// either the `&'static str` a `panic!("literal")` produces or the `String`
+/// a `panic!("{}", ...)` produces -- both handled here. Anything else (a
+/// custom payload from `panic_any`) falls back to a fixed string rather
+/// than failing to log at all.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.as_str()
+    } else {
+        "no message (unknown panic payload type)"
     }
 }
 
@@ -368,6 +411,33 @@ mod tests {
         assert_eq!(event_for_id(ID_LOCK), Some(TrayEvent::ToggleLock));
         assert_eq!(event_for_id(ID_START_STOP), Some(TrayEvent::StartStop));
         assert_eq!(event_for_id(ID_QUIT), Some(TrayEvent::Quit));
+    }
+
+    /// FINDING 1: `Tray::new` catches a panic out of `Self::build()` the
+    /// same way `libappindicator-sys` actually panics -- with a `&'static
+    /// str` message from a `panic!("literal")` call, which is exactly what
+    /// its own source does. `panic_message` is the piece that turns
+    /// whatever `catch_unwind` caught into the text the warning logs, so
+    /// this pins it against both payload shapes `panic!` can produce
+    /// rather than trusting `catch_unwind` alone to prove the message
+    /// survives.
+    #[test]
+    fn panic_message_reads_both_str_and_string_payloads() {
+        // The default panic hook still prints to stderr even though this
+        // catches the unwind; suppressed here so a passing test run stays
+        // quiet about a panic that was, on purpose, always going to happen.
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+
+        let str_payload =
+            std::panic::catch_unwind(|| panic!("literal message")).expect_err("panics");
+        assert_eq!(panic_message(&*str_payload), "literal message");
+
+        let string_payload =
+            std::panic::catch_unwind(|| panic!("formatted {}", "message")).expect_err("panics");
+        assert_eq!(panic_message(&*string_payload), "formatted message");
+
+        std::panic::set_hook(previous_hook);
     }
 
     #[test]
