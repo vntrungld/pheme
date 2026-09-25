@@ -17,8 +17,12 @@ use tracing::{debug, warn};
 enum Cmd {
     /// Read the local clipboard and, if the policy allows, send it to this peer.
     SendTo(PeerSender),
-    /// Text that arrived from the peer.
-    Apply(String),
+    /// Bytes that arrived from the peer, already known to carry the
+    /// clipboard MIME type but not yet validated as UTF-8. That validation,
+    /// and the `String` allocation it produces, happen on this worker
+    /// thread rather than on the caller of `apply` -- which is the
+    /// client/server session loop that also dispatches `Key` and `Button`.
+    Apply(Vec<u8>),
 }
 
 /// A handle to the clipboard worker. Cheap to clone; every clone reaches the
@@ -116,11 +120,22 @@ impl ClipboardService {
                                 }
                             });
                         }
-                        Cmd::Apply(text) => {
-                            if !sync.incoming(&text) {
+                        Cmd::Apply(data) => {
+                            // Validated here, on the worker thread, and not on
+                            // the caller's: see the comment on `Cmd::Apply`.
+                            let text = match std::str::from_utf8(&data) {
+                                Ok(t) => t,
+                                // A peer sending bytes that are not text is
+                                // not a reason to stop.
+                                Err(e) => {
+                                    debug!("clipboard message was not valid UTF-8: {e}");
+                                    continue;
+                                }
+                            };
+                            if !sync.incoming(text) {
                                 continue;
                             }
-                            if let Err(e) = clip.set_text(&text) {
+                            if let Err(e) = clip.set_text(text) {
                                 // The policy already recorded this text as
                                 // exchanged, but the clipboard never received
                                 // it. Forget it, or the peer's natural retry —
@@ -169,7 +184,14 @@ impl ClipboardService {
 
     /// Applies a `Msg::Clipboard` that arrived from the peer. Anything else is
     /// ignored.
-    pub fn apply(&self, m: &Msg) {
+    ///
+    /// Only the MIME check runs here, on the caller's thread. UTF-8
+    /// validation of up to `MAX_CLIP_BYTES` and the `String` it produces are
+    /// real work -- roughly 0.2-0.4 ms once per crossing -- and the caller is
+    /// the client/server session loop that also dispatches `Key` and
+    /// `Button`, the path this project optimises before all others. Both
+    /// happen on the clipboard worker thread instead; see `Cmd::Apply`.
+    pub fn apply(&self, m: Msg) {
         let Msg::Clipboard { mime, data } = m else {
             return;
         };
@@ -177,14 +199,8 @@ impl ClipboardService {
             debug!(%mime, "clipboard message in a format pheme does not speak; ignored");
             return;
         }
-        match std::str::from_utf8(data) {
-            Ok(text) => {
-                if self.tx.send(Cmd::Apply(text.to_string())).is_err() {
-                    self.report_gone();
-                }
-            }
-            // A peer sending bytes that are not text is not a reason to stop.
-            Err(e) => debug!("clipboard message was not valid UTF-8: {e}"),
+        if self.tx.send(Cmd::Apply(data)).is_err() {
+            self.report_gone();
         }
     }
 }
@@ -222,7 +238,7 @@ mod tests {
     async fn an_incoming_message_reaches_the_clipboard() {
         let (clip, handle) = MockClipboard::new();
         let s = ClipboardService::spawn(move || Ok(Box::new(clip) as Box<dyn Clipboard>)).unwrap();
-        s.apply(&Msg::Clipboard {
+        s.apply(Msg::Clipboard {
             mime: CLIP_MIME.to_string(),
             data: b"xin ch\xc3\xa0o".to_vec(),
         });
@@ -233,13 +249,13 @@ mod tests {
     async fn a_message_that_is_not_utf8_is_ignored() {
         let (clip, handle) = MockClipboard::new();
         let s = ClipboardService::spawn(move || Ok(Box::new(clip) as Box<dyn Clipboard>)).unwrap();
-        s.apply(&Msg::Clipboard {
+        s.apply(Msg::Clipboard {
             mime: CLIP_MIME.to_string(),
             data: vec![0xff, 0xfe, 0xfd],
         });
         // Then something valid, to prove the service is still alive rather than
         // merely slow.
-        s.apply(&Msg::Clipboard {
+        s.apply(Msg::Clipboard {
             mime: CLIP_MIME.to_string(),
             data: b"after".to_vec(),
         });
@@ -251,11 +267,11 @@ mod tests {
     async fn a_message_in_an_unknown_format_is_ignored() {
         let (clip, handle) = MockClipboard::new();
         let s = ClipboardService::spawn(move || Ok(Box::new(clip) as Box<dyn Clipboard>)).unwrap();
-        s.apply(&Msg::Clipboard {
+        s.apply(Msg::Clipboard {
             mime: "image/png".to_string(),
             data: b"not text".to_vec(),
         });
-        s.apply(&Msg::Clipboard {
+        s.apply(Msg::Clipboard {
             mime: CLIP_MIME.to_string(),
             data: b"text".to_vec(),
         });
@@ -271,14 +287,14 @@ mod tests {
         let (clip, handle) = MockClipboard::new();
         let s = ClipboardService::spawn(move || Ok(Box::new(clip) as Box<dyn Clipboard>)).unwrap();
         handle.fail_with("the compositor went away");
-        s.apply(&Msg::Clipboard {
+        s.apply(Msg::Clipboard {
             mime: CLIP_MIME.to_string(),
             data: b"same text".to_vec(),
         });
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(handle.text(), None, "a failing backend stored something");
         handle.stop_failing();
-        s.apply(&Msg::Clipboard {
+        s.apply(Msg::Clipboard {
             mime: CLIP_MIME.to_string(),
             data: b"same text".to_vec(),
         });
@@ -293,7 +309,7 @@ mod tests {
         let (clip, handle) = MockClipboard::new();
         let s = ClipboardService::spawn(move || Ok(Box::new(clip) as Box<dyn Clipboard>)).unwrap();
         for _ in 0..3 {
-            s.apply(&Msg::Clipboard {
+            s.apply(Msg::Clipboard {
                 mime: CLIP_MIME.to_string(),
                 data: b"once".to_vec(),
             });

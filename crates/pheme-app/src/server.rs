@@ -669,7 +669,7 @@ async fn handle_peer(
             m = clip_rx.recv() => match m {
                 Some(m) => {
                     if let Some(c) = &shared.clipboard {
-                        c.apply(&m);
+                        c.apply(m);
                     }
                 }
                 None => break Ok(()),
