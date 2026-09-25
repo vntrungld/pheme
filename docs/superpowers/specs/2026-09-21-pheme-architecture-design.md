@@ -166,8 +166,12 @@ Each sub-project gets its own spec and plan, building on the previous one.
 4. **Wayland capture** — portal InputCapture + libei (GNOME/KDE),
    layer-shell (Hyprland/Sway).
 5. **Text clipboard + mDNS.**
-6. **Tray + egui config GUI**, Windows installer (Inno Setup), systemd
-   user unit, CI release.
+6. **Tray + egui config GUI**, front-end process supervising the core over
+   a local socket, audio device enumeration.
+7. **Display input switching** — DDC/CI on the monitor's VCP 0x60, so a
+   single monitor cabled to both machines follows the pointer.
+8. **Packaging** — Windows installer (Inno Setup), start with Windows,
+   systemd user unit, GTK/AppIndicator packaging notes, CI release.
 
 ## 10. Testing
 
