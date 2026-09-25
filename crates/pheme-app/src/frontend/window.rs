@@ -12,12 +12,14 @@
 //! rule that a restart must not leave the previous generation's peer or RTT
 //! on screen can be tested without a window at all.
 
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context as _;
 use eframe::egui;
 
-use crate::config::{Config, Role};
+use crate::config::{config_dir, Config, Role};
 use crate::ipc::{Command, LinkState};
 
 use super::{CoreState, Supervisor, Tray, TrayEvent};
@@ -64,6 +66,10 @@ pub fn run() -> anyhow::Result<()> {
         quitting: false,
         close_ineffective: false,
         action_error: None,
+        discovery: Arc::new(Mutex::new(DiscoveryState::Idle)),
+        selected_server: None,
+        pair_code: String::new(),
+        pairing: Arc::new(Mutex::new(PairingState::Idle)),
     };
 
     let viewport = egui::ViewportBuilder::default()
@@ -230,6 +236,22 @@ struct PhemeApp {
     /// The reason the tray's Start/Stop item last failed to do what it
     /// asked, if it did. Cleared at the start of every new attempt.
     action_error: Option<String>,
+    /// What the client pairing panel's "Discover servers" button last asked
+    /// for, or found. `browse` takes about three seconds and must never run
+    /// on the repaint thread, so the button spawns it on `handle` and this
+    /// cell is how the result comes back; drawn every frame, never awaited.
+    discovery: Arc<Mutex<DiscoveryState>>,
+    /// The server picked from the discovery list, by address. Its identity
+    /// beyond "the machine that answered at this address" is unproven until
+    /// pairing actually succeeds -- see the fingerprint note in
+    /// `draw_pairing_client`.
+    selected_server: Option<SocketAddr>,
+    /// The pairing code as typed into the client panel.
+    pair_code: String,
+    /// What the client pairing panel's "Pair" button last did. `client_pair`
+    /// talks to another machine, so like discovery this is filled by a
+    /// background task on `handle` rather than awaited here.
+    pairing: Arc<Mutex<PairingState>>,
 }
 
 impl eframe::App for PhemeApp {
@@ -309,24 +331,37 @@ impl eframe::App for PhemeApp {
         }
 
         let state = self.supervisor.state();
+        // Read from the held configuration, not `view.role`: that is `None`
+        // until the first `Status` arrives, which -- while pairing is in
+        // progress -- can be a while (see `spawn_generation`'s comment on
+        // why the code has to travel over stdout instead).
+        let role = self.supervisor.config().map(|c| c.role);
         self.view.apply(&state);
         if let Some(tray) = &mut self.tray {
             tray.set_state(&state);
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            if let Some(err) = &self.action_error {
-                ui.colored_label(egui::Color32::RED, err);
-                ui.separator();
-            }
-            if self.close_ineffective {
-                ui.colored_label(
-                    egui::Color32::YELLOW,
-                    "Pheme is still running. Use Quit in the tray to exit.",
-                );
-                ui.separator();
-            }
-            draw_status(ui, &self.view);
+            // The status grid plus the pairing panel below it can run past
+            // the window's fixed size (a client with the discovery list
+            // full, say); a scroll area keeps every control reachable
+            // instead of letting the bottom of the panel run off the
+            // window with no way back to it.
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                if let Some(err) = &self.action_error {
+                    ui.colored_label(egui::Color32::RED, err);
+                    ui.separator();
+                }
+                if self.close_ineffective {
+                    ui.colored_label(
+                        egui::Color32::YELLOW,
+                        "Pheme is still running. Use Quit in the tray to exit.",
+                    );
+                    ui.separator();
+                }
+                draw_status(ui, &self.view);
+                draw_pairing(ui, role, &state, self);
+            });
         });
 
         // The core pushes a `Status` at most once a second; this just needs
@@ -466,6 +501,230 @@ fn link_state_name(state: &LinkState) -> &'static str {
     }
 }
 
+/// What the client pairing panel's "Discover servers" button last asked for,
+/// or found. `pheme_net::discovery::browse` takes about three seconds;
+/// written from the background task `draw_pairing_client` spawns, and read
+/// back every frame -- never awaited on the repaint thread.
+#[derive(Debug, Clone)]
+enum DiscoveryState {
+    Idle,
+    Browsing,
+    Found(Vec<pheme_net::discovery::Found>),
+    Failed(String),
+}
+
+/// What the client pairing panel's "Pair" button last did. Filled by a
+/// background task the same way as [`DiscoveryState`]: `client_pair` also
+/// talks to another machine and must not block the repaint thread either.
+#[derive(Debug, Clone)]
+enum PairingState {
+    Idle,
+    Pairing,
+    Done(String),
+    Failed(String),
+}
+
+/// Draws the pairing panel for `role`, or nothing at all if there is no
+/// configuration yet (`role` is `None`) -- there is nothing to pair a role
+/// that has not been chosen. A server gets the button that restarts the
+/// core with `--pair` and the code it then prints; a client gets the mDNS
+/// list, a code field and the button that runs `client_pair` in this
+/// process.
+fn draw_pairing(ui: &mut egui::Ui, role: Option<Role>, core_state: &CoreState, app: &mut PhemeApp) {
+    let Some(role) = role else {
+        return;
+    };
+    ui.separator();
+    ui.heading("Pairing");
+    match role {
+        Role::Server => draw_pairing_server(ui, core_state, app),
+        Role::Client => draw_pairing_client(ui, app),
+    }
+}
+
+/// The server half of the pairing panel: a button that restarts the
+/// supervised core with `--pair`, and the code it prints once it has.
+fn draw_pairing_server(ui: &mut egui::Ui, core_state: &CoreState, app: &mut PhemeApp) {
+    if ui.button("Start pairing").clicked() {
+        app.action_error = None;
+        // Blocks only on the child spawning, not on the pairing exchange
+        // itself, which runs to completion inside that child process --
+        // the same pattern `TrayEvent::StartStop` already uses for `restart`.
+        if let Err(e) = app.handle.block_on(app.supervisor.restart_pairing()) {
+            app.action_error = Some(format!("could not start pairing: {e:#}"));
+        }
+    }
+    match (app.supervisor.pairing_code(), core_state) {
+        (Some(code), CoreState::Running(_)) => {
+            // The generation that printed this code has since connected
+            // over `--ipc` and is serving normally -- pairing ended one way
+            // or another, so the code on screen is stale, not live.
+            ui.label(format!(
+                "Last pairing code was {code}, now inactive. Click Start \
+                 pairing again for a new one."
+            ));
+        }
+        (Some(code), _) => {
+            ui.label(format!("Pairing code: {code}"));
+            ui.label(
+                "Enter this on the client's pairing panel (or run `pheme \
+                 pair <this host> <code>`). Valid for 120 seconds, for one \
+                 client.",
+            );
+        }
+        (None, _) => {
+            ui.label("Click Start pairing to get a code, then enter it on the client.");
+        }
+    }
+}
+
+/// The client half of the pairing panel: the mDNS discovery list, a code
+/// field, and the button that runs `client_pair` in this process.
+fn draw_pairing_client(ui: &mut egui::Ui, app: &mut PhemeApp) {
+    let browsing = matches!(
+        *app.discovery.lock().expect("discovery mutex poisoned"),
+        DiscoveryState::Browsing
+    );
+    if ui
+        .add_enabled(!browsing, egui::Button::new("Discover servers"))
+        .clicked()
+    {
+        start_discovery(app);
+    }
+
+    let snapshot = app
+        .discovery
+        .lock()
+        .expect("discovery mutex poisoned")
+        .clone();
+    match &snapshot {
+        DiscoveryState::Idle => {
+            ui.label("Click Discover servers to look for one on this network.");
+        }
+        DiscoveryState::Browsing => {
+            ui.label("Looking for servers (about 3 seconds)...");
+        }
+        DiscoveryState::Failed(e) => {
+            ui.colored_label(egui::Color32::RED, format!("Discovery failed: {e}"));
+        }
+        DiscoveryState::Found(found) if found.is_empty() => {
+            ui.label(
+                "No servers found. Make sure one is running, with discovery \
+                 on, on the same network.",
+            );
+        }
+        DiscoveryState::Found(found) => {
+            // The whole reason this line exists: a fingerprint published
+            // over mDNS is not proof of anything -- anyone on the network
+            // can advertise one. It is shown only so it can be compared by
+            // eye with what the server itself displays; trust comes from
+            // the pairing code below, never from this list.
+            ui.label(
+                "Fingerprints are advisory: compare the one below with what \
+                 the server shows, but trust comes from the pairing code, \
+                 never from this list.",
+            );
+            for f in found {
+                let selected = app.selected_server == Some(f.addr);
+                let label = format!(
+                    "{}   {}   fingerprint: {}",
+                    f.name,
+                    f.addr,
+                    f.fingerprint.as_deref().unwrap_or("(none advertised)")
+                );
+                if ui.selectable_label(selected, label).clicked() {
+                    app.selected_server = Some(f.addr);
+                }
+            }
+        }
+    }
+
+    ui.horizontal(|ui| {
+        ui.label("Code:");
+        ui.text_edit_singleline(&mut app.pair_code);
+    });
+
+    let pairing_snapshot = app.pairing.lock().expect("pairing mutex poisoned").clone();
+    let busy_pairing = matches!(pairing_snapshot, PairingState::Pairing);
+    let can_pair =
+        app.selected_server.is_some() && !app.pair_code.trim().is_empty() && !busy_pairing;
+    if ui
+        .add_enabled(can_pair, egui::Button::new("Pair"))
+        .clicked()
+    {
+        if let (Some(addr), Some(cfg)) = (app.selected_server, app.supervisor.config()) {
+            let code = app.pair_code.clone();
+            start_pairing(app, addr, cfg.name, code);
+        }
+    }
+
+    match pairing_snapshot {
+        PairingState::Idle => {}
+        PairingState::Pairing => {
+            ui.label("Pairing...");
+        }
+        PairingState::Done(name) => {
+            ui.colored_label(egui::Color32::GREEN, format!("Paired with {name}."));
+        }
+        PairingState::Failed(e) => {
+            ui.colored_label(egui::Color32::RED, format!("Pairing failed: {e}"));
+        }
+    }
+}
+
+/// Starts a background discovery browse, and marks the panel as looking.
+/// Split out from `draw_pairing_client` so the one rule that matters here --
+/// this call itself must return at once, with `browse` running on `handle`
+/// rather than blocking the caller -- can be exercised directly in a test,
+/// without needing to simulate a click through `egui`.
+fn start_discovery(app: &PhemeApp) {
+    *app.discovery.lock().expect("discovery mutex poisoned") = DiscoveryState::Browsing;
+    let discovery = app.discovery.clone();
+    // Never run on the repaint thread: `browse` takes about three seconds,
+    // and freezing the window for that long is exactly what the
+    // two-process design exists to avoid. `handle` is the front-end's own
+    // tokio runtime, driven independently of `update`.
+    app.handle.spawn(async move {
+        let result = pheme_net::discovery::browse(Duration::from_secs(3)).await;
+        *discovery.lock().expect("discovery mutex poisoned") = match result {
+            Ok(found) => DiscoveryState::Found(found),
+            Err(e) => DiscoveryState::Failed(e.to_string()),
+        };
+    });
+}
+
+/// Starts a background pairing attempt against `addr`, as the client
+/// identified by `name`. Split out from `draw_pairing_client` for the same
+/// reason as [`start_discovery`]: `client_pair` talks to another machine and
+/// must not block the caller either.
+fn start_pairing(app: &PhemeApp, addr: SocketAddr, name: String, code: String) {
+    *app.pairing.lock().expect("pairing mutex poisoned") = PairingState::Pairing;
+    let pairing = app.pairing.clone();
+    app.handle.spawn(async move {
+        let result = pair_with(&name, addr, &code).await;
+        *pairing.lock().expect("pairing mutex poisoned") = match result {
+            Ok(server_name) => PairingState::Done(server_name),
+            Err(e) => PairingState::Failed(format!("{e:#}")),
+        };
+    });
+}
+
+/// Pairs with the server at `addr` using `code`, as the client identified by
+/// `name`. The same three steps `pheme_app::client::pair` runs for the
+/// `pheme pair` subcommand, run here in the front-end process instead: it
+/// already links `pheme-net`, so nothing shells out to a second invocation
+/// of the binary. Always called from a spawned task (see [`start_pairing`]),
+/// never awaited directly from `update`.
+async fn pair_with(name: &str, addr: SocketAddr, code: &str) -> anyhow::Result<String> {
+    let dir = config_dir();
+    let identity = pheme_net::Identity::load_or_create(&dir, name)?;
+    let trust = pheme_net::TrustStore::load(&dir)?.shared();
+    let endpoint = pheme_net::Endpoint::pairing_client(&identity, trust.clone())?;
+    let server_name =
+        pheme_net::pairing::client_pair(&endpoint, addr, code.trim(), &identity, trust).await?;
+    Ok(server_name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -522,6 +781,97 @@ mod tests {
         assert_eq!(
             view.state,
             Some(LinkState::Failed("address already in use".into()))
+        );
+    }
+
+    /// A `PhemeApp` with a `Supervisor` that has nothing configured, so
+    /// `Supervisor::start` spawns no child at all -- `exe` is therefore
+    /// never actually run, and can be any path. Cheap enough to build in
+    /// every test below, and it keeps each one from having to repeat every
+    /// field this struct has gained since task 10.
+    async fn test_app() -> PhemeApp {
+        let supervisor = Supervisor::start(std::path::PathBuf::from("/nonexistent-pheme"), None)
+            .await
+            .expect("a Supervisor with no configuration spawns nothing");
+        PhemeApp {
+            handle: tokio::runtime::Handle::current(),
+            supervisor,
+            tray: None,
+            has_tray: false,
+            hiding_works: true,
+            view: StatusView::default(),
+            quitting: false,
+            close_ineffective: false,
+            action_error: None,
+            discovery: Arc::new(Mutex::new(DiscoveryState::Idle)),
+            selected_server: None,
+            pair_code: String::new(),
+            pairing: Arc::new(Mutex::new(PairingState::Idle)),
+        }
+    }
+
+    #[tokio::test]
+    async fn start_discovery_returns_before_browse_finishes() {
+        // Review Focus 1 (task 11 brief): `browse` takes about three
+        // seconds, and this call must never make the caller wait for it --
+        // the caller here stands in for the repaint thread `draw_pairing`
+        // is called from every frame.
+        let app = test_app().await;
+        let started = std::time::Instant::now();
+        start_discovery(&app);
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "start_discovery blocked its caller for {:?}; browse must run on \
+             a task, not whatever thread calls this",
+            started.elapsed()
+        );
+        assert!(matches!(
+            *app.discovery.lock().unwrap(),
+            DiscoveryState::Browsing
+        ));
+    }
+
+    /// Real mDNS multicast, and about three seconds long: not something CI
+    /// should pay for on every push. Run by hand:
+    /// `cargo test -p pheme-app --lib frontend::window::tests::discovery_finds_a_real_advertised_server -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn discovery_finds_a_real_advertised_server() {
+        let _advert = pheme_net::discovery::advertise(
+            "pheme-window-test-server",
+            24813,
+            "window-test-fingerprint",
+        )
+        .expect("advertise");
+
+        let app = test_app().await;
+        start_discovery(&app);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(6);
+        let found = loop {
+            {
+                let d = app.discovery.lock().unwrap();
+                match &*d {
+                    DiscoveryState::Found(found) => break found.clone(),
+                    DiscoveryState::Failed(e) => panic!("discovery failed: {e}"),
+                    _ => {}
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "discovery did not finish in time"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+
+        let server = found
+            .iter()
+            .find(|f| f.name == "pheme-window-test-server")
+            .expect("our own advertised server was not among those discovered");
+        assert_eq!(server.addr.port(), 24813);
+        assert_eq!(
+            server.fingerprint.as_deref(),
+            Some("window-test-fingerprint")
         );
     }
 }

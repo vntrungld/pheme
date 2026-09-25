@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 use tokio::process::{Child, Command as ProcessCommand};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -49,6 +49,10 @@ struct Generation {
     child_cmd_tx: mpsc::Sender<ChildCmd>,
     ipc_task: JoinHandle<()>,
     child_task: JoinHandle<()>,
+    /// The pairing code this generation's core printed on its stdout, once
+    /// it has. Always present but always `None` for a generation not spawned
+    /// with `--pair` -- see [`Supervisor::restart_pairing`].
+    pairing_code: Arc<Mutex<Option<String>>>,
 }
 
 /// A message the stop path sends to the task that owns the child.
@@ -80,13 +84,36 @@ impl Supervisor {
             state: Arc::new(Mutex::new(CoreState::NoConfig)),
             current: None,
         };
-        sup.spawn_current().await?;
+        sup.spawn_current(false).await?;
         Ok(sup)
     }
 
     /// The state as of the most recent report; never blocks on the child.
     pub fn state(&self) -> CoreState {
         self.state.lock().expect("state mutex poisoned").clone()
+    }
+
+    /// The configuration currently held -- the one behind the running (or
+    /// about to run) child. `None` before any configuration exists, which is
+    /// exactly when [`state`][Self::state] reads `CoreState::NoConfig`.
+    /// Read-only: changing it goes through
+    /// [`apply_config`][Self::apply_config], the only path that also writes
+    /// it to disk.
+    pub fn config(&self) -> Option<Config> {
+        self.cfg.clone()
+    }
+
+    /// The pairing code the current generation's core printed on its stdout,
+    /// once it has. `None` before it arrives, when the current generation
+    /// was not started with [`restart_pairing`][Self::restart_pairing], or
+    /// when nothing is running at all.
+    pub fn pairing_code(&self) -> Option<String> {
+        self.current.as_ref().and_then(|gen| {
+            gen.pairing_code
+                .lock()
+                .expect("pairing code mutex poisoned")
+                .clone()
+        })
     }
 
     /// Sends a command to the running child, if any. Silently dropped if
@@ -104,7 +131,7 @@ impl Supervisor {
         self.stop_current().await;
         cfg.save(path)?;
         self.cfg = Some(cfg);
-        self.spawn_current().await?;
+        self.spawn_current(false).await?;
         Ok(())
     }
 
@@ -121,7 +148,21 @@ impl Supervisor {
     /// configured, same as a fresh [`Supervisor::start`].
     pub async fn restart(&mut self) -> anyhow::Result<()> {
         self.stop_current().await;
-        self.spawn_current().await
+        self.spawn_current(false).await
+    }
+
+    /// Stops the child if one is running and starts it again with `--pair`:
+    /// the server core prints a pairing code and waits for one client
+    /// rather than serving normally. Same rule as
+    /// [`restart`][Self::restart] otherwise -- never touches disk, and
+    /// `NoConfig` if nothing has ever been configured.
+    ///
+    /// Meant for a server configuration; the client subcommand has no
+    /// `--pair` flag. Nothing here inspects `cfg.role` because nothing
+    /// needs to: the only caller is the pairing panel's server half.
+    pub async fn restart_pairing(&mut self) -> anyhow::Result<()> {
+        self.stop_current().await;
+        self.spawn_current(true).await
     }
 
     /// The child's process id while one is running.
@@ -130,13 +171,14 @@ impl Supervisor {
     }
 
     /// Spawns a child for the current configuration, or reports `NoConfig`
-    /// if there is none.
-    async fn spawn_current(&mut self) -> anyhow::Result<()> {
+    /// if there is none. `pair` adds `--pair` to the child's arguments --
+    /// see [`restart_pairing`][Self::restart_pairing].
+    async fn spawn_current(&mut self, pair: bool) -> anyhow::Result<()> {
         let Some(cfg) = self.cfg.clone() else {
             *self.state.lock().expect("state mutex poisoned") = CoreState::NoConfig;
             return Ok(());
         };
-        let gen = spawn_generation(&self.exe, &cfg, self.state.clone()).await?;
+        let gen = spawn_generation(&self.exe, &cfg, self.state.clone(), pair).await?;
         self.current = Some(gen);
         Ok(())
     }
@@ -165,11 +207,14 @@ impl Supervisor {
     }
 }
 
-/// Spawns one child and the two tasks that watch it.
+/// Spawns one child and the two tasks that watch it. `pair` adds `--pair`
+/// and, since that is the one case this process needs to read the child's
+/// stdout (see [`capture_pairing_code`]), pipes it instead of discarding it.
 async fn spawn_generation(
     exe: &Path,
     cfg: &Config,
     state: Arc<Mutex<CoreState>>,
+    pair: bool,
 ) -> anyhow::Result<Generation> {
     let listener = IpcListener::bind()
         .await
@@ -186,9 +231,12 @@ async fn spawn_generation(
         .arg("--ipc")
         .arg(&ipc_path)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(if pair { Stdio::piped() } else { Stdio::null() })
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    if pair {
+        command.arg("--pair");
+    }
     let mut child = command
         .spawn()
         .with_context(|| format!("spawning {}", exe.display()))?;
@@ -196,6 +244,15 @@ async fn spawn_generation(
         .id()
         .ok_or_else(|| anyhow::anyhow!("the child exited before it could be identified"))?;
 
+    // The pairing exchange runs to completion inside `pheme_app::server::main`
+    // *before* the child ever connects over `--ipc` -- so while pairing is in
+    // progress there is no `Status` this could ride on even if one had a
+    // field for it. Stdout is the only channel the code ever crosses on.
+    let pairing_code = if pair {
+        capture_pairing_code(&mut child)
+    } else {
+        Arc::new(Mutex::new(None))
+    };
     let stderr_rx = capture_stderr(&mut child);
 
     let (child_cmd_tx, child_cmd_rx) = mpsc::channel(1);
@@ -210,7 +267,30 @@ async fn spawn_generation(
         child_cmd_tx,
         ipc_task,
         child_task,
+        pairing_code,
     })
+}
+
+/// Drains the child's stdout in the background, watching for the one line
+/// `pheme server --pair` prints -- `"Pairing code: NNNNNN   (valid for ..."`
+/// -- and publishing just the code into the returned cell the moment it is
+/// seen. Keeps reading (and discarding) afterwards so a full pipe can never
+/// stall the child; nothing else it writes there matters to this process.
+fn capture_pairing_code(child: &mut Child) -> Arc<Mutex<Option<String>>> {
+    let code = Arc::new(Mutex::new(None));
+    let stdout = child.stdout.take().expect("stdout is piped while pairing");
+    let out = code.clone();
+    tokio::spawn(async move {
+        let mut lines = tokio::io::BufReader::new(stdout).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if let Some(rest) = line.strip_prefix("Pairing code: ") {
+                if let Some(word) = rest.split_whitespace().next() {
+                    *out.lock().expect("pairing code mutex poisoned") = Some(word.to_string());
+                }
+            }
+        }
+    });
+    code
 }
 
 /// Drains the child's stderr in the background and reports the whole of it

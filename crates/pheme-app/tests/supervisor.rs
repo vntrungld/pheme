@@ -63,6 +63,24 @@ fn stub_main(mode: &str) -> ! {
         let rt = tokio::runtime::Runtime::new().expect("stub tokio runtime");
         rt.block_on(run_stub_core(&ipc_path));
         std::process::exit(0);
+    } else if mode == "pair" {
+        // An honest-enough imitation of `pheme server --pair`: if (and only
+        // if) `--pair` is actually among its arguments -- proving
+        // `Supervisor::restart_pairing` really adds it -- it prints a code
+        // on stdout before doing anything else, exactly where
+        // `capture_pairing_code` looks for it. Then it behaves like
+        // "normal", the same way the real core moves on to `run_server`
+        // once `run_server_pairing` returns.
+        let ipc_path = ipc_path_from_argv();
+        if std::env::args().any(|a| a == "--pair") {
+            println!(
+                "Pairing code: 123456   (valid for 120 s, run `pheme pair \
+                 <this-host> 123456` on the client)"
+            );
+        }
+        let rt = tokio::runtime::Runtime::new().expect("stub tokio runtime");
+        rt.block_on(run_stub_core(&ipc_path));
+        std::process::exit(0);
     } else if let Some(rest) = mode.strip_prefix("exit-") {
         let code: i32 = rest.parse().unwrap_or(1);
         std::process::exit(code);
@@ -159,6 +177,10 @@ fn make_stub(suffix: &str) -> PathBuf {
 
 fn stub_exe() -> PathBuf {
     make_stub("normal")
+}
+
+fn stub_exe_that_pairs() -> PathBuf {
+    make_stub("pair")
 }
 
 fn stub_exe_that_exits(code: i32) -> PathBuf {
@@ -315,6 +337,47 @@ async fn restarting_with_no_configuration_is_a_harmless_no_op() {
     assert!(matches!(s.state(), CoreState::NoConfig));
     s.restart().await.unwrap();
     assert!(matches!(s.state(), CoreState::NoConfig));
+}
+
+#[tokio::test]
+async fn restart_pairing_adds_the_flag_and_captures_the_printed_code() {
+    // Task 11 brief, the server side: a button restarts the child with
+    // `--pair`, and the panel shows the code it prints. The first
+    // generation here is spawned without `--pair` (an ordinary `start`), so
+    // `pairing_code` has nothing to report until `restart_pairing` runs.
+    let mut s = Supervisor::start(stub_exe_that_pairs(), Some(server_config()))
+        .await
+        .unwrap();
+    wait_until(
+        || matches!(s.state(), CoreState::Running(_)),
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(
+        s.pairing_code(),
+        None,
+        "the first generation was never told to pair"
+    );
+
+    s.restart_pairing().await.unwrap();
+    assert!(
+        wait_until(|| s.pairing_code().is_some(), Duration::from_secs(5)).await,
+        "the pairing code never reached the supervisor"
+    );
+    assert_eq!(s.pairing_code().as_deref(), Some("123456"));
+
+    // The stub reaches its normal IPC handshake once it has "paired", the
+    // same as the real core moving on to `run_server` once
+    // `run_server_pairing` returns -- so the panel's status grid picks back
+    // up once pairing ends, exactly as it would after any other restart.
+    assert!(
+        wait_until(
+            || matches!(s.state(), CoreState::Running(_)),
+            Duration::from_secs(5)
+        )
+        .await,
+        "the child never reconnected after pairing"
+    );
 }
 
 #[tokio::test]
