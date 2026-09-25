@@ -590,12 +590,19 @@ mod tests {
         assert_eq!(identity_from_edid(&e).as_deref(), Some("GSM"));
     }
 
-    /// Break it by deleting the header check: a block of zeroes then parses
-    /// as a display named "@@@".
+    /// Break it by deleting the header check.
+    ///
+    /// The checksum is repaired after corrupting the header, and that is
+    /// the whole point of this test: without the repair, the corrupted byte
+    /// also invalidates the checksum, the checksum check refuses the block
+    /// on its own, and the header check can be deleted with the test still
+    /// green.
     #[test]
     fn a_bad_header_is_refused() {
         let mut e = edid_with([0x1E, 0x6D], &[(0xFC, b"X\n")]);
         e[1] = 0x00;
+        let sum: u8 = e[..127].iter().fold(0u8, |a, b| a.wrapping_add(*b));
+        e[127] = 0u8.wrapping_sub(sum);
         assert_eq!(identity_from_edid(&e), None);
     }
 
@@ -805,7 +812,7 @@ pub fn input_values_from_caps(caps: &str) -> Vec<u16> {
         return Vec::new();
     };
     let needle = format!("{INPUT_SELECT:02X}(");
-    let start = match find_ignore_case(&vcp, &needle) {
+    let start = match find_ignore_case(vcp, &needle) {
         Some(i) => i + needle.len(),
         None => return Vec::new(),
     };
