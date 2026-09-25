@@ -15,6 +15,7 @@ pheme-core = { workspace = true }
 pheme-input = { workspace = true }
 pheme-net = { workspace = true }
 pheme-clip = { workspace = true }
+pheme-display = { workspace = true }
 pheme-audio = { workspace = true }
 rtrb = { workspace = true }
 rubato = { workspace = true }

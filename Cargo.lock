@@ -3475,6 +3475,7 @@ dependencies = [
  "pheme-audio",
  "pheme-clip",
  "pheme-core",
+ "pheme-display",
  "pheme-input",
  "pheme-net",
  "pheme-proto",

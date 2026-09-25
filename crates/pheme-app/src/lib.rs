@@ -5,6 +5,7 @@ pub mod backoff;
 pub mod client;
 pub mod clipboard;
 pub mod config;
+pub mod display;
 pub mod frontend;
 pub mod ipc;
 pub mod server;
