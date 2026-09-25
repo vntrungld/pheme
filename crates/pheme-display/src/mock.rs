@@ -64,11 +64,13 @@ impl MockMonitorHandle {
 /// An `OpenFn` body that hands `mon` over the first time it is called and
 /// reports `NoMonitor` on every call after that.
 ///
-/// The service may try to open a monitor more than once -- it retries at
-/// the moment this machine becomes the displayed input -- so the closure it
-/// is given is `FnMut`, and a test that simply moved its mock out of the
-/// closure would not compile. This is the shape nearly every test wants:
-/// one monitor, handed over once.
+/// The service may try to open a monitor more than once -- it retries when
+/// a switch needs a handle and none is held, which is the pointer leaving
+/// that machine and so a moment when the monitor has been settled on it
+/// for the whole visit -- so the closure it is given is `FnMut`, and a
+/// test that simply moved its mock out of the closure would not compile.
+/// This is the shape nearly every test wants: one monitor, handed over
+/// once.
 pub fn opens_once(
     mon: MockMonitor,
 ) -> impl FnMut() -> Result<Box<dyn Monitor>, DisplayError> + Send {

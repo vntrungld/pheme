@@ -23,10 +23,14 @@ use crate::config::DisplayCfg;
 /// depends on what it captures, not on what it returns, so this stays
 /// `Send` even though `Monitor` is not.
 ///
-/// `FnMut`, not `FnOnce`: an open that found nothing is retried at the one
-/// instant its answer can have changed, which is when this machine becomes
-/// the input the monitor is displaying (see `Req::BecameDisplayed`).
-/// `pheme_display::mock::opens_once` is the shape a test wants.
+/// `FnMut`, not `FnOnce`: an open that found nothing is retried when a
+/// `Req::Switch` needs a handle and none is held -- the pointer leaving
+/// this machine, by which time it has been the displayed input for the
+/// whole visit and the monitor has long since settled. See
+/// `OPEN_ATTEMPTS` for why that instant and not the one where this
+/// machine *becomes* the displayed input, which catches the monitor
+/// mid-switch. `pheme_display::mock::opens_once` is the shape a test
+/// wants.
 pub type OpenFn = Box<dyn FnMut() -> Result<Box<dyn Monitor>, DisplayError> + Send>;
 
 enum Req {
@@ -326,8 +330,9 @@ fn open_monitor(
             warn!(
                 error = %e,
                 "display switching is off: no usable monitor. DDC/CI is answered only by \
-                 the input the monitor is showing, so this is retried if this machine \
-                 becomes that input"
+                 the input the monitor is showing, so this is tried again on the first \
+                 crossing that hands the pointer away from this machine, by which time \
+                 the monitor has had a whole visit to settle on it"
             );
             None
         }
