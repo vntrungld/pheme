@@ -236,6 +236,35 @@ async fn with_no_configuration_nothing_is_spawned() {
 }
 
 #[tokio::test]
+async fn a_freshly_spawned_child_reads_as_running_and_starting_not_no_config() {
+    // Finding 2 (final review): task 12 hit a panel that read "No
+    // configuration yet" and a tray Start/Stop item that still read
+    // "Start" immediately after a successful first Save -- while a child
+    // was, in fact, already running. `state()` must say `Running` with
+    // `LinkState::Starting` the moment `Supervisor::start` returns, not
+    // `NoConfig` and not a stale `Stopped` left over from before this
+    // generation existed. Checked with no intervening `.await`, on the
+    // default current-thread test runtime, so the IPC-accept task spawned
+    // inside `spawn_generation` cannot have run yet and raced this
+    // assertion with a real `Status`.
+    let s = Supervisor::start(stub_exe(), Some(server_config()))
+        .await
+        .unwrap();
+    match s.state() {
+        CoreState::Running(status) => {
+            assert_eq!(
+                status.state,
+                LinkState::Starting,
+                "a child that has not reported yet must read as Starting"
+            );
+        }
+        other => panic!(
+            "expected CoreState::Running(.. Starting ..) right after spawning, got {other:?}"
+        ),
+    }
+}
+
+#[tokio::test]
 async fn a_running_child_reports_status() {
     let s = Supervisor::start(stub_exe(), Some(server_config()))
         .await

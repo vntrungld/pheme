@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::config::{Config, Role};
-use crate::ipc::{Command, IpcListener, Status};
+use crate::ipc::{Command, IpcListener, LinkState, Status};
 
 /// How long [`Supervisor::shutdown`] and the stop half of
 /// [`Supervisor::apply_config`] wait for the child to exit on its own before
@@ -198,14 +198,51 @@ impl Supervisor {
     /// Spawns a child for the current configuration, or reports `NoConfig`
     /// if there is none. `pair` adds `--pair` to the child's arguments --
     /// see [`restart_pairing`][Self::restart_pairing].
+    ///
+    /// Publishes `CoreState::Running(Status { state: LinkState::Starting,
+    /// .. })` the moment a child exists, before the process is even
+    /// spawned -- never leaving `state` at whatever it read before this
+    /// call. Finding 2 from the final review: without this, `state` kept
+    /// reading `NoConfig` (on the very first run) or a stale `Stopped`
+    /// (on every restart after) for as long as it took the new generation
+    /// to connect over IPC and report a real `Status`. On Wayland that gap
+    /// can last as long as the InputCapture portal's permission dialog is
+    /// up -- effectively indefinite -- during which the panel told a
+    /// person who had just clicked Save "No configuration yet" and the
+    /// tray's Start/Stop item still read "Start" over a child that was, in
+    /// fact, already running: a Start/Stop click there called `restart()`
+    /// on a live child, killing it mid-dialog and raising a new one, with
+    /// no way out. `LinkState::Starting` is exactly the state the design
+    /// carries for "a child exists but has not reported yet"; nothing
+    /// before this emitted it.
+    ///
+    /// Set *before* `spawn_generation` runs, and not after: the tasks it
+    /// spawns can themselves publish a real `Status` (or `Stopped`, for a
+    /// child that fails immediately) the moment they get a turn on the
+    /// executor, and this placeholder must never be able to overwrite a
+    /// report that already arrived.
     async fn spawn_current(&mut self, pair: bool) -> anyhow::Result<()> {
         let Some(cfg) = self.cfg.clone() else {
             *self.state.lock().expect("state mutex poisoned") = CoreState::NoConfig;
             return Ok(());
         };
-        let gen = spawn_generation(&self.exe, &cfg, self.state.clone(), pair).await?;
-        self.current = Some(gen);
-        Ok(())
+        *self.state.lock().expect("state mutex poisoned") =
+            CoreState::Running(starting_status(cfg.role));
+        match spawn_generation(&self.exe, &cfg, self.state.clone(), pair).await {
+            Ok(gen) => {
+                self.current = Some(gen);
+                Ok(())
+            }
+            Err(e) => {
+                // The placeholder above must not survive a spawn that never
+                // happened -- a listener that could not bind, or a process
+                // that could not even start, is a stop, not a still-pending
+                // start.
+                *self.state.lock().expect("state mutex poisoned") =
+                    CoreState::Stopped(format!("could not start: {e:#}"));
+                Err(e)
+            }
+        }
     }
 
     /// Stops whatever is currently running, if anything, and waits for it to
@@ -406,6 +443,29 @@ async fn run_ipc(
                 }
             }
         }
+    }
+}
+
+/// The placeholder `Status` [`Supervisor::spawn_current`] publishes the
+/// moment a child has been asked to start, before it has connected over
+/// IPC or reported anything of its own -- `LinkState::Starting` is what
+/// makes this readable as "a child exists" rather than "nothing is
+/// happening", the distinction Finding 2 (final review) turned on.
+/// Everything else is the same "nothing measured yet" zero every other
+/// field already uses before a real report arrives.
+fn starting_status(role: Role) -> Status {
+    Status {
+        role,
+        state: LinkState::Starting,
+        peer: None,
+        rtt_us: 0,
+        locked: false,
+        events: 0,
+        lost: 0,
+        audio_depth_ms: 0,
+        audio_lost: 0,
+        mic_depth_ms: 0,
+        mic_lost: 0,
     }
 }
 
