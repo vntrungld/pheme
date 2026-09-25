@@ -497,7 +497,25 @@ pub async fn run_server(
                     // right after it, opening a link-then-core ordering this file
                     // documents no other path taking. Ending it here first keeps the
                     // two locks from ever being held together.
-                    let peer = s.link.lock().unwrap().as_ref().map(|l| l.name.clone());
+                    //
+                    // `rtt_us` rides along with `peer` for the same reason: both come
+                    // from the same `link` guard, and FINDING 4 (final review) is
+                    // exactly this -- a server that hard-coded `rtt_us: 0` and rendered
+                    // it as a confident "RTT 0.0 ms" forever. Unlike `lost` or the
+                    // audio/mic pairs, RTT is not role-asymmetric: QUIC tracks it the
+                    // same way from either end, so `PeerSender::rtt()` (a live read off
+                    // the connection, no bookkeeping of our own) gives the server a
+                    // real figure instead of a label -- there is nothing here it
+                    // wouldn't have measured itself.
+                    let (peer, rtt_us) = {
+                        let link = s.link.lock().unwrap();
+                        (
+                            link.as_ref().map(|l| l.name.clone()),
+                            link.as_ref()
+                                .map(|l| l.sender.rtt().as_micros() as u64)
+                                .unwrap_or(0),
+                        )
+                    };
                     let status = Status {
                         role: Role::Server,
                         state: if connected {
@@ -506,7 +524,7 @@ pub async fn run_server(
                             LinkState::Listening
                         },
                         peer,
-                        rtt_us: 0,
+                        rtt_us,
                         locked: s.core.lock().unwrap().locked(),
                         events: now.0 - last.0,
                         // Only the client can count a gap in the other end's

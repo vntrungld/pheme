@@ -401,6 +401,17 @@ impl PeerSender {
         }
     }
 
+    /// The connection's current round-trip time estimate, live from QUIC's
+    /// own tracking -- the same figure [`Peer::rtt`] reads, exposed here
+    /// too because a `Link` (the server's record of its one client) holds
+    /// a cloned `PeerSender`, not a borrow of the `Peer` itself, once the
+    /// per-connection task that owns it has moved on. No polling or
+    /// bookkeeping of our own: `Connection::rtt()` is synchronous and
+    /// already up to date on every call.
+    pub fn rtt(&self) -> Duration {
+        self.conn.rtt()
+    }
+
     /// Sends one clipboard message on a unidirectional stream of its own.
     ///
     /// Never the control stream. A one-megabyte payload written there would hold
