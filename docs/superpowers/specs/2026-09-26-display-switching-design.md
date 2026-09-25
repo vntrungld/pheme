@@ -540,6 +540,7 @@ cabled to both machines.
 | E7 | Run with `display.input` set on a machine whose monitor ignores DDC/CI | one warning at startup, nothing later, input and audio unaffected |
 | E8 | Remove `[display]`, cross the edge | no DDC traffic, no warning, everything else unchanged |
 | E9 | Unplug the monitor's second cable and cross the edge | the failed command warns once and does not repeat on later crossings |
+| E10 | Give both machines the same `display.input` and connect | the "same monitor input" warning appears on the server |
 
 ## 14. Definition of done
 
@@ -564,7 +565,7 @@ cabled to both machines.
 - **The monitor may not answer at all.** Proven on the development
   machine, where `ddcutil` and `ddc-i2c` fail identically. §7 makes this
   ordinary rather than fatal, but it means the automated tests can never
-  tell us the feature works — E1–E9 are the only evidence there will be.
+  tell us the feature works — E1–E10 are the only evidence there will be.
 - **Input values are vendor-specific.** MCCS assigns 0x0F to DisplayPort-1
   and 0x11 to HDMI-1, and vendors disregard it freely. Hence `pheme
   displays`, hence a raw number in the config rather than a friendly name.
