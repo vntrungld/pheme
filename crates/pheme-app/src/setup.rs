@@ -43,12 +43,17 @@ pub fn run() -> anyhow::Result<()> {
         .with_context(|| format!("writing {}", rule_path.display()))?;
     println!("Wrote {}", rule_path.display());
     let mut ok = true;
-    // Load the module before touching udev. `udevadm trigger --name-match=uinput`
-    // resolves the name through sysfs, so on a machine where uinput has never been
-    // loaded there is no /sys/devices/virtual/misc/uinput to match and the trigger
-    // fails with "Failed to open the device 'uinput': Invalid argument" — which is
-    // exactly the machine this command exists to set up.
+    // Load the modules before touching udev. `udevadm trigger` resolves its
+    // matches through sysfs, so on a machine where a module has never been
+    // loaded there is nothing there yet to match, and the trigger for it
+    // either fails outright (uinput: "Failed to open the device 'uinput':
+    // Invalid argument") or, worse, silently matches nothing (i2c-dev: the
+    // rule's `KERNEL=="i2c-[0-9]*"` has no /dev/i2c-* nodes to apply to
+    // until the module creates them) -- which is exactly the machine this
+    // command exists to set up, and exactly the machine `pheme displays`
+    // would otherwise still find nothing on afterwards.
     ok &= run_step("modprobe uinput", Command::new("modprobe").arg("uinput"));
+    ok &= run_step("modprobe i2c-dev", Command::new("modprobe").arg("i2c-dev"));
     ok &= run_step(
         "udevadm control --reload",
         Command::new("udevadm").args(["control", "--reload"]),
@@ -57,11 +62,27 @@ pub fn run() -> anyhow::Result<()> {
         "udevadm trigger --name-match=uinput",
         Command::new("udevadm").args(["trigger", "--name-match=uinput"]),
     );
+    // uinput is one device matched by /dev name; the i2c buses are a whole
+    // subsystem (i2c-0, i2c-1, ...) whose count and names vary by machine,
+    // so they are matched by subsystem rather than by name. `SUBSYSTEM==
+    // "i2c-dev"` is exactly what the i2c-dev module tags the bus character
+    // devices with (confirmed against /sys/class/i2c-dev on this machine),
+    // so it re-triggers precisely the nodes the new udev rule applies to,
+    // without also matching i2c adapters or muxes that carry no character
+    // device at all.
+    ok &= run_step(
+        "udevadm trigger --subsystem-match=i2c-dev",
+        Command::new("udevadm").args(["trigger", "--subsystem-match=i2c-dev"]),
+    );
     match std::fs::write(modules_path, MODULES_LOAD) {
-        Ok(()) => println!("Wrote {} (uinput loads at boot)", modules_path.display()),
+        Ok(()) => println!(
+            "Wrote {} (uinput and i2c-dev load at boot)",
+            modules_path.display()
+        ),
         Err(e) => {
             eprintln!(
-                "warning: writing {} failed: {e}; uinput will need `modprobe uinput` after each boot",
+                "warning: writing {} failed: {e}; uinput and i2c-dev will need \
+                 `modprobe uinput` / `modprobe i2c-dev` after each boot",
                 modules_path.display()
             );
             ok = false;
@@ -91,6 +112,18 @@ pub fn run() -> anyhow::Result<()> {
             "Setup finished with warnings (see above); reboot or reload udev manually if /dev/uinput stays inaccessible."
         );
     }
+    // Unlike `input` above, `pheme setup` does not add the user to `i2c`
+    // itself -- it only prints the command. The two groups are handled
+    // differently on purpose, not by oversight: `input` is required for
+    // pheme to work at all (no virtual keyboard or mouse without it), so
+    // adding it automatically is the price of the program running at all.
+    // `i2c` grants raw access to every I2C bus on the machine, not just
+    // the ones behind a monitor, for a feature that is optional and that
+    // many monitors do not even support. The udev rule's `TAG+="uaccess"`
+    // already covers the logged-in user on most systems without any group
+    // change, so this is a fallback for systems where it does not, not the
+    // primary mechanism -- and enabling it is the person's call, not
+    // this command's.
     println!(
         "If DDC/CI still fails, add yourself to the i2c group and log in again:\n  \
          usermod -aG i2c {user}"
