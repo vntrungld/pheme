@@ -67,6 +67,8 @@ enum Cmd {
         #[arg(long, default_value_t = 3)]
         timeout: u64,
     },
+    /// List the audio devices this machine offers
+    Devices,
 }
 
 fn init_logging(verbose: u8) {
@@ -175,6 +177,27 @@ async fn main() -> anyhow::Result<()> {
                     );
                     break;
                 }
+            }
+            Ok(())
+        }
+        Cmd::Devices => {
+            let devices = pheme_audio::devices::list_devices()?;
+            if devices.is_empty() {
+                println!("No audio devices found.");
+                return Ok(());
+            }
+            println!("{:<10} {:<40} DEFAULT", "KIND", "NAME");
+            for d in &devices {
+                let kind = match d.kind {
+                    pheme_audio::devices::DeviceKind::Playback => "playback",
+                    pheme_audio::devices::DeviceKind::Capture => "capture",
+                };
+                println!(
+                    "{:<10} {:<40} {}",
+                    kind,
+                    d.name,
+                    if d.is_default { "*" } else { "" }
+                );
             }
             Ok(())
         }
