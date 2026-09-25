@@ -36,6 +36,8 @@
   ```
   This type-checks. It does not prove behaviour: anything Windows-specific belongs in the manual matrix, not in a claim of correctness.
 
+  **It only works for `pheme-audio` and `pheme-input`.** For `pheme-app` and `pheme-net` it fails before reaching any of this plan's code: they depend on `ring` through `quinn`, whose build needs `x86_64-w64-mingw32-gcc`, which is not installed on this machine and cannot be installed from inside a task. Verified against plain `master` with no changes applied, so it is the environment and not anything written here. For `pheme-app`'s Windows arms — the named pipe, and anything later tasks add — **CI's `windows-latest` job is the only compile check there is**. State that in the report rather than substituting a check that proves less and reads like it proves the same.
+
 ## Review Focus
 
 Five things the spec implies, that a person will meet, and that no happy-path test would catch. Each has a test in the task that owns the code.
