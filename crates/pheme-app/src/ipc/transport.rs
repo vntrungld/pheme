@@ -153,6 +153,7 @@ impl CoreLink {
 #[cfg(unix)]
 mod platform {
     use std::io;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
     use tokio::net::{UnixListener, UnixStream};
@@ -195,6 +196,20 @@ mod platform {
         pub(super) fn bind_at(path: &std::path::Path) -> Result<Self, IpcError> {
             if let Some(dir) = path.parent() {
                 std::fs::create_dir_all(dir)?;
+                // FINDING 7 (final review, security-adjacent): with no
+                // `XDG_RUNTIME_DIR`, this directory is `/tmp/pheme`, shared
+                // by every user on the machine. Left at the default 0755,
+                // another local user can create the front-end's listener
+                // path first (or simply watch this one appear) and accept
+                // the connection the real core was meant to make, handing
+                // that other user the front-end's `Lock`, `Unlock` and
+                // `Stop` commands while the real core's own connection is
+                // never accepted. 0700 makes the directory reachable only
+                // by the user who owns it, closing that off -- applied
+                // unconditionally, not only on first creation, so a
+                // directory a previous, unpatched run already made at 0755
+                // is tightened the next time anything binds under it too.
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
             }
             match std::fs::remove_file(path) {
                 Ok(()) => {}
@@ -335,6 +350,32 @@ mod tests {
             listener.is_ok(),
             "a stale file at the target path should not block bind_at: {:?}",
             listener.err()
+        );
+    }
+
+    /// FINDING 7 (final review, security-adjacent): the directory a socket
+    /// is created under must be reachable only by the user who owns it, so
+    /// another local user cannot get there first and receive `Lock`,
+    /// `Unlock` and `Stop` commands meant for the real core. Uses a
+    /// sub-directory `bind_at` has to create itself -- not the tempdir
+    /// `tempfile` already made at 0700 on its own -- so this actually
+    /// exercises the `create_dir_all` + `set_permissions` path rather than
+    /// merely observing a permission this test's own fixture happened to
+    /// set.
+    #[tokio::test]
+    async fn the_socket_directory_is_created_user_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("pheme_sockets");
+        let path = dir.join("test.sock");
+
+        let _listener = IpcListener::bind_at(&path).expect("bind_at");
+
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "the socket directory must be created at 0700, not the default 0755"
         );
     }
 }
