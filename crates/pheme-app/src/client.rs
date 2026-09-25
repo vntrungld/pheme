@@ -423,9 +423,39 @@ pub async fn run_client(
                             Ok(()) => info!("disconnected from server"),
                             Err(e) => warn!("session ended: {e}"),
                         }
-                        // However that session ended, there is no peer to
-                        // ask any more and the pointer is not here.
+                        // A link that died while the pointer was on this
+                        // machine strands the picture. The server's core
+                        // returns to local the moment the connection drops,
+                        // and the server cannot command the monitor -- it
+                        // is not the input being displayed, this machine is
+                        // (design section 2). So this is the last moment
+                        // the picture can follow the pointer back, and
+                        // nothing else in the program is in a position to
+                        // do it.
+                        //
+                        // Two endings are deliberately excluded. Our own
+                        // shutdown, tested here: the person quit pheme on
+                        // the machine they are looking at, and moving their
+                        // picture to the other one on the way out is not
+                        // what they asked for. And `Msg::Bye`, which clears
+                        // `pointer_here` in its own arm for the reason
+                        // recorded there: it means the server is going down
+                        // or its capture failed, and switching to an input
+                        // that is about to lose its signal is worse than
+                        // staying.
+                        let stranded =
+                            switch.pointer_here.load(Ordering::Relaxed) && !*shutdown.borrow();
                         switch.session_ended();
+                        if stranded {
+                            let server_input = *switch.server_input.lock().unwrap();
+                            if let (Some(d), Some(v)) = (&display, server_input) {
+                                info!(
+                                    "the link dropped while the pointer was here; \
+                                       switching the monitor back to the server"
+                                );
+                                d.switch_to(v);
+                            }
+                        }
                         backoff.note_connected_for(started.elapsed());
                     }
                     Err(NetError::Untrusted(reason)) => {

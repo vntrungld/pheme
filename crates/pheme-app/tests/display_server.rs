@@ -21,6 +21,7 @@ use pheme_app::display::DisplayService;
 use pheme_app::server::{run_server, ServerDeps};
 use pheme_core::{CaptureEvent, ClientPlacement, Hotkeys, Side};
 use pheme_display::mock::{opens_once, MockMonitor, MockMonitorHandle};
+use pheme_display::Monitor;
 use pheme_input::mock::{MockCapture, MockCaptureHandle};
 use pheme_input::CaptureMode;
 use pheme_net::{Endpoint, Identity, Peer, TrustStore};
@@ -65,9 +66,14 @@ struct Rig {
     cap: MockCaptureHandle,
     mon: MockMonitorHandle,
     /// Held, not dropped: dropping it closes the connection and the server
-    /// would tear the session down underneath the test.
-    _peer: Peer,
+    /// would tear the session down underneath the test. `Option` so a test
+    /// about a *dropped* link can take it out.
+    peer: Option<Peer>,
     rx: mpsc::Receiver<Msg>,
+    /// Kept so a test can connect a second stand-in client after the first
+    /// one has gone.
+    client_ep: Endpoint,
+    server_addr: std::net::SocketAddr,
 }
 
 impl Rig {
@@ -168,9 +174,39 @@ async fn spawn_rig() -> Rig {
         shutdown_tx,
         cap,
         mon,
-        _peer: peer,
+        peer: Some(peer),
         rx,
+        client_ep,
+        server_addr,
     }
+}
+
+/// Connects another stand-in client under the same name and completes the
+/// handshake, as a client that reconnects after a dropped link does.
+async fn reconnect(rig: &mut Rig) {
+    let mut peer = rig
+        .client_ep
+        .connect(rig.server_addr)
+        .await
+        .expect("reconnecting to the server");
+    let mut rx = peer.take_incoming();
+    peer.sender()
+        .send_control(&Msg::Hello {
+            version: PROTOCOL_VERSION,
+            name: "lap".into(),
+            os: Os::Linux,
+            screens: screens(1000, 500),
+            audio: AudioParams::DEFAULT,
+            display_input: Some(CLIENT_INPUT),
+        })
+        .await
+        .expect("sending Hello");
+    match rx.recv().await {
+        Some(Msg::HelloAck { .. }) => {}
+        other => panic!("expected HelloAck, got {other:?}"),
+    }
+    rig.peer = Some(peer);
+    rig.rx = rx;
 }
 
 /// Pushes right-edge crossings until the core accepts one, which is also how
@@ -304,7 +340,9 @@ async fn the_recovery_hotkey_asks_both_machines() {
 async fn a_switch_display_from_the_client_reaches_the_monitor() {
     let rig = spawn_rig().await;
     assert_eq!(rig.mon.input(), SERVER_INPUT);
-    rig._peer
+    rig.peer
+        .as_ref()
+        .expect("the stand-in client is connected")
         .sender()
         .send_control(&Msg::SwitchDisplay {
             input: CLIENT_INPUT,
@@ -315,6 +353,58 @@ async fn a_switch_display_from_the_client_reaches_the_monitor() {
     assert!(
         wait_until(|| mon.input() == CLIENT_INPUT, Duration::from_secs(5)).await,
         "the client's request never reached the monitor; it was left on {:#04x}",
+        mon.input()
+    );
+    rig.shutdown().await;
+}
+
+/// The disconnect half of the crossing-back hook.
+///
+/// A link that dies while the pointer is on the client ends with the
+/// client switching the monitor back to this machine (it is the displayed
+/// input, so it is the only one that can). No `Msg::Leave` is ever sent,
+/// so the hook in `run_actions` does not run, and without the one on the
+/// disconnect path this machine still believes the monitor shows the
+/// client -- and rule 1 then silently refuses the next crossing, for ever.
+///
+/// Break it by deleting the `was_remote` block beside
+/// `core.client_disconnected`: the second crossing commands nothing and
+/// the monitor is left on the server's own input.
+///
+/// The monitor is moved by hand in between, through a second handle on the
+/// same mock, because that is exactly what the real client does as its
+/// link dies -- and without it the final assertion would pass on a monitor
+/// nobody ever commanded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_crossing_after_a_dropped_client_still_commands_the_monitor() {
+    let mut rig = spawn_rig().await;
+    cross_to_the_client(&rig.cap).await;
+    let mon = rig.mon.clone();
+    assert!(
+        wait_until(|| mon.input() == CLIENT_INPUT, Duration::from_secs(5)).await,
+        "the first crossing never reached the monitor"
+    );
+
+    // The link dies, and the client -- the machine on screen -- switches
+    // the monitor back to the server on its way out.
+    drop(rig.peer.take());
+    mon.monitor("MOCK", "mock")
+        .set_input(SERVER_INPUT)
+        .expect("the mock never fails");
+    assert!(
+        wait_until(
+            || rig.cap.mode() == CaptureMode::Observe,
+            Duration::from_secs(5)
+        )
+        .await,
+        "the server never returned to local after the client went away"
+    );
+
+    reconnect(&mut rig).await;
+    cross_to_the_client(&rig.cap).await;
+    assert!(
+        wait_until(|| mon.input() == CLIENT_INPUT, Duration::from_secs(5)).await,
+        "the crossing after a reconnect left the monitor on {:#04x}",
         mon.input()
     );
     rig.shutdown().await;

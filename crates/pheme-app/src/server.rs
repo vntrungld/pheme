@@ -991,7 +991,20 @@ async fn handle_peer(
     // for the life of the process, with its indicator lit and nothing listening.
     shared.mic.set_wanted(false);
     let actions = shared.core.lock().unwrap().client_disconnected(&name);
+    // Non-empty exactly when the pointer was on that client: the core
+    // answers a return to local with an `Ungrab` and answers nothing at
+    // all when it was already local. So this is the disconnect half of the
+    // `Msg::Leave` hook in `run_actions` -- the client switches the monitor
+    // back to this machine as its link dies, and without this the belief
+    // here would still name the client's input and rule 1 would refuse the
+    // next crossing.
+    let was_remote = !actions.is_empty();
     shared.execute(actions);
+    if was_remote {
+        if let (Some(d), Some(v)) = (&shared.display, shared.display_input) {
+            d.became_displayed(v);
+        }
+    }
     shared.publish_edges();
     peer.close("session ended");
     info!(client = %name, "client disconnected");

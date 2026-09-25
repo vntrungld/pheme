@@ -354,3 +354,104 @@ async fn the_gui_switch_asks_for_the_machine_that_holds_the_pointer() {
     );
     rig.shutdown().await;
 }
+
+/// A link that dies while the pointer is on this machine.
+///
+/// The `Msg::Bye` path has a deliberate argument for not switching. The
+/// silent drop never had one: the server's core returns to local the
+/// instant the connection goes, the server cannot command the monitor
+/// because it is not the input being displayed, and the client used to
+/// just break out to reconnect -- leaving the picture on the machine the
+/// pointer is not on, with nobody able to move it but the recovery hotkey.
+///
+/// Break it by deleting the `stranded` block after `session` returns: the
+/// monitor stays on `CLIENT_INPUT`.
+///
+/// Nothing else could satisfy this: no `Leave` is ever sent, so the
+/// crossing-back hook does not run, and a reconnect commands nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_link_that_drops_while_the_pointer_is_here_brings_the_picture_back() {
+    let rig = spawn_rig().await;
+    rig.peer
+        .sender()
+        .send_control(&Msg::Enter {
+            seq: 1,
+            x: 10,
+            y: 20,
+            mods: Modifiers(0),
+        })
+        .await
+        .expect("sending Enter");
+    assert!(
+        wait_until(
+            || rig.inj.calls().contains(&InjectCall::MoveAbs(10, 20)),
+            Duration::from_secs(5)
+        )
+        .await,
+        "the client never acted on the Enter"
+    );
+    assert_eq!(rig.mon.input(), CLIENT_INPUT, "the pointer is here");
+
+    // The link dies the way a network failure kills it: no Bye, no Leave,
+    // just a connection that is gone.
+    let Rig {
+        client,
+        shutdown_tx,
+        mon,
+        peer,
+        ..
+    } = rig;
+    drop(peer);
+
+    assert!(
+        wait_until(|| mon.input() == SERVER_INPUT, Duration::from_secs(10)).await,
+        "the picture was left on {:#04x}, on a machine the pointer is no longer on",
+        mon.input()
+    );
+    let _ = shutdown_tx.send(true);
+    let _ = client.await;
+}
+
+/// The exclusion beside it: quitting pheme does not move the picture.
+///
+/// The person quit on the machine they are looking at. Throwing their
+/// screen over to the other one on the way out is not what they asked for,
+/// and the shutdown path is the one ending of a session that is not a
+/// failure to recover from.
+///
+/// Break it by dropping the `!*shutdown.borrow()` from `stranded`.
+///
+/// A negative assertion, and bounded by time rather than by an event,
+/// which the rest of this file avoids: there is no later effect to wait
+/// for once the client has exited. It is still exact in one direction --
+/// `Rig::shutdown` awaits the client task, so the switch, if the code made
+/// one, was already queued before the window opens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutting_down_with_the_pointer_here_leaves_the_picture_alone() {
+    let rig = spawn_rig().await;
+    rig.peer
+        .sender()
+        .send_control(&Msg::Enter {
+            seq: 1,
+            x: 10,
+            y: 20,
+            mods: Modifiers(0),
+        })
+        .await
+        .expect("sending Enter");
+    assert!(
+        wait_until(
+            || rig.inj.calls().contains(&InjectCall::MoveAbs(10, 20)),
+            Duration::from_secs(5)
+        )
+        .await,
+        "the client never acted on the Enter"
+    );
+    let mon = rig.mon.clone();
+    rig.shutdown().await;
+    assert!(
+        !wait_until(|| mon.input() != CLIENT_INPUT, Duration::from_millis(300)).await,
+        "quitting moved the picture to {:#04x}",
+        mon.input()
+    );
+}
