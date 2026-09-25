@@ -226,7 +226,7 @@ automated runs against a mock.
 | E4 | Sweep the pointer across the edge and back inside one second | the monitor switches **at least once and at most twice**, and ends on the machine the pointer ended on. Zero switches is a failure, not a pass: a feature that is wedged also "ends" on the right machine |
 | E5 | Press the `switch_display` hotkey while the monitor is on the wrong machine | the monitor corrects itself |
 | E6 | Click "Switch display" in the window twice: once on the machine that both holds the pointer and is on screen, and once on the client while the client is on screen but the pointer is on the server | the first click leaves the monitor where it is, because it is already right; the second switches the monitor to the server. A click that moves the picture away from the machine holding the pointer is a failure |
-| E7 | Run with `display.input` set where the monitor ignores DDC/CI | one warning at startup, nothing later, input and audio unaffected |
+| E7 | Run with `display.input` set where the monitor ignores DDC/CI | one warning at startup, nothing later, input and audio unaffected, and the window's Display row says no monitor answered rather than "nothing commanded yet" |
 | E8 | Remove `[display]`, cross the edge | the startup log never says "display switching is on", no DDC warning appears, and everything else is unchanged |
 | E9 | Unplug the monitor's second cable, cross the edge | the failed command warns once and does not repeat on later crossings |
 | E10 | Give both machines the same `display.input` and connect | the "same monitor input" warning appears on the server |

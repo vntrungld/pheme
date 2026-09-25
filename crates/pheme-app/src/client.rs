@@ -179,6 +179,7 @@ fn send_link_state(
             mic_depth_ms: 0,
             mic_lost: 0,
             display_input: display.as_ref().and_then(|d| d.last_input()),
+            display_no_monitor: display.as_ref().is_some_and(|d| d.no_monitor()),
         });
     }
 }
@@ -298,6 +299,7 @@ pub async fn run_client(
             mic_depth_ms: 0,
             mic_lost: 0,
             display_input: display.as_ref().and_then(|d| d.last_input()),
+            display_no_monitor: display.as_ref().is_some_and(|d| d.no_monitor()),
         };
         if let Err(e) = link.send_status(&initial).await {
             debug!("status send failed: {e}");
@@ -726,6 +728,7 @@ async fn session(
                         mic_depth_ms: mic_stats.depth_ms.load(Ordering::Relaxed) as u32,
                         mic_lost: m.lost,
                         display_input: display.as_ref().and_then(|d| d.last_input()),
+                        display_no_monitor: display.as_ref().is_some_and(|d| d.no_monitor()),
                     };
                     let _ = tx.try_send(status);
                 }

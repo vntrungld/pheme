@@ -127,6 +127,14 @@ fn a_failing_open_leaves_a_service_that_does_nothing() {
         "no call on the input path may block"
     );
     assert_eq!(svc.last_input(), None, "nothing was ever switched");
+    // The fact the front-end's Display row needs: not "nothing yet" but
+    // "nothing ever". Break it by dropping the `NO_MONITOR` store in
+    // `open_monitor`, and the window goes back to saying "On, nothing
+    // commanded yet" for the whole life of the program.
+    assert!(
+        svc.no_monitor(),
+        "a service that found no monitor must say so"
+    );
     assert_eq!(
         opens.load(Ordering::SeqCst),
         1,
@@ -367,4 +375,49 @@ fn a_monitor_that_never_answers_stops_being_reopened() {
         "three attempts in all: one at startup and one at each of the first two \
          crossings that put this machine on screen"
     );
+}
+
+/// The other side of `no_monitor`: a retry that succeeds takes it back.
+///
+/// Break it by dropping the `NO_MONITOR` reset in `open_monitor`'s `Ok`
+/// arm: the window then says no monitor answered while the monitor is
+/// being switched under the person's nose.
+///
+/// The assertion comes *before* any successful command on purpose. A
+/// confirmed switch stores its own value in the same atomic and so clears
+/// the sentinel whatever `open_monitor` does -- a first version of this
+/// test switched first, and passed with the reset deleted.
+#[test]
+fn a_reopen_that_works_clears_the_no_monitor_report() {
+    let (mon, handle) = MockMonitor::new("MOCK", "mock", 0x11);
+    let opens = Arc::new(AtomicUsize::new(0));
+    let o = Arc::clone(&opens);
+    let mut slot = Some(mon);
+    let svc = DisplayService::spawn(
+        &cfg(0x0f, 0),
+        Box::new(move || {
+            if o.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(DisplayError::NoMonitor);
+            }
+            match slot.take() {
+                Some(m) => Ok(Box::new(m) as Box<dyn pheme_display::Monitor>),
+                None => Err(DisplayError::NoMonitor),
+            }
+        }),
+    )
+    .expect("the feature is configured on");
+    wait_for("the failed open to be reported", || svc.no_monitor());
+
+    svc.became_displayed(0x0f);
+    wait_for("the second open", || opens.load(Ordering::SeqCst) == 2);
+    assert!(
+        !svc.no_monitor(),
+        "the report must go back as soon as a monitor answers, not when one is \
+         first commanded"
+    );
+
+    // And the service really does work from here, so the assertion above
+    // is about a live monitor rather than a cleared flag.
+    svc.switch_to(0x12);
+    wait_for("the switch after the reopen", || handle.input() == 0x12);
 }

@@ -17,6 +17,7 @@ fn sample() -> Status {
         mic_depth_ms: 0,
         mic_lost: 0,
         display_input: Some(0x11),
+        display_no_monitor: false,
     }
 }
 

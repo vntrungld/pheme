@@ -616,6 +616,7 @@ pub async fn run_server(
                         mic_depth_ms: 0,
                         mic_lost: 0,
                         display_input: s.display.as_ref().and_then(|d| d.last_input()),
+                        display_no_monitor: s.display.as_ref().is_some_and(|d| d.no_monitor()),
                     };
                     let _ = tx.try_send(status);
                 }
@@ -646,6 +647,7 @@ pub async fn run_server(
             mic_depth_ms: 0,
             mic_lost: 0,
             display_input: shared.display.as_ref().and_then(|d| d.last_input()),
+            display_no_monitor: shared.display.as_ref().is_some_and(|d| d.no_monitor()),
         };
         if let Err(e) = link.send_status(&initial).await {
             debug!("status send failed: {e}");

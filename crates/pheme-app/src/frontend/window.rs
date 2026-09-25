@@ -187,6 +187,10 @@ pub struct StatusView {
     /// `None` when display switching is off or nothing has been commanded
     /// yet.
     pub display_input: Option<u16>,
+    /// No monitor answered DDC/CI here, so nothing will be commanded. The
+    /// difference between "not yet" and "not ever" (see
+    /// [`display_status_text`]).
+    pub display_no_monitor: bool,
     /// Set only while [`CoreState::Stopped`], and gone again the moment a
     /// fresh `Running` report arrives.
     pub stopped_reason: Option<String>,
@@ -221,6 +225,7 @@ impl StatusView {
                 self.mic_depth_ms = status.mic_depth_ms;
                 self.mic_lost = status.mic_lost;
                 self.display_input = status.display_input;
+                self.display_no_monitor = status.display_no_monitor;
             }
         }
     }
@@ -802,7 +807,11 @@ fn draw_status(ui: &mut egui::Ui, view: &StatusView, display_configured: bool) {
             ui.end_row();
 
             ui.label("Display");
-            ui.label(display_status_text(display_configured, view.display_input));
+            ui.label(display_status_text(
+                display_configured,
+                view.display_input,
+                view.display_no_monitor,
+            ));
             ui.end_row();
 
             ui.label("Events/s");
@@ -866,20 +875,30 @@ fn link_state_name(state: &LinkState) -> &'static str {
 }
 
 /// What the "Display" row says. `Status.display_input` alone cannot tell
-/// three situations apart: the feature is off; it is on and nothing has
+/// four situations apart: the feature is off; it is on and nothing has
 /// been commanded yet, which is every run until the first crossing (and
 /// every attempt whose command failed too, since `DisplayService` never
-/// stores a failed one); or it is on and `v` is the input last
+/// stores a failed one); it is on and no monitor ever answered DDC/CI, so
+/// nothing ever will be commanded; or it is on and `v` is the input last
 /// successfully commanded. `configured` -- this machine's own `[display]
 /// input` from the held `Config`, not anything `Status` reports -- is what
-/// makes the first two distinguishable; the third case folds the "nothing
-/// yet" and "last command failed" situations together, which is accepted,
-/// but the text must not claim to know which of those two it is.
-fn display_status_text(configured: bool, display_input: Option<u16>) -> String {
-    match (configured, display_input) {
-        (false, _) => "Off".to_string(),
-        (true, None) => "On, nothing commanded yet".to_string(),
-        (true, Some(v)) => format!("0x{v:02x}"),
+/// separates the first; `no_monitor`, which the service knows and used to
+/// throw away, separates the third.
+///
+/// That third arm is the one this row exists for. "On, nothing commanded
+/// yet" is literally true on hardware that ignores DDC/CI and reads as "it
+/// will work next time", and it is what a person saw for the whole life of
+/// the program -- including on the machine this feature was developed on.
+///
+/// The last arm still folds "nothing yet" and "the last command failed"
+/// together, which is accepted, but the text must not claim to know which
+/// of those two it is.
+fn display_status_text(configured: bool, display_input: Option<u16>, no_monitor: bool) -> String {
+    match (configured, display_input, no_monitor) {
+        (false, _, _) => "Off".to_string(),
+        (true, _, true) => "On, but no monitor answered DDC/CI".to_string(),
+        (true, None, false) => "On, nothing commanded yet".to_string(),
+        (true, Some(v), false) => format!("0x{v:02x}"),
     }
 }
 
@@ -1475,6 +1494,7 @@ mod tests {
             mic_depth_ms: 0,
             mic_lost: 0,
             display_input: Some(0x11),
+            display_no_monitor: false,
         }
     }
 
@@ -1502,10 +1522,21 @@ mod tests {
         // commanded yet" -- both are `None`. `configured` is what makes
         // them distinguishable, and the wording must not claim more than
         // it knows once a command could have failed silently.
-        assert_eq!(display_status_text(false, None), "Off");
-        assert_eq!(display_status_text(false, Some(0x11)), "Off");
-        assert_eq!(display_status_text(true, None), "On, nothing commanded yet");
-        assert_eq!(display_status_text(true, Some(0x11)), "0x11");
+        assert_eq!(display_status_text(false, None, false), "Off");
+        assert_eq!(display_status_text(false, Some(0x11), false), "Off");
+        assert_eq!(
+            display_status_text(true, None, false),
+            "On, nothing commanded yet"
+        );
+        assert_eq!(display_status_text(true, Some(0x11), false), "0x11");
+        // The fourth situation, and the one a person actually meets on
+        // hardware that ignores DDC/CI: it is configured, nothing answered,
+        // and nothing ever will. Break it by dropping the `no_monitor` arm:
+        // this reads "On, nothing commanded yet" for ever.
+        assert_eq!(
+            display_status_text(true, None, true),
+            "On, but no monitor answered DDC/CI"
+        );
     }
 
     #[test]

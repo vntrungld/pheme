@@ -65,14 +65,24 @@ const QUEUE: usize = 4;
 pub struct DisplayService {
     tx: Sender<Req>,
     /// The input last *successfully* commanded, for the front-end's status
-    /// line. `u32::MAX` means "nothing yet", so one atomic carries both
-    /// states and the status path takes no lock at all -- it is read once a
+    /// line, or one of two sentinels: `NO_INPUT` for "nothing yet" and
+    /// `NO_MONITOR` for "nothing answered DDC/CI". One atomic carries all
+    /// three, so the status path takes no lock at all -- it is read once a
     /// second from the thread that also carries input.
     last: Arc<AtomicU32>,
 }
 
 /// `last`'s sentinel for "no input has been confirmed".
 const NO_INPUT: u32 = u32::MAX;
+
+/// `last`'s sentinel for "no monitor answered, so nothing can be
+/// commanded".
+///
+/// Distinct from `NO_INPUT` because the two read identically to a person
+/// and mean opposite things: one is a feature waiting for its first
+/// crossing, the other a feature that will never do anything on this
+/// hardware. Neither can collide with a real value, which is a `u16`.
+const NO_MONITOR: u32 = u32::MAX - 1;
 
 impl DisplayService {
     /// `None` when the feature is off, that is when `[display] input` is
@@ -109,9 +119,19 @@ impl DisplayService {
     /// nothing has been. Read by the status path once a second.
     pub fn last_input(&self) -> Option<u16> {
         match self.last.load(Ordering::Relaxed) {
-            NO_INPUT => None,
+            NO_INPUT | NO_MONITOR => None,
             v => Some(v as u16),
         }
+    }
+
+    /// Whether the last attempt to open a monitor found none.
+    ///
+    /// The difference between "on, and nothing has been commanded yet" and
+    /// "on, and nothing ever will be" -- which is the common case on
+    /// hardware that ignores DDC/CI, and the one a person needs told. The
+    /// service knows it; without this it threw it away.
+    pub fn no_monitor(&self) -> bool {
+        self.last.load(Ordering::Relaxed) == NO_MONITOR
     }
 
     /// A pointer crossing asks for `value`. Never blocks and never fails.
@@ -169,7 +189,7 @@ impl DisplayService {
 fn run(rx: Receiver<Req>, mut open: OpenFn, cooldown: Duration, last: Arc<AtomicU32>) {
     let mut policy = DisplaySwitch::new(cooldown);
     let mut attempts = 0u32;
-    let mut mon = open_monitor(&mut open, &mut attempts);
+    let mut mon = open_monitor(&mut open, &mut attempts, &last);
     if let Some(m) = mon.as_mut() {
         match m.get_input() {
             Ok(v) => policy.observe(v),
@@ -203,7 +223,7 @@ fn run(rx: Receiver<Req>, mut open: OpenFn, cooldown: Duration, last: Arc<Atomic
             Some(Req::Force(v)) => Some(policy.force(v, now)),
             Some(Req::BecameDisplayed(own)) => {
                 if mon.is_none() {
-                    mon = open_monitor(&mut open, &mut attempts);
+                    mon = open_monitor(&mut open, &mut attempts, &last);
                     if mon.is_none() && attempts >= OPEN_ATTEMPTS {
                         warn!(
                             attempts,
@@ -255,7 +275,11 @@ fn run(rx: Receiver<Req>, mut open: OpenFn, cooldown: Duration, last: Arc<Atomic
 /// A failure is ordinary: a machine whose monitor does not speak DDC/CI is
 /// an ordinary machine. It is said once at `warn` and afterwards at
 /// `debug`, so a person sees it without a retry filling the log.
-fn open_monitor(open: &mut OpenFn, attempts: &mut u32) -> Option<Box<dyn Monitor>> {
+fn open_monitor(
+    open: &mut OpenFn,
+    attempts: &mut u32,
+    last: &AtomicU32,
+) -> Option<Box<dyn Monitor>> {
     *attempts += 1;
     match open() {
         Ok(m) => {
@@ -264,9 +288,16 @@ fn open_monitor(open: &mut OpenFn, attempts: &mut u32) -> Option<Box<dyn Monitor
                 at = m.location(),
                 "display switching is on"
             );
+            // A retry that succeeded: the front-end is told the feature is
+            // alive again, not that no monitor answered. Only this thread
+            // writes `last`, so a plain load and store cannot race.
+            if last.load(Ordering::Relaxed) == NO_MONITOR {
+                last.store(NO_INPUT, Ordering::Relaxed);
+            }
             Some(m)
         }
         Err(e) if *attempts == 1 => {
+            last.store(NO_MONITOR, Ordering::Relaxed);
             warn!(
                 error = %e,
                 "display switching is off: no usable monitor. DDC/CI is answered only by \
@@ -276,6 +307,7 @@ fn open_monitor(open: &mut OpenFn, attempts: &mut u32) -> Option<Box<dyn Monitor
             None
         }
         Err(e) => {
+            last.store(NO_MONITOR, Ordering::Relaxed);
             debug!(error = %e, attempt = *attempts, "still no usable monitor");
             None
         }

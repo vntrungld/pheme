@@ -51,6 +51,14 @@ pub struct Status {
     /// yet. Rendered as a hex value, because that is how `display.input` is
     /// written and how `pheme displays` prints it.
     pub display_input: Option<u16>,
+    /// Display switching is configured here, and no monitor answered
+    /// DDC/CI, so nothing will be commanded.
+    ///
+    /// Without this the window can only say "nothing commanded yet", which
+    /// is true, reads as "it will work next time", and is what a person
+    /// sees for the whole life of the program on the very common hardware
+    /// that ignores DDC/CI.
+    pub display_no_monitor: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,6 +144,7 @@ mod tests {
             mic_depth_ms: 0,
             mic_lost: 0,
             display_input: Some(0x11),
+            display_no_monitor: false,
         }
     }
 
