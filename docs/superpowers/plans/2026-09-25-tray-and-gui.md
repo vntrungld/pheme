@@ -20,8 +20,9 @@
 - Every existing subcommand must behave exactly as it does today. `--ipc` is the only addition to them, and it is absent unless the front-end passes it.
 - Exact values, to be used verbatim:
   - `pub const MAX_IPC_FRAME: usize = 64 * 1024;`
-  - Linux socket path: `$XDG_RUNTIME_DIR/pheme/ipc-<pid>.sock`, falling back to `/tmp/pheme/ipc-<pid>.sock` when `XDG_RUNTIME_DIR` is unset.
-  - Windows pipe path: `\\.\pipe\pheme-<pid>`.
+  - Linux socket path: `$XDG_RUNTIME_DIR/pheme/ipc-<pid>-<n>.sock`, falling back to `/tmp/pheme/ipc-<pid>-<n>.sock` when `XDG_RUNTIME_DIR` is unset.
+  - Windows pipe path: `\\.\pipe\pheme-<pid>-<n>`.
+  - `<n>` is a process-local `AtomicU64` counter. The pid keeps two front-ends apart; the counter keeps two listeners inside one process apart, which is what every test binary is.
   - `--ipc` is hidden from `--help`: `#[arg(long, hide = true)]`.
   - The front-end waits **two seconds** for a child to exit before killing it.
   - `eframe = "0.32"`, `tray-icon = "0.24"`.

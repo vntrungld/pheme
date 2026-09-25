@@ -101,14 +101,23 @@ does not affect input, which is the property §2 is about.
 `crates/pheme-app/src/ipc.rs`.
 
 **Transport.** A Unix domain socket on Linux at
-`$XDG_RUNTIME_DIR/pheme/ipc-<pid>.sock` (falling back to `/tmp` when the
-variable is unset), and a named pipe on Windows at
-`\\.\pipe\pheme-<pid>`. Both come from `tokio::net`, which is already a
-dependency: `UnixListener` and `windows::named_pipe`. No new crate.
+`$XDG_RUNTIME_DIR/pheme/ipc-<pid>-<n>.sock` (falling back to `/tmp` when
+the variable is unset), and a named pipe on Windows at
+`\\.\pipe\pheme-<pid>-<n>`. Both come from `tokio::net`, which is already
+a dependency: `UnixListener` and `windows::named_pipe`. No new crate.
 
 The front-end listens and the core connects, so the core never has to
-guess when the front-end appeared, and the path carries the front-end's
-process id so two front-ends do not collide.
+guess when the front-end appeared.
+
+`<pid>` keeps two front-ends apart, which is what the path exists for:
+front-ends are separate processes. `<n>` is a process-local counter, and
+it is there because a *test binary* is one process holding many
+listeners — without it every listener in a test run shares one path and
+they race. That is not a hypothetical: the first implementation of this
+module failed fifteen consecutive parallel test runs and passed every
+serial one. Serialising the tests would have been the wrong fix, since
+it would have had to spread to every later test file that starts a
+front-end.
 
 **Framing.** The same shape as the control stream: a length prefix and a
 postcard body. The types are *not* `pheme_proto::Msg`. That enum is the
