@@ -1970,10 +1970,16 @@ same edit.
         assert_eq!(a, vec![Action::SwitchDisplay { local: false }]);
     }
 
-    /// Break it by testing the hotkey after the local/remote split rather
-    /// than before it: the key is then forwarded to the client, typed into
-    /// whatever has focus there, and the person who cannot see their screen
-    /// has no way back.
+    /// Break it by deleting the `switch_display` arm from `on_event`: the
+    /// key then falls through to `on_remote_event`, which forwards it as
+    /// `Action::SendControl(Msg::Key { .. })` — typed into whatever has
+    /// focus on the client, while the person who cannot see their screen
+    /// loses the only way back.
+    ///
+    /// Not "move the arm below the local/remote split". That was checked
+    /// and is not a mutation this test catches: an arm that returns early
+    /// still intercepts the key wherever it is placed. The arm's position
+    /// matters for readability, not for this assertion.
     #[test]
     fn the_switch_display_hotkey_is_never_forwarded() {
         let mut c = core_with_switch(Side::Right, (0.0, 1.0));
