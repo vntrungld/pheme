@@ -46,9 +46,9 @@ fn wait_for(what: &str, f: impl Fn() -> bool) {
     panic!("{what} did not happen within 5 s");
 }
 
-/// Break it by removing the `input.is_none()` guard from `spawn`: pheme
-/// then starts a thread and enumerates monitors for every person who never
-/// asked for this feature, costing a second of startup each time.
+/// Break it by removing `spawn`'s `cfg.input?;` guard: pheme then starts a
+/// thread and enumerates monitors for every person who never asked for this
+/// feature, costing a second of startup each time.
 #[test]
 fn an_unconfigured_input_means_no_service() {
     let (mon, _handle) = MockMonitor::new("MOCK", "mock", 0x11);
@@ -69,14 +69,20 @@ fn an_unconfigured_input_means_no_service() {
 /// enumeration costs about a second, and it would be a second of every
 /// start, spent before the input path exists.
 ///
+/// `released` is the one load-bearing assertion here. The other three are
+/// close to vacuous and are kept only as documentation of the contract, not
+/// as coverage: `opens == 1` cannot be anything else, because `OpenFn` is
+/// `FnOnce` and the type system already forbids a second call; the two-second
+/// bound cannot fail, because a send on a disconnected channel returns at
+/// once whether it blocks or not; and `last_input()` is `None` because that
+/// is the sentinel every implementation starts at.
+///
 /// What this test deliberately does *not* claim: it cannot catch an
 /// implementation that unwraps the `OpenFn`'s result. That panic happens on
 /// a detached thread, and the test harness fails a test only for a panic on
 /// its own thread. The observable aftermath is identical either way -- the
 /// receiver is dropped and every send is refused -- so the panic is invisible
-/// from here. What is asserted instead is real: the open is attempted once
-/// and never retried, no call blocks, and nothing is ever reported as
-/// switched.
+/// from here.
 #[test]
 fn a_failing_open_leaves_a_service_that_does_nothing() {
     let (gate_tx, gate_rx) = std::sync::mpsc::sync_channel::<()>(0);
@@ -194,6 +200,16 @@ fn force_reaches_the_monitor_where_a_switch_would_be_deduplicated() {
 /// Review Focus 2. Break it by treating a zero cooldown as "always in
 /// cooldown": the second value is held behind a deadline that has already
 /// passed, and the loop re-arms it forever without ever issuing it.
+///
+/// Two things this test is not. The break it names is not in this crate: it
+/// is `DisplaySwitch::in_cooldown` in `crates/pheme-display/src/switch.rs`,
+/// where `saturating_duration_since(t) < self.cooldown` is false for a zero
+/// cooldown. From the service's side, what this covers is a loop that
+/// stalls after its first command. And it does not reach the `poll` arm:
+/// with `cooldown_ms = 0` nothing is ever pending, so deleting
+/// `None => policy.poll(now)` leaves this test green.
+/// `a_request_made_during_the_cooldown_still_arrives` is that arm's only
+/// cover.
 #[test]
 fn a_zero_cooldown_switches_every_time() {
     let (svc, handle) = service(0, 0x11);
@@ -230,11 +246,28 @@ fn only_a_confirmed_switch_is_reported() {
 /// is issued when the cooldown ends, not dropped. Break it by dropping the
 /// held request in the service loop, or by passing `rx.recv()` where the
 /// deadline arm belongs: the second value never arrives.
+///
+/// The only test covering the `poll` arm and the deadline wakeup at all.
+/// Every other test here runs with `cooldown_ms = 0`, where nothing is ever
+/// held and deleting `None => policy.poll(now)` changes nothing. Do not
+/// weaken it without replacing that cover.
+///
+/// The precondition is asserted rather than assumed. Holding only happens
+/// if the second request reaches the policy inside the cooldown; a >200 ms
+/// preemption on a loaded runner would put it outside, where it is issued
+/// at once and the test passes while testing nothing. `t0` is taken before
+/// the first command is issued, so it is an upper bound on the time since
+/// the command went out.
 #[test]
 fn a_request_made_during_the_cooldown_still_arrives() {
     let (svc, handle) = service(200, 0x11);
+    let t0 = Instant::now();
     svc.switch_to(0x0f);
     wait_for("the first switch", || handle.input() == 0x0f);
+    assert!(
+        t0.elapsed() < Duration::from_millis(200),
+        "the second request must be sent inside the cooldown for it to be held"
+    );
     svc.switch_to(0x12);
     wait_for("the held switch", || handle.input() == 0x12);
 }

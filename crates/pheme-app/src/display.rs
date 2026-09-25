@@ -95,8 +95,18 @@ impl DisplayService {
     }
 
     fn send(&self, req: Req) {
+        // A dropped crossing and a dropped rescue are not the same event.
+        // The queue's rationale -- four crossings deep, the oldest is no
+        // longer anyone's intention -- is an argument about pointer
+        // crossings, and it does not carry over to the hotkey somebody
+        // pressed *because* the monitor is already wedged. That one is worth
+        // saying out loud.
+        let forced = matches!(req, Req::Force(_));
         match self.tx.try_send(req) {
             Ok(()) => {}
+            Err(TrySendError::Full(_)) if forced => {
+                warn!("the display queue is full; the forced switch was dropped")
+            }
             Err(TrySendError::Full(_)) => {
                 debug!("the display queue is full; dropping a switch")
             }
