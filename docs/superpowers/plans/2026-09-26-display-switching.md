@@ -1799,60 +1799,67 @@ EOF
 
 - [ ] **Step 1: Write the failing tests**
 
-In the `tests` module of `crates/pheme-core/src/server.rs`:
+In the `tests` module of `crates/pheme-core/src/server.rs`. Note the first
+change: the existing `core()` helper builds `Hotkeys { lock: Some(LOCK) }`
+and stops compiling the moment the struct gains a field, so widen it in the
+same edit.
 
 ```rust
-    /// Break it by hard-coding `local: true`: the hotkey then always asks
-    /// for the server's input, so it can never bring the screen back to a
-    /// client.
-    #[test]
-    fn the_switch_display_hotkey_reports_which_machine_holds_the_pointer() {
-        let mut core = ServerCore::new(
-            one_client_left(),
+    const SWITCH: KeyCode = KeyCode(0x45); // F12
+
+    /// `core`, with a switch-display hotkey bound as well.
+    fn core_with_switch(side: Side, span: (f32, f32)) -> ServerCore {
+        let layout = Layout {
+            server_screens: screen(1920, 1080),
+            clients: vec![ClientPlacement {
+                name: "lap".into(),
+                side,
+                span,
+            }],
+        };
+        let mut c = ServerCore::new(
+            layout,
             Hotkeys {
-                lock: None,
-                switch_display: Some(KeyCode(0x45)),
+                lock: Some(LOCK),
+                switch_display: Some(SWITCH),
             },
         );
-        core.client_connected("c", vec![screen(1920, 1080)]);
+        c.client_connected("lap", screen(1000, 500));
+        c
+    }
 
-        let a = core.on_event(CaptureEvent::Key {
-            code: KeyCode(0x45),
+    /// Break it by hard-coding `local: true`: the hotkey then always asks
+    /// for the server's input, so it can never bring the screen back from a
+    /// client -- the one case it exists for.
+    #[test]
+    fn the_switch_display_hotkey_reports_which_machine_holds_the_pointer() {
+        let mut c = core_with_switch(Side::Right, (0.0, 1.0));
+        let a = c.on_event(CaptureEvent::Key {
+            code: SWITCH,
             down: true,
         });
         assert_eq!(a, vec![Action::SwitchDisplay { local: true }]);
 
-        // Walk off the left edge so the core goes remote.
-        core.on_event(CaptureEvent::MotionAbs { x: 100, y: 500 });
-        core.on_event(CaptureEvent::MotionAbs { x: -1, y: 500 });
-        assert!(matches!(core.active(), Active::Remote(_)));
+        enter_right(&mut c);
+        assert!(matches!(c.active(), Active::Remote(_)));
 
-        let a = core.on_event(CaptureEvent::Key {
-            code: KeyCode(0x45),
+        let a = c.on_event(CaptureEvent::Key {
+            code: SWITCH,
             down: true,
         });
         assert_eq!(a, vec![Action::SwitchDisplay { local: false }]);
     }
 
     /// Break it by testing the hotkey after the local/remote split rather
-    /// than before it: the key is then forwarded to the client, which types
-    /// it into whatever has focus there, and the person who cannot see
-    /// their screen has no way back.
+    /// than before it: the key is then forwarded to the client, typed into
+    /// whatever has focus there, and the person who cannot see their screen
+    /// has no way back.
     #[test]
     fn the_switch_display_hotkey_is_never_forwarded() {
-        let mut core = ServerCore::new(
-            one_client_left(),
-            Hotkeys {
-                lock: None,
-                switch_display: Some(KeyCode(0x45)),
-            },
-        );
-        core.client_connected("c", vec![screen(1920, 1080)]);
-        core.on_event(CaptureEvent::MotionAbs { x: 100, y: 500 });
-        core.on_event(CaptureEvent::MotionAbs { x: -1, y: 500 });
-
-        let a = core.on_event(CaptureEvent::Key {
-            code: KeyCode(0x45),
+        let mut c = core_with_switch(Side::Right, (0.0, 1.0));
+        enter_right(&mut c);
+        let a = c.on_event(CaptureEvent::Key {
+            code: SWITCH,
             down: true,
         });
         assert!(
@@ -1862,26 +1869,30 @@ In the `tests` module of `crates/pheme-core/src/server.rs`:
         );
     }
 
-    /// Break it by acting on key-up as well: the monitor is then commanded
-    /// twice per press, and the second command lands mid-switch.
+    /// Break it by acting on key-up as well: one press then commands the
+    /// monitor twice, and the second command lands mid-switch.
     #[test]
     fn the_switch_display_hotkey_acts_on_the_way_down_only() {
-        let mut core = ServerCore::new(
-            one_client_left(),
-            Hotkeys {
-                lock: None,
-                switch_display: Some(KeyCode(0x45)),
-            },
-        );
-        let a = core.on_event(CaptureEvent::Key {
-            code: KeyCode(0x45),
+        let mut c = core_with_switch(Side::Right, (0.0, 1.0));
+        let a = c.on_event(CaptureEvent::Key {
+            code: SWITCH,
             down: false,
         });
         assert!(a.is_empty(), "{a:?}");
     }
 ```
 
-Reuse whatever helpers the existing tests in this file already use to build a layout and a `ScreenInfo`; `one_client_left()` and `screen(w, h)` above stand for them. If the file's helpers are named differently, use the file's names — do not add duplicates.
+Widen the existing helper in the same edit:
+
+```rust
+        let mut c = ServerCore::new(
+            layout,
+            Hotkeys {
+                lock: Some(LOCK),
+                switch_display: None,
+            },
+        );
+```
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
