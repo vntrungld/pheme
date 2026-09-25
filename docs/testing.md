@@ -190,3 +190,24 @@ backends and the real mDNS round trip are actually exercised (design §7).
 | D2 | `connect = "<name>"`, then change the server's IP and restart it | the client reconnects without being restarted |
 | D3 | Two servers with the same name | `discover` lists both and warns |
 | D4 | Windows with the firewall at its default | `discover` finds the Linux server, or the firewall prompt appears and `pheme setup` explains it |
+
+## Tray and configuration GUI (sub-project 6)
+
+None of this runs on CI: the tray, the window and both device backends
+need a desktop session, so CI only proves this sub-project compiles and
+that its protocol and file handling are correct — it proves nothing
+about whether the application actually works (design §11). This matrix
+is the only place that gets tested.
+
+| ID | What | Pass |
+|---|---|---|
+| G1 | `pheme` with no config file, Linux KDE | the window opens on first run; the tray icon appears |
+| G2 | `pheme` on Windows | the same |
+| G3 | Pair two machines entirely from the windows | both ends end up paired; `pheme client` then connects |
+| G4 | Edit the client list and save | `config.toml` parses, the child restarts, the new edge works |
+| G5 | Save over a config file containing comments | the warning appears before the first write |
+| G6 | Quit from the tray | no `pheme` process remains |
+| G7 | Kill the front-end with SIGKILL | the core exits within a second; no orphan |
+| G8 | Lock from the tray while the pointer is on the client | the checkmark and the core agree; unlocking restores |
+| G9 | `pheme devices` on both platforms | the list matches what the OS sound settings show |
+| G10 | GNOME without the AppIndicator extension | one warning, no tray, the window still opens |

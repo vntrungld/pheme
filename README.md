@@ -9,6 +9,77 @@ Status: early development — see `docs/superpowers/specs/` for the design.
 
     cargo build --release
 
+## The tray and window
+
+Running `pheme` with **no subcommand** opens a tray icon and a window,
+instead of any of the subcommands below. The window has three panels:
+status (role, link state, peer, RTT and the traffic counters), pairing
+(a button that shows a pairing code on a server, or the list of
+servers found over mDNS on a client), and configuration (`role`,
+`name`, `listen` or `connect`, the client list, the lock hotkey and the
+three audio device menus). Saving the configuration panel writes
+`config.toml` and restarts the server or client underneath it to pick
+the change up; nothing reloads live.
+
+The tray's menu is **Open**, **Lock input**, **Start**/**Stop** and
+**Quit**. Closing the window hides it, where the platform allows it —
+sharing keeps running, and the tray brings it back. **Only Quit exits
+the application.** On Wayland, hiding a window is a no-op winit does
+not implement there, so the window stays open instead and shows
+"Pheme is still running. Use Quit in the tray to exit." Where there is
+no tray to reopen the window from at all (see the GNOME note below),
+closing the window exits instead, since the application would
+otherwise be unreachable.
+
+**Closing the front-end stops sharing.** `pheme` with no subcommand
+runs the same server or client as a child process, and that child
+exits the moment its connection back to the front-end closes — so
+quitting the tray, or killing the front-end, always leaves nothing
+running behind it. To run Pheme without a GUI, run `pheme server` or
+`pheme client` directly from a terminal, exactly as below; every
+existing subcommand is unchanged.
+
+### Linux runtime dependencies
+
+`pheme` links against GTK 3 directly, so it has to be installed to run
+the binary **at all** on Linux — every subcommand, not only the tray
+and window. `libappindicator` (its Ayatana fork is tried first) is
+loaded by the tray specifically, the moment one is actually built;
+install both before running `pheme` rather than after something fails:
+
+```bash
+# Debian/Ubuntu
+sudo apt install libgtk-3-0 libayatana-appindicator3-1
+# Arch
+sudo pacman -S gtk3 libayatana-appindicator
+# Fedora
+sudo dnf install gtk3 libappindicator-gtk3
+```
+
+The release tarball does not bundle either. Building from source on
+Linux needs the matching `-dev` packages, plus a few X11/xcb headers
+`eframe` needs — see the packages `.github/workflows/ci.yml` installs
+before `cargo build`.
+
+**GNOME does not ship the AppIndicator shell extension enabled**, so
+the tray icon never appears there, even with the library installed —
+`pheme` notices there is no host for it, logs one warning, and opens
+the window directly instead. Every panel in the window still works;
+installing an AppIndicator extension (for example "AppIndicator and
+KStatusNotifierItem Support" from extensions.gnome.org) is what brings
+the tray icon back.
+
+### `pheme devices`
+
+    pheme devices
+
+Lists the audio devices this machine currently offers — playback
+devices, then capture devices, each marked as the operating system's
+default or not. The NAME column is exactly what `playback_device`,
+`capture_device` and `mic_device` in `config.toml` match against (see
+"Audio" below), or a distinctive part of it. The configuration
+window's three device menus are filled from this same list.
+
 ## Run (keyboard/mouse sharing)
 
 1. **Server** (the machine with the keyboard and mouse), once:
