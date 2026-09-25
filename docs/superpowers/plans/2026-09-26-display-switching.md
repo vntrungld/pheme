@@ -656,12 +656,23 @@ mod tests {
         assert!(input_values_from_caps(caps).is_empty());
     }
 
-    /// Break it by reading to the end of the string when no ')' follows:
-    /// the truncated list then yields values from whatever text came after.
+    /// Defence in depth, and said plainly rather than claimed as one line:
+    /// a truncated string is stopped by `section`'s balance scan, and if
+    /// that scan were made to return the remainder instead of `None`, the
+    /// `find(')')` guard would stop it again. Either guard alone holds the
+    /// line; the values only leak out of the truncation if both go.
     #[test]
-    fn a_truncated_list_yields_nothing() {
+    fn an_unbalanced_capability_string_yields_nothing() {
         let caps = "(prot(monitor)vcp(02 60(0F 11";
         assert!(input_values_from_caps(caps).is_empty());
+    }
+
+    /// Break it by replacing the `filter_map(..ok())` with
+    /// `map(..unwrap())`: one junk token in a monitor's own capability
+    /// string then panics `pheme displays` instead of being skipped.
+    #[test]
+    fn a_token_that_is_not_hexadecimal_is_skipped() {
+        assert_eq!(input_values_from_caps("vcp(60(0F ZZ 11))"), vec![0x0F, 0x11]);
     }
 
     /// Break it by parsing decimal: 0x11 would come back as 11.
@@ -846,7 +857,7 @@ pub mod edid;
 - [ ] **Step 6: Run the tests to verify they pass**
 
 Run: `cargo test -p pheme-display`
-Expected: PASS, 18 tests.
+Expected: PASS, 19 tests.
 
 - [ ] **Step 7: Run the full gate**
 
