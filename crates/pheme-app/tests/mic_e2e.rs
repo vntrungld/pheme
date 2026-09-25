@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use pheme_app::audio::{CaptureSource, InStats, PlaybackSource};
 use pheme_app::client::{run_client, ClientDeps};
 use pheme_app::server::{run_server, ServerDeps};
+use pheme_app::target::Target;
 use pheme_audio::mock::{MockCapture, MockCaptureHandle, MockPlayback, MockPlaybackHandle};
 use pheme_audio::{Demand, FRAME_INTERLEAVED};
 use pheme_core::{ClientPlacement, Hotkeys, Side};
@@ -260,7 +261,7 @@ fn spawn_mic_pair(demand: Demand, virtual_mic: bool) -> MicPair {
             name: "lap".into(),
             inject: Box::new(inject),
             endpoint: client_ep,
-            server_addr,
+            target: Target::Fixed(server_addr),
             stats: false,
             audio: CaptureSource::Disabled,
             audio_counters: None,
@@ -430,7 +431,7 @@ async fn a_client_with_no_virtual_microphone_still_runs_its_session_loop() {
             name: "lap".into(),
             inject: Box::new(inject),
             endpoint: client_ep,
-            server_addr,
+            target: Target::Fixed(server_addr),
             stats: false,
             audio: CaptureSource::Disabled,
             audio_counters: None,

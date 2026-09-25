@@ -1,6 +1,5 @@
 //! Client runtime: QUIC peer → core → injection, with automatic reconnect.
 
-use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -19,12 +18,19 @@ use crate::audio::{CaptureSource, InStats, OutCounters, PlaybackSource, RecvSide
 use crate::backoff::Backoff;
 use crate::clipboard::ClipboardService;
 use crate::config::{config_dir, Config};
+use crate::target::Target;
 
 pub struct ClientDeps {
     pub name: String,
     pub inject: Box<dyn InputInject>,
     pub endpoint: Endpoint,
-    pub server_addr: SocketAddr,
+    /// Where the server is, as a question rather than an answer.
+    ///
+    /// Resolved on every connection attempt, not once at startup: a server that
+    /// took a new DHCP lease or restarted on another port is then reachable
+    /// again within one backoff interval instead of needing the client
+    /// restarted. §4.3.
+    pub target: Target,
     pub stats: bool,
     /// Where the client's outgoing audio comes from.
     pub audio: CaptureSource,
@@ -126,7 +132,7 @@ pub async fn run_client(
         name,
         mut inject,
         endpoint,
-        server_addr,
+        target,
         stats,
         audio,
         audio_counters,
@@ -144,38 +150,46 @@ pub async fn run_client(
         if *shutdown.borrow() {
             break;
         }
-        let connect = tokio::select! {
-            r = endpoint.connect(server_addr) => r,
-            _ = shutdown.changed() => break,
-        };
-        match connect {
-            Ok(peer) => {
-                let started = Instant::now();
-                match session(
-                    peer,
-                    &name,
-                    inject.as_mut(),
-                    stats,
-                    SessionAudio {
-                        audio: &audio,
-                        counters: &counters,
-                        mic: &mic,
-                        mic_stats: &mic_stats,
-                    },
-                    clipboard.clone(),
-                    &mut shutdown,
-                )
-                .await
-                {
-                    Ok(()) => info!("disconnected from server"),
-                    Err(e) => warn!("session ended: {e}"),
+        match target.resolve().await {
+            Ok(server_addr) => {
+                let connect = tokio::select! {
+                    r = endpoint.connect(server_addr) => r,
+                    _ = shutdown.changed() => break,
+                };
+                match connect {
+                    Ok(peer) => {
+                        let started = Instant::now();
+                        match session(
+                            peer,
+                            &name,
+                            inject.as_mut(),
+                            stats,
+                            SessionAudio {
+                                audio: &audio,
+                                counters: &counters,
+                                mic: &mic,
+                                mic_stats: &mic_stats,
+                            },
+                            clipboard.clone(),
+                            &mut shutdown,
+                        )
+                        .await
+                        {
+                            Ok(()) => info!("disconnected from server"),
+                            Err(e) => warn!("session ended: {e}"),
+                        }
+                        backoff.note_connected_for(started.elapsed());
+                    }
+                    Err(NetError::Untrusted(reason)) => {
+                        warn!("connect to {server_addr} rejected: untrusted server ({reason})")
+                    }
+                    Err(e) => debug!("connect to {server_addr} failed: {e}"),
                 }
-                backoff.note_connected_for(started.elapsed());
             }
-            Err(NetError::Untrusted(reason)) => {
-                warn!("connect to {server_addr} rejected: untrusted server ({reason})")
-            }
-            Err(e) => debug!("connect to {server_addr} failed: {e}"),
+            // The target may simply not be up yet (a fresh DHCP lease, an mDNS
+            // name whose owner hasn't announced yet): this waits out the same
+            // backoff as a failed connection, below, rather than being fatal.
+            Err(e) => debug!("could not resolve {target:?}: {e}"),
         }
         if *shutdown.borrow() {
             break;
@@ -398,10 +412,10 @@ pub async fn main(cfg: Config, host: Option<&str>, stats: bool) -> anyhow::Resul
     if trust.read().unwrap().peers().is_empty() {
         bail!("no paired server; run `pheme pair <host> <code>` first");
     }
-    let server_addr = cfg.connect_addr(host)?;
+    let target = cfg.connect_target(host)?;
     let endpoint = Endpoint::client(&identity, trust)?;
     let inject = pheme_input::detect_inject().context("input injection backend")?;
-    info!(name = %cfg.name, server = %server_addr, fingerprint = %identity.fingerprint, "pheme client");
+    info!(name = %cfg.name, target = ?target, fingerprint = %identity.fingerprint, "pheme client");
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
         let _ = tokio::signal::ctrl_c().await;
@@ -414,7 +428,7 @@ pub async fn main(cfg: Config, host: Option<&str>, stats: bool) -> anyhow::Resul
             name: cfg.name.clone(),
             inject,
             endpoint,
-            server_addr,
+            target,
             stats,
             audio: CaptureSource::Detect(cfg.audio.capture_device.clone()),
             audio_counters: None,
@@ -432,7 +446,7 @@ pub async fn pair(cfg: Config, host: &str, code: &str) -> anyhow::Result<()> {
     let dir = config_dir();
     let identity = Identity::load_or_create(&dir, &cfg.name)?;
     let trust = TrustStore::load(&dir)?.shared();
-    let addr = cfg.connect_addr(Some(host))?;
+    let addr = cfg.connect_target(Some(host))?.resolve().await?;
     let endpoint = Endpoint::pairing_client(&identity, trust.clone())?;
     let server_name = client_pair(&endpoint, addr, code.trim(), &identity, trust).await?;
     println!("Paired with {server_name} at {addr}. You can now run `pheme client {host}`.");

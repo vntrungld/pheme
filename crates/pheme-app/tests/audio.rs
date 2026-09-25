@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use pheme_app::audio::{CaptureSource, InStats, OutCounters, PlaybackSource};
 use pheme_app::client::{run_client, ClientDeps};
 use pheme_app::server::{run_server, ServerDeps};
+use pheme_app::target::Target;
 use pheme_audio::mock::{MockCapture, MockCaptureHandle, MockPlayback, MockPlaybackHandle};
 use pheme_audio::FRAME_INTERLEAVED;
 use pheme_core::{CaptureEvent, ClientPlacement, Hotkeys, Side};
@@ -136,7 +137,7 @@ fn spawn_pair(fail_capture: bool) -> Pair {
             name: "lap".into(),
             inject: Box::new(inject),
             endpoint: client_ep,
-            server_addr,
+            target: Target::Fixed(server_addr),
             stats: false,
             audio: CaptureSource::Backend(Box::new(mic_backend)),
             audio_counters: Some(sent.clone()),

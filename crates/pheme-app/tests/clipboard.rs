@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use pheme_app::client::{run_client, ClientDeps};
 use pheme_app::clipboard::ClipboardService;
 use pheme_app::server::{run_server, ServerDeps};
+use pheme_app::target::Target;
 use pheme_clip::mock::{MockClipboard, MockClipboardHandle};
 use pheme_clip::Clipboard;
 use pheme_core::{CaptureEvent, ClientPlacement, Hotkeys, Side};
@@ -144,7 +145,7 @@ async fn spawn_clip_pair(with_client_clip: bool) -> ClipPair {
             name: "lap".into(),
             inject: Box::new(inject),
             endpoint: client_ep,
-            server_addr,
+            target: Target::Fixed(server_addr),
             stats: false,
             audio: pheme_app::audio::CaptureSource::Disabled,
             audio_counters: None,

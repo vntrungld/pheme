@@ -2,6 +2,7 @@ use std::time::{Duration, Instant};
 
 use pheme_app::client::{run_client, ClientDeps};
 use pheme_app::server::{run_server, ServerDeps};
+use pheme_app::target::Target;
 use pheme_core::{CaptureEvent, ClientPlacement, Hotkeys, Side};
 use pheme_input::mock::{InjectCall, MockCapture, MockCaptureHandle, MockInject, MockInjectLog};
 use pheme_input::CaptureMode;
@@ -113,7 +114,7 @@ fn spawn_pair_with_hotkeys(hotkeys: Hotkeys) -> Pair {
             name: "lap".into(),
             inject: Box::new(inject),
             endpoint: client_ep,
-            server_addr,
+            target: Target::Fixed(server_addr),
             stats: false,
             audio: pheme_app::audio::CaptureSource::Disabled,
             audio_counters: None,
@@ -203,7 +204,7 @@ async fn server_and_client_exchange_input_over_quic() {
             name: "lap".into(),
             inject: Box::new(inject),
             endpoint: client_ep,
-            server_addr,
+            target: Target::Fixed(server_addr),
             stats: false,
             audio: pheme_app::audio::CaptureSource::Disabled,
             audio_counters: None,
@@ -335,7 +336,7 @@ async fn client_reconnects_after_server_restart() {
             name: "lap".into(),
             inject: Box::new(inject),
             endpoint: client_ep,
-            server_addr,
+            target: Target::Fixed(server_addr),
             stats: false,
             audio: pheme_app::audio::CaptureSource::Disabled,
             audio_counters: None,
@@ -462,7 +463,7 @@ async fn server_releases_grab_when_client_vanishes_silently() {
             name: "lap".into(),
             inject: Box::new(inject),
             endpoint: client_ep,
-            server_addr,
+            target: Target::Fixed(server_addr),
             stats: false,
             audio: pheme_app::audio::CaptureSource::Disabled,
             audio_counters: None,
