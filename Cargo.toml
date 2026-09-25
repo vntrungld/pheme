@@ -53,6 +53,7 @@ reis = { version = "0.7", features = ["async-io"] }
 futures-lite = "2"
 async-channel = "2"
 arboard = { version = "3.6", default-features = false, features = ["wayland-data-control"] }
+mdns-sd = "0.21"
 
 [profile.release]
 lto = "thin"

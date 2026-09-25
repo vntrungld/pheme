@@ -1,5 +1,6 @@
 //! QUIC transport with pinned-certificate mTLS, pairing and reconnect helpers.
 
+pub mod discovery;
 mod fsutil;
 pub mod identity;
 pub mod pairing;
@@ -7,6 +8,7 @@ pub mod transport;
 pub mod trust;
 pub mod verifier;
 
+pub use discovery::{advertise, browse, resolve, Advertiser, Found};
 pub use identity::Identity;
 pub use transport::{CloseReason, Endpoint, Incoming, Peer, PeerSender};
 pub use trust::{SharedTrust, TrustStore, TrustedPeer};

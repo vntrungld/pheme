@@ -21,6 +21,7 @@ toml = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+mdns-sd = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
