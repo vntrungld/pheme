@@ -630,8 +630,9 @@ impl eframe::App for PhemeApp {
         pump_gtk();
 
         // Collected rather than handled inline: `tray.poll()` holds a
-        // mutable borrow of `self.tray` for the loop, and `ToggleLock` and
-        // `StartStop` now call `self.toggle_lock()` / `self.start_stop()`
+        // mutable borrow of `self.tray` for the loop, and `ToggleLock`,
+        // `StartStop` and `SwitchDisplay` all call a method on `self` --
+        // `self.toggle_lock()` / `self.start_stop()` / `self.switch_display()`
         // -- the same methods the window's own buttons call, per Finding 3
         // -- which need the whole of `self`, not just the tray field. The
         // borrow has to end before those run.
@@ -684,7 +685,11 @@ impl eframe::App for PhemeApp {
         // until the first `Status` arrives, which -- while pairing is in
         // progress -- can be a while (see `spawn_generation`'s comment on
         // why the code has to travel over stdout instead).
-        let role = self.supervisor.config().map(|c| c.role);
+        let cfg = self.supervisor.config();
+        let role = cfg.as_ref().map(|c| c.role);
+        // Likewise: whether display switching is configured at all is not
+        // something `Status` ever reports, only the held `Config`.
+        let display_configured = cfg.as_ref().is_some_and(|c| c.display.input.is_some());
         self.view.apply(&state);
         if let Some(tray) = &mut self.tray {
             tray.set_state(&state);
@@ -708,7 +713,7 @@ impl eframe::App for PhemeApp {
                     );
                     ui.separator();
                 }
-                draw_status(ui, &self.view);
+                draw_status(ui, &self.view, display_configured);
                 draw_actions(ui, &state, self);
                 draw_pairing(ui, role, &state, self);
                 draw_config(ui, self);
@@ -743,8 +748,12 @@ impl eframe::App for PhemeApp {
     }
 }
 
-/// Draws the status panel for `view`.
-fn draw_status(ui: &mut egui::Ui, view: &StatusView) {
+/// Draws the status panel for `view`. `display_configured` is whether this
+/// machine's own `[display] input` is set at all -- known from the held
+/// `Config`, not from anything `Status` reports, and needed to tell "the
+/// feature is off" apart from "it is on and nothing has been commanded
+/// yet" (see [`display_status_text`]).
+fn draw_status(ui: &mut egui::Ui, view: &StatusView, display_configured: bool) {
     let Some(role) = view.role else {
         if let Some(reason) = &view.stopped_reason {
             ui.heading("Stopped");
@@ -792,10 +801,8 @@ fn draw_status(ui: &mut egui::Ui, view: &StatusView) {
             ui.label(if view.locked { "yes" } else { "no" });
             ui.end_row();
 
-            ui.label(match view.display_input {
-                Some(v) => format!("Display input 0x{v:02x}"),
-                None => "Display switching off".to_string(),
-            });
+            ui.label("Display");
+            ui.label(display_status_text(display_configured, view.display_input));
             ui.end_row();
 
             ui.label("Events/s");
@@ -855,6 +862,24 @@ fn link_state_name(state: &LinkState) -> &'static str {
         LinkState::Connecting => "Connecting",
         LinkState::Connected => "Connected",
         LinkState::Failed(_) => "Failed",
+    }
+}
+
+/// What the "Display" row says. `Status.display_input` alone cannot tell
+/// three situations apart: the feature is off; it is on and nothing has
+/// been commanded yet, which is every run until the first crossing (and
+/// every attempt whose command failed too, since `DisplayService` never
+/// stores a failed one); or it is on and `v` is the input last
+/// successfully commanded. `configured` -- this machine's own `[display]
+/// input` from the held `Config`, not anything `Status` reports -- is what
+/// makes the first two distinguishable; the third case folds the "nothing
+/// yet" and "last command failed" situations together, which is accepted,
+/// but the text must not claim to know which of those two it is.
+fn display_status_text(configured: bool, display_input: Option<u16>) -> String {
+    match (configured, display_input) {
+        (false, _) => "Off".to_string(),
+        (true, None) => "On, nothing commanded yet".to_string(),
+        (true, Some(v)) => format!("0x{v:02x}"),
     }
 }
 
@@ -1460,9 +1485,27 @@ mod tests {
         let mut view = StatusView::default();
         view.apply(&CoreState::Running(server_status_with_peer("laptop-win")));
         assert_eq!(view.peer.as_deref(), Some("laptop-win"));
+        assert_eq!(
+            view.display_input,
+            Some(0x11),
+            "display_input was not copied from Status"
+        );
         view.apply(&CoreState::Stopped("restarting".into()));
         assert_eq!(view.peer, None, "a stale peer survived the restart");
         assert_eq!(view.rtt_us, 0);
+    }
+
+    #[test]
+    fn the_display_line_tells_off_from_not_yet_commanded_from_commanded() {
+        // The finding this exists for: `display_input` alone cannot tell
+        // "the feature is off" apart from "it is on and nothing has been
+        // commanded yet" -- both are `None`. `configured` is what makes
+        // them distinguishable, and the wording must not claim more than
+        // it knows once a command could have failed silently.
+        assert_eq!(display_status_text(false, None), "Off");
+        assert_eq!(display_status_text(false, Some(0x11)), "Off");
+        assert_eq!(display_status_text(true, None), "On, nothing commanded yet");
+        assert_eq!(display_status_text(true, Some(0x11)), "0x11");
     }
 
     #[test]

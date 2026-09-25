@@ -287,8 +287,11 @@ pub async fn run_client(
                         // There is no core to ask and no peer to tell -- the
                         // server owns the hotkey -- so this re-asserts the
                         // input this machine last learned the server is
-                        // cabled to, exactly as `session`'s own `Msg::Leave`
-                        // handling does.
+                        // cabled to. Unlike `session`'s own `Msg::Leave`
+                        // handling, which calls `switch_to` and so can be
+                        // deduped or held by the cooldown policy, this is a
+                        // recovery action and calls `force`, which bypasses
+                        // both on purpose.
                         Ok(Some(Command::SwitchDisplay)) => {
                             let v = *known_server_display_input.lock().unwrap();
                             if let (Some(d), Some(v)) = (display_for_cmd.as_ref(), v) {

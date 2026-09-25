@@ -117,9 +117,12 @@ struct Shared {
     ///
     /// Owned here, and so kept alive by every `Arc<Shared>` -- including
     /// the router thread's own clone. `DisplayService` has no shutdown:
-    /// dropping it disconnects the channel and its thread exits silently,
-    /// so anything shorter-lived than the router would turn switching off
-    /// mid-session with nothing in the log to say why.
+    /// dropping its last clone disconnects the channel and its thread
+    /// exits silently, so anything shorter-lived than the router would
+    /// turn switching off mid-session with nothing in the log to say why.
+    /// The server keeps exactly one clone, this field; only the client
+    /// clones a second, for its IPC command loop (see `DisplayService`'s
+    /// own doc comment).
     display: Option<DisplayService>,
     /// This machine's own `[display] input`, the hotkey's target while the
     /// pointer is here.
