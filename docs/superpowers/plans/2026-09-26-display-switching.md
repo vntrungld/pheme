@@ -1607,12 +1607,89 @@ and in `impl Default for HotkeysCfg`, beside `lock`:
             switch_display: None,
 ```
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [ ] **Step 5: Carry both new fields through the settings form**
+
+Also modify: `crates/pheme-app/src/frontend/window.rs`.
+
+`ConfigForm` builds a whole `Config` from the panel's fields as an
+exhaustive struct literal (`ConfigForm::build`, around line 317), so adding
+a field to `Config` or `HotkeysCfg` stops the crate compiling. Two lines
+would fix that — and would introduce a worse bug than the one they fix.
+Neither new setting has a widget, so rebuilding the config from the form
+would reset both to their defaults: somebody who wrote `[display] input`
+into the file by hand would lose it, silently, the first time they pressed
+Save, and display switching would go quiet with nothing to explain why.
+
+The file already answers this. `ConfigForm::discovery` carries a setting
+the panel does not show, for exactly this reason, and says so in its doc
+comment. Follow it.
+
+In `struct ConfigForm`, beside `discovery`:
+
+```rust
+    /// Not exposed in the panel, and carried through unedited for the same
+    /// reason `discovery` is: a `[display]` section written by hand must
+    /// survive a Save from this form.
+    display: DisplayCfg,
+    /// Likewise. `hotkeys.switch_display` has no widget either.
+    switch_display: Option<String>,
+```
+
+In `ConfigForm::from_config`:
+
+```rust
+            display: cfg.display.clone(),
+            switch_display: cfg.hotkeys.switch_display.clone(),
+```
+
+In `ConfigForm::build`'s `Config` literal:
+
+```rust
+            hotkeys: HotkeysCfg {
+                lock: trimmed_or_none(&self.lock_hotkey),
+                switch_display: self.switch_display.clone(),
+            },
+```
+
+and, beside `audio`:
+
+```rust
+            display: self.display.clone(),
+```
+
+Import `DisplayCfg` from `crate::config` alongside the `AudioCfg` and
+`HotkeysCfg` already imported there.
+
+- [ ] **Step 6: Pin the round trip**
+
+In `crates/pheme-app/src/frontend/window.rs`'s `#[cfg(test)] mod tests`:
+
+```rust
+    /// Break it by dropping the carried fields and letting `build` fill
+    /// them from `Default`: a person who configured display switching by
+    /// hand loses it the first time they press Save, and the feature goes
+    /// quiet with nothing to explain why.
+    #[test]
+    fn the_form_carries_display_settings_it_cannot_edit() {
+        let mut cfg = Config::default();
+        cfg.display.input = Some(0x11);
+        cfg.display.monitor = Some("ULTRAGEAR".into());
+        cfg.display.cooldown_ms = 250;
+        cfg.hotkeys.switch_display = Some("F12".into());
+
+        let back = ConfigForm::from_config(&cfg).build().expect("valid config");
+
+        assert_eq!(back.display, cfg.display);
+        assert_eq!(back.hotkeys.switch_display.as_deref(), Some("F12"));
+    }
+```
+
+- [ ] **Step 7: Run the tests to verify they pass**
 
 Run: `cargo test -p pheme-app --lib config`
 Expected: PASS.
 
-- [ ] **Step 6: Run the full gate**
+- [ ] **Step 8: Run the full gate**
 
 ```bash
 cargo fmt --all -- --check
@@ -1620,10 +1697,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
-git add crates/pheme-app/src/config.rs
+git add crates/pheme-app/src/config.rs crates/pheme-app/src/frontend/window.rs
 git commit -F - <<'EOF'
 Update: add the display section to the configuration
 
