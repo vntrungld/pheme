@@ -5,6 +5,7 @@ members = [
     "crates/pheme-core",
     "crates/pheme-input",
     "crates/pheme-audio",
+    "crates/pheme-clip",
     "crates/pheme-net",
     "crates/pheme-app",
 ]
@@ -21,6 +22,7 @@ pheme-proto = { path = "crates/pheme-proto" }
 pheme-core = { path = "crates/pheme-core" }
 pheme-input = { path = "crates/pheme-input" }
 pheme-audio = { path = "crates/pheme-audio" }
+pheme-clip = { path = "crates/pheme-clip" }
 pheme-net = { path = "crates/pheme-net" }
 
 serde = { version = "1", features = ["derive"] }

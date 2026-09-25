@@ -15,6 +15,23 @@ use serde::{Deserialize, Serialize};
 /// See §2.4 of the sub-project 3 spec.
 pub const PROTOCOL_VERSION: u16 = 2;
 
+/// The largest clipboard payload Pheme sends or accepts, in bytes.
+///
+/// The cap lives here, not in `pheme-clip`, because two crates enforce it: the
+/// sender's policy (`ClipSync`) and the receiver's unidirectional-stream reader
+/// in `pheme-net`. A receiver with a smaller cap than the sender would silently
+/// drop content the sender believed it had delivered. `pheme-net` depends on
+/// this crate and must never depend on `pheme-clip`.
+pub const MAX_CLIP_BYTES: usize = 1024 * 1024;
+
+/// Room above `MAX_CLIP_BYTES` for the encoding around the payload: the enum
+/// tag, the MIME string and the two length prefixes.
+pub const CLIP_FRAME_SLACK: usize = 256;
+
+/// The only clipboard format Pheme speaks. A message in any other format is
+/// ignored by the receiver rather than guessed at.
+pub const CLIP_MIME: &str = "text/plain;charset=utf-8";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Os {
     Linux,

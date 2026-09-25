@@ -1317,6 +1317,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pheme-clip"
+version = "0.1.0"
+dependencies = [
+ "pheme-proto",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "pheme-core"
 version = "0.1.0"
 dependencies = [
