@@ -9,6 +9,8 @@ use pheme_input::keymap::key_by_name;
 use pheme_net::DEFAULT_PORT;
 use serde::{Deserialize, Serialize};
 
+use crate::target::Target;
+
 pub fn config_dir() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -236,6 +238,16 @@ impl Config {
             Some(a) => Ok(a),
             None => bail!("{with_port} did not resolve to an IPv4 address"),
         }
+    }
+
+    /// The server to connect to, as a target that is resolved on every attempt.
+    ///
+    /// `connect_addr` resolves once and returns an address; this returns the
+    /// *question*, so the reconnect loop can ask it again after the answer
+    /// changes. §4.3.
+    pub fn connect_target(&self, override_host: Option<&str>) -> anyhow::Result<Target> {
+        let host = override_host.or(self.connect.as_deref()).unwrap_or("");
+        Target::parse(host)
     }
 }
 

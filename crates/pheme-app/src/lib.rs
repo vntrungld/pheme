@@ -7,3 +7,4 @@ pub mod clipboard;
 pub mod config;
 pub mod server;
 pub mod setup;
+pub mod target;
