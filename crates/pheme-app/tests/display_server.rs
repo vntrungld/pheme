@@ -20,7 +20,7 @@ use pheme_app::config::DisplayCfg;
 use pheme_app::display::DisplayService;
 use pheme_app::server::{run_server, ServerDeps};
 use pheme_core::{CaptureEvent, ClientPlacement, Hotkeys, Side};
-use pheme_display::mock::{MockMonitor, MockMonitorHandle};
+use pheme_display::mock::{opens_once, MockMonitor, MockMonitorHandle};
 use pheme_input::mock::{MockCapture, MockCaptureHandle};
 use pheme_input::CaptureMode;
 use pheme_net::{Endpoint, Identity, Peer, TrustStore};
@@ -103,7 +103,7 @@ async fn spawn_rig() -> Rig {
             // in `display.rs`, and a real one would only make these wait.
             cooldown_ms: 0,
         },
-        Box::new(move || Ok(Box::new(monitor))),
+        Box::new(opens_once(monitor)),
     )
     .expect("the feature is configured on");
 

@@ -22,12 +22,34 @@ use crate::config::DisplayCfg;
 /// closure that has already captured `display.monitor`. A closure's `Send`
 /// depends on what it captures, not on what it returns, so this stays
 /// `Send` even though `Monitor` is not.
-pub type OpenFn = Box<dyn FnOnce() -> Result<Box<dyn Monitor>, DisplayError> + Send>;
+///
+/// `FnMut`, not `FnOnce`: an open that found nothing is retried at the one
+/// instant its answer can have changed, which is when this machine becomes
+/// the input the monitor is displaying (see `Req::BecameDisplayed`).
+/// `pheme_display::mock::opens_once` is the shape a test wants.
+pub type OpenFn = Box<dyn FnMut() -> Result<Box<dyn Monitor>, DisplayError> + Send>;
 
 enum Req {
     Switch(u16),
     Force(u16),
+    /// This machine has just become the input the monitor is displaying.
+    /// Carries this machine's own `display.input`.
+    BecameDisplayed(u16),
 }
+
+/// How many times a monitor is opened before the service gives up for good:
+/// once at startup, then once at each of the first two moments this machine
+/// becomes the displayed input.
+///
+/// A bound is needed because DDC/CI is answered only by the displayed
+/// input, so an enumeration that found nothing at startup may simply have
+/// been run on the machine that was off screen. Retrying at every crossing
+/// for ever would cost a second of the display thread on every crossing on
+/// the very common hardware that answers nothing at all; three attempts is
+/// enough to cover a monitor that was mid-switch or re-syncing on the first
+/// one, and after them the thread exits exactly as design section 7 says --
+/// nothing retries on a schedule, and nothing retries for ever.
+const OPEN_ATTEMPTS: u32 = 3;
 
 /// Four, the same depth the status channel uses. A full queue means four
 /// crossings are already waiting on a monitor that takes seconds to answer,
@@ -58,9 +80,12 @@ impl DisplayService {
     ///
     /// This returns before the monitor is opened, so it cannot and does not
     /// report whether one answered: enumeration costs about a second and
-    /// runs on the spawned thread. A thread that finds no monitor logs once
-    /// and exits, which disconnects the channel and turns every later
-    /// `switch_to` into a dropped send.
+    /// runs on the spawned thread. A thread that finds no monitor says so
+    /// once and holds no handle; every `switch_to` it is then sent is
+    /// dropped, and it tries again only when `became_displayed` says this
+    /// machine is on screen, at most `OPEN_ATTEMPTS` times in all. When
+    /// those run out it exits, which disconnects the channel and turns
+    /// every later send into a dropped one.
     pub fn spawn(cfg: &DisplayCfg, open: OpenFn) -> Option<DisplayService> {
         // Off unless `[display] input` names the input this machine is
         // cabled to. Written with `?` because clippy's `question_mark` lint
@@ -100,6 +125,24 @@ impl DisplayService {
         self.send(Req::Force(value));
     }
 
+    /// This machine has just become the input the monitor is displaying,
+    /// and `own_input` is the value it is cabled to. Never blocks and never
+    /// fails.
+    ///
+    /// The peer commands the same monitor, so the policy's belief about
+    /// what is on screen goes stale every time the peer switches it. This
+    /// is the one moment that belief can be refreshed: the monitor is
+    /// listening to this machine's cable, so it will answer a read, and a
+    /// machine whose startup enumeration found nothing because it was off
+    /// screen can finally find something.
+    ///
+    /// The server calls it when the pointer returns to local -- the client
+    /// has just commanded the monitor to this machine's input -- and the
+    /// client on `Msg::Enter`, where the server has just done the same.
+    pub fn became_displayed(&self, own_input: u16) {
+        self.send(Req::BecameDisplayed(own_input));
+    }
+
     fn send(&self, req: Req) {
         // A dropped crossing and a dropped rescue are not the same event.
         // The queue's rationale -- four crossings deep, the oldest is no
@@ -123,29 +166,18 @@ impl DisplayService {
     }
 }
 
-fn run(rx: Receiver<Req>, open: OpenFn, cooldown: Duration, last: Arc<AtomicU32>) {
-    let mut mon = match open() {
-        Ok(m) => m,
-        Err(e) => {
-            // Once, and never retried on any schedule. A machine whose
-            // monitor does not speak DDC/CI is an ordinary machine, not a
-            // fault worth repeating.
-            warn!(error = %e, "display switching is off: no usable monitor");
-            return;
-        }
-    };
-    info!(
-        monitor = mon.identity(),
-        at = mon.location(),
-        "display switching is on"
-    );
+fn run(rx: Receiver<Req>, mut open: OpenFn, cooldown: Duration, last: Arc<AtomicU32>) {
     let mut policy = DisplaySwitch::new(cooldown);
-    match mon.get_input() {
-        Ok(v) => policy.observe(v),
-        Err(e) => debug!(
-            error = %e,
-            "could not read the current input; the first switch will be issued blind"
-        ),
+    let mut attempts = 0u32;
+    let mut mon = open_monitor(&mut open, &mut attempts);
+    if let Some(m) = mon.as_mut() {
+        match m.get_input() {
+            Ok(v) => policy.observe(v),
+            Err(e) => debug!(
+                error = %e,
+                "could not read the current input; the first switch will be issued blind"
+            ),
+        }
     }
     let mut warned = false;
     loop {
@@ -169,10 +201,83 @@ fn run(rx: Receiver<Req>, open: OpenFn, cooldown: Duration, last: Arc<AtomicU32>
         let issue = match req {
             Some(Req::Switch(v)) => policy.request(v, now),
             Some(Req::Force(v)) => Some(policy.force(v, now)),
+            Some(Req::BecameDisplayed(own)) => {
+                if mon.is_none() {
+                    mon = open_monitor(&mut open, &mut attempts);
+                    if mon.is_none() && attempts >= OPEN_ATTEMPTS {
+                        warn!(
+                            attempts,
+                            "display switching stays off: no monitor answered DDC/CI even \
+                             with this machine on screen"
+                        );
+                        return;
+                    }
+                }
+                if mon.is_some() {
+                    // `own`, and deliberately not a fresh `get_input()`.
+                    // The event itself is the stronger evidence: it means
+                    // the peer has just commanded the monitor to this
+                    // machine's cable, so this machine's own input is what
+                    // is on screen by construction.
+                    //
+                    // A read here races that command. The peer issues it
+                    // on *its* display thread and sends the crossing at
+                    // once, so a read taken on this side can still return
+                    // the peer's input -- and observing that value is the
+                    // very defect this hook exists to fix, because rule 1
+                    // would then refuse this machine's next correct
+                    // command. On the hardware design section 2 describes
+                    // the read would merely fail and fall back to `own`,
+                    // but on a monitor that answers from a non-displayed
+                    // input (section 15) it succeeds with a stale value,
+                    // and `display_crossing.rs` fails on it deterministically.
+                    //
+                    // Believing `own` wrongly cannot wedge anything: the
+                    // only command rule 1 can refuse is one for this
+                    // machine's own input, and a crossing never asks for
+                    // that -- it asks for the peer's. The recovery hotkey
+                    // bypasses rule 1 outright.
+                    policy.observe(own);
+                    debug!(input = own, "this machine is the displayed input");
+                }
+                None
+            }
             None => policy.poll(now),
         };
-        if let Some(v) = issue {
-            apply(mon.as_mut(), &mut policy, v, &mut warned, &last);
+        if let (Some(v), Some(m)) = (issue, mon.as_mut()) {
+            apply(m.as_mut(), &mut policy, v, &mut warned, &last);
+        }
+    }
+}
+
+/// One attempt at acquiring a monitor, counted against `OPEN_ATTEMPTS`.
+///
+/// A failure is ordinary: a machine whose monitor does not speak DDC/CI is
+/// an ordinary machine. It is said once at `warn` and afterwards at
+/// `debug`, so a person sees it without a retry filling the log.
+fn open_monitor(open: &mut OpenFn, attempts: &mut u32) -> Option<Box<dyn Monitor>> {
+    *attempts += 1;
+    match open() {
+        Ok(m) => {
+            info!(
+                monitor = m.identity(),
+                at = m.location(),
+                "display switching is on"
+            );
+            Some(m)
+        }
+        Err(e) if *attempts == 1 => {
+            warn!(
+                error = %e,
+                "display switching is off: no usable monitor. DDC/CI is answered only by \
+                 the input the monitor is showing, so this is retried if this machine \
+                 becomes that input"
+            );
+            None
+        }
+        Err(e) => {
+            debug!(error = %e, attempt = *attempts, "still no usable monitor");
+            None
         }
     }
 }

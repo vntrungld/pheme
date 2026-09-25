@@ -181,7 +181,8 @@ pub struct DisplaySwitch {
 
 impl DisplaySwitch {
     pub fn new(cooldown: Duration) -> Self;
-    /// Seed `selected` from a successful read at startup.
+    /// Seed `selected` from a successful read at startup, or from the
+    /// moment this machine becomes the displayed input (below).
     pub fn observe(&mut self, value: u16);
     /// A crossing asks for `value`. `Some(v)` means issue it now.
     pub fn request(&mut self, value: u16, now: Instant) -> Option<u16>;
@@ -225,6 +226,44 @@ input the monitor is not showing, and rule 1 would refuse to correct it.
 So the service records the value **only after** `set_input` returns `Ok`,
 and calls `forget()` when it does not.
 
+**How the belief learns what the peer did.** `selected` is a belief about a
+resource *both* machines command, so it goes stale every time the peer
+switches the monitor. Nothing in the list above tells it so, and a stale
+belief is not harmless: rule 1 refuses a command for the input it thinks is
+already selected, silently. Walk the first version of this design: the
+client reads `0x11` at startup, the server switches the monitor to the
+client's `0x0f` on the first crossing, and on the crossing back the client's
+rule 1 refuses its own correct command because it still believes `0x11`. The
+picture stays on the client while the pointer is on the server — the exact
+failure this feature exists to prevent, after exactly one crossing.
+
+There is one moment at which each machine can learn the answer, and it is
+the same moment §2 gives it the power to act: **when it becomes the
+displayed input**. Both sides know it exactly:
+
+- the **client**, on `Msg::Enter` — the server has just commanded the
+  monitor to the client's own input;
+- the **server**, when the pointer returns to local (it sends `Msg::Leave`)
+  — the client has just commanded the monitor to the server's own input.
+
+`DisplayService::became_displayed(own_input)` carries it, alongside
+`switch_to` and `force` and with the same never-blocks, never-fails
+contract. The service thread answers it with `observe(own_input)`.
+
+`own_input`, and deliberately **not** a fresh `get_input()`. The event is
+the stronger evidence: it means the peer has just commanded the monitor to
+this machine's cable. A read races that command — the peer issues it on its
+own display thread and sends the crossing at once — so a read taken here can
+still return the *peer's* input, and observing that is the very defect this
+hook exists to fix. On the hardware §2 describes the read would merely fail
+and fall back to `own_input`; on a monitor that answers from a non-displayed
+input (§15) it succeeds with a stale value, which
+`tests/display_crossing.rs` fails on deterministically. Believing
+`own_input` wrongly — when the peer's command did not land — cannot wedge
+anything, because the only command rule 1 can refuse is one for this
+machine's own input, and a crossing never asks for that; it asks for the
+peer's.
+
 ### 3.5 The mock
 
 `MockMonitor` / `MockMonitorHandle`, mirroring `MockClipboard` from
@@ -239,27 +278,33 @@ thread while the service thread owns the monitor.
 ```rust
 pub struct DisplayService { tx: crossbeam_channel::Sender<Req> }
 
-enum Req { Switch(u16), Force(u16) }
+enum Req { Switch(u16), Force(u16), BecameDisplayed(u16) }
 
 /// How the service acquires its monitor. Injected so the tests can hand it
 /// a `MockMonitor`; production passes a closure over `pheme_display::open`
 /// that has already captured `cfg.monitor`, which keeps the boxed closure
 /// free of borrowed arguments and so `Send`.
+///
+/// `FnMut`, because §7's bounded retry calls it more than once.
 pub type OpenFn =
-    Box<dyn FnOnce() -> Result<Box<dyn Monitor>, DisplayError> + Send>;
+    Box<dyn FnMut() -> Result<Box<dyn Monitor>, DisplayError> + Send>;
 
 impl DisplayService {
     /// `None` when the feature is off, i.e. no `[display] input` in the
     /// config. This returns before the monitor is opened, so it cannot and
     /// does not report whether one answered: enumeration costs a second
-    /// and runs on the spawned thread. A thread that finds no monitor logs
-    /// once (§7) and exits, which disconnects the channel and makes every
-    /// later `switch_to` a dropped send.
+    /// and runs on the spawned thread. A thread that finds no monitor says
+    /// so once (§7), holds no handle and drops every later `switch_to`,
+    /// and exits once its retries are spent.
     pub fn spawn(cfg: &DisplayCfg, open: OpenFn) -> Option<DisplayService>;
     /// Never blocks and never fails. A full queue drops the request:
     /// whatever filled it is a more recent intention than this one.
     pub fn switch_to(&self, value: u16);
     pub fn force(&self, value: u16);
+    /// This machine is now the input the monitor is displaying, and it is
+    /// cabled to `own_input` (§3.4). Reopens a monitor if none is held,
+    /// and tells the policy what is on screen. Never blocks, never fails.
+    pub fn became_displayed(&self, own_input: u16);
 }
 ```
 
@@ -276,7 +321,9 @@ indefinitely.
 On startup the thread runs the `OpenFn` it was given, then `get_input()` once
 and `observe()`s the result if it succeeds. A failed read is not an error
 — it leaves `selected` unknown, and the first crossing issues a command
-that would otherwise have been deduplicated away.
+that would otherwise have been deduplicated away. It is the only read the
+service ever takes; after it, the policy learns the monitor's state from
+`confirm`, `forget` and `became_displayed` (§3.4).
 
 ## 5. Where it hooks
 
@@ -304,6 +351,13 @@ if matches!(m, Msg::Leave { .. }) {
     if let (Some(d), Some(v)) = (&display, server_display_input) { d.switch_to(v); }
 }
 ```
+
+Each side also answers the *opposite* transition — the one that makes it
+the displayed input — with `became_displayed(own_input)` (§3.4): the server
+in the same arm, on `Msg::Enter`'s mirror `Msg::Leave`, and the client on
+`Msg::Enter`. Those two calls issue no command; they keep this machine's
+belief about a monitor the peer also commands from going stale, and give a
+machine that found no monitor at startup its chance to find one.
 
 `display_input: Option<u16>` is a new field on the existing `Link` struct
 (`server.rs:77`), set from the client's `Hello` when the link is built.
@@ -367,10 +421,24 @@ library. It is a common case and the feature must treat it as ordinary,
 not exceptional:
 
 - `enumerate()` finding nothing, or `open()` matching nothing, makes the
-  service thread log **one** warning naming what was tried and exit.
-  Nothing retries, on any schedule, ever. The hooks in §5 go on calling
-  `switch_to`, and each call is a send on a channel with no receiver,
-  which `switch_to` discards exactly as it discards a full one.
+  service thread log **one** warning naming what was tried and hold no
+  monitor. The hooks in §5 go on calling `switch_to`, and each call is
+  discarded exactly as a full queue is.
+
+  It does not exit on the spot, because on the hardware §2 is premised on a
+  startup enumeration finding nothing may mean only that this machine was
+  not the one on screen — and that is the machine, by §2, that will have to
+  command the monitor later. So the open is retried at the one instant its
+  answer can have changed: `became_displayed` (§3.4). **Nothing retries on
+  a schedule** — there is no timer anywhere in this design — and nothing
+  retries for ever: the open is attempted `OPEN_ATTEMPTS` = 3 times in all,
+  once at startup and once at each of the first two crossings that put this
+  machine on screen. Three covers a monitor that was still re-syncing on the
+  first retry. When they run out the thread says so once more and exits,
+  which disconnects the channel and makes every later send a dropped one,
+  exactly as before. The bound is what keeps the common case — hardware that
+  answers no DDC/CI at all — from spending 1.09 s of the display thread on
+  every crossing for the life of the program.
 - A `set_input` that fails logs a warning the first time and at `debug`
   after that, calls `forget()`, and leaves the service running.
 - `switch_to` on a `None` service is a no-op at the call site, because the
@@ -504,13 +572,24 @@ Automated, none of it needing a monitor:
   checksum; a block with no `0xFC` descriptor; one with no `0xFF`.
 - The capability-string input list: a real-shaped string, one with no
   `60(...)`, one that is truncated mid-list.
+- **Both machines over one shared `MockMonitor`** (`display_crossing.rs`):
+  a real `run_server` and a real `run_client` cross out, back, out and back,
+  with the monitor's input asserted after each of the four transitions.
+  This is the test the sub-project turns on: one crossing cannot show a
+  stale belief about a monitor two machines command, and every test written
+  before it passed with §3.4's defect in place. Deleting the client's
+  `became_displayed` fails transition 2; deleting the server's fails
+  transition 3.
 - `DisplayService` over `MockMonitor`: `spawn` returns `None` when
   `display.input` is unset, and `Some` with an `OpenFn` that fails, whose
   `switch_to` is then a no-op rather than a panic or a block; a failing
   `set_input` does not stop the next
   identical request from reaching the monitor (the `forget` path, driven
   end to end rather than asserted on the policy alone); `force` reaches
-  the monitor when `switch_to` for the same value would not.
+  the monitor when `switch_to` for the same value would not; an open that
+  found nothing is retried on `became_displayed` and works from then on;
+  and that retry stops after `OPEN_ATTEMPTS`, observed through the
+  `OpenFn`'s own drop when the thread gives up.
 - Config: `[display]` with a hex `input`; an absent section leaving the
   feature off; `[hotkeys]` naming only `lock` still parsing.
 - Proto: `Hello`/`HelloAck` round-trip with and without `display_input`;
@@ -569,10 +648,19 @@ cabled to both machines.
 - **Input values are vendor-specific.** MCCS assigns 0x0F to DisplayPort-1
   and 0x11 to HDMI-1, and vendors disregard it freely. Hence `pheme
   displays`, hence a raw number in the config rather than a friendly name.
-- **Some monitors answer on a non-displayed input.** Where that is true,
-  both machines' commands land and could contend. Rules 1 and 2 bound the
-  damage to one redundant command, and the hotkey's deliberate
-  both-machines broadcast is harmless for the same reason.
+- **Some monitors answer on a non-displayed input.** The design no longer
+  depends either way on whether they do. It used to: a machine that could
+  not open a monitor at startup was off for good (§7), which meant the
+  feature worked end to end only where this risk was *realised* — where the
+  premise in §2 was false. §7's bounded retry removes that dependence, so
+  both kinds of hardware now work.
+
+  What remains of the risk is contention: where both machines' commands
+  land, they could fight. Rules 1 and 2 bound that to one redundant command,
+  and the hotkey's deliberate both-machines broadcast is harmless for the
+  same reason. The one place it still bites is a *read*, which is why
+  §3.4's `became_displayed` does not take one: on such a monitor a read can
+  answer with the input the peer is about to switch away from.
 - **i2c bus numbers move between boots.** `display.monitor` matches the
   EDID identity, never the bus path, so a renumbered bus changes nothing.
 - **A DDC write can block for hundreds of milliseconds** under GPU load.

@@ -15,7 +15,7 @@ use pheme_app::client::{run_client, ClientDeps};
 use pheme_app::config::DisplayCfg;
 use pheme_app::display::DisplayService;
 use pheme_app::target::Target;
-use pheme_display::mock::{MockMonitor, MockMonitorHandle};
+use pheme_display::mock::{opens_once, MockMonitor, MockMonitorHandle};
 use pheme_input::mock::MockInject;
 use pheme_net::{Endpoint, Identity, Incoming, Peer, TrustStore};
 use pheme_proto::{AudioParams, Msg, ScreenInfo, PROTOCOL_VERSION};
@@ -101,7 +101,7 @@ async fn spawn_rig() -> Rig {
             // in `display.rs`, and a real one would only make these wait.
             cooldown_ms: 0,
         },
-        Box::new(move || Ok(Box::new(monitor))),
+        Box::new(opens_once(monitor)),
     )
     .expect("the feature is configured on");
 

@@ -44,6 +44,39 @@ impl MockMonitorHandle {
     pub fn set_caps(&self, caps: &str) {
         self.0.lock().unwrap().caps = caps.to_string();
     }
+
+    /// A second `MockMonitor` over the same state.
+    ///
+    /// One physical monitor is commanded by *both* machines, which is the
+    /// fact the whole design rests on, and a test that gives each machine
+    /// its own independent mock cannot see either machine's belief about
+    /// the other go stale. This is how one mock is handed to two
+    /// `DisplayService`s.
+    pub fn monitor(&self, identity: &str, location: &str) -> MockMonitor {
+        MockMonitor {
+            identity: identity.to_string(),
+            location: location.to_string(),
+            inner: Arc::clone(&self.0),
+        }
+    }
+}
+
+/// An `OpenFn` body that hands `mon` over the first time it is called and
+/// reports `NoMonitor` on every call after that.
+///
+/// The service may try to open a monitor more than once -- it retries at
+/// the moment this machine becomes the displayed input -- so the closure it
+/// is given is `FnMut`, and a test that simply moved its mock out of the
+/// closure would not compile. This is the shape nearly every test wants:
+/// one monitor, handed over once.
+pub fn opens_once(
+    mon: MockMonitor,
+) -> impl FnMut() -> Result<Box<dyn Monitor>, DisplayError> + Send {
+    let mut slot = Some(mon);
+    move || match slot.take() {
+        Some(m) => Ok(Box::new(m) as Box<dyn Monitor>),
+        None => Err(DisplayError::NoMonitor),
+    }
 }
 
 pub struct MockMonitor {

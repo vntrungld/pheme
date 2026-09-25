@@ -536,6 +536,18 @@ async fn session(
                             d.switch_to(v);
                         }
                     }
+                    // The mirror of the hook above. `Enter` arrives the
+                    // instant the server commands the monitor to this
+                    // machine's input, so this is where this machine's
+                    // belief about the monitor learns what the server did
+                    // to it -- and where a startup that found no monitor,
+                    // because this machine was not the one on screen, gets
+                    // its one chance to find one.
+                    if matches!(m, Msg::Enter { .. }) {
+                        if let (Some(d), Some(v)) = (display, display_input) {
+                            d.became_displayed(v);
+                        }
+                    }
                     // `&m`, not `m`: `Msg` is not `Copy` and the loop
                     // still passes it to `core.on_msg` below.
                     if let Msg::SwitchDisplay { input } = &m {

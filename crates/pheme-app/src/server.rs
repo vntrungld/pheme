@@ -192,6 +192,18 @@ impl Shared {
                                 d.switch_to(v);
                             }
                         }
+                        // The mirror of the hook above, and the only way
+                        // this machine's belief about the monitor ever
+                        // learns what the client did to it. `Leave` is sent
+                        // as the pointer returns here, which is the instant
+                        // the client commands the monitor to this machine's
+                        // input -- so from now on the monitor answers this
+                        // cable, and what it says can be read.
+                        if matches!(m, Msg::Leave { .. }) {
+                            if let (Some(d), Some(v)) = (&self.display, self.display_input) {
+                                d.became_displayed(v);
+                            }
+                        }
                         let _ = l.control.send(m);
                         self.counters.control_sent.fetch_add(1, Ordering::Relaxed);
                     }
