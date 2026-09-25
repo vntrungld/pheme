@@ -348,9 +348,16 @@ Requirements and limits:
 
 - The monitor must answer DDC/CI. Many do not, and some have a DDC/CI
   switch in their on-screen menu that ships turned off. Check with
-  `pheme displays`, or with `ddcutil detect` on Linux.
+  `pheme displays`, or with `ddcutil detect` on Linux — but check it on
+  the machine the monitor is **currently showing**. Only the displayed
+  input answers DDC/CI on most monitors, so running it on the other
+  machine can report nothing on hardware that works perfectly. Switch the
+  monitor to each machine in turn and run it there.
 - Some laptop docks and HDMI adapters do not carry the i2c lines the
   protocol needs.
+- `monitor` is best given as part of the identity rather than the bus
+  path: i2c bus numbers can move between boots, and a `monitor` that names
+  one stops matching when they do.
 - On Linux, `pheme setup` loads `i2c-dev` and adds the udev rule. If it
   still fails, `usermod -aG i2c $USER` and log in again.
 - With no `[display]` section, nothing here runs and nothing changes.

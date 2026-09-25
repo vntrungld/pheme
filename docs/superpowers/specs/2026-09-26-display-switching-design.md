@@ -696,8 +696,14 @@ cabled to both machines.
   same reason. The one place it still bites is a *read*, which is why
   §3.4's `became_displayed` does not take one: on such a monitor a read can
   answer with the input the peer is about to switch away from.
-- **i2c bus numbers move between boots.** `display.monitor` matches the
-  EDID identity, never the bus path, so a renumbered bus changes nothing.
+- **i2c bus numbers move between boots.** `display.monitor` is matched
+  against the EDID identity *and* the bus path (§3.1), so which of the two
+  a person writes decides whether this matters. An identity — the intended
+  form, and what `pheme displays` puts first — survives a renumbering
+  untouched. A path like `/dev/i2c-10` does not: after a renumbering it
+  matches a different monitor or none at all, and the feature turns itself
+  off with the `NoMatch` warning. The path is there for monitors whose EDID
+  carries no name, where it is the only handle there is.
 - **A DDC write can block for hundreds of milliseconds** under GPU load.
   It happens on the service thread and the input path never waits on it
   (§4); the bounded channel drops rather than queues.
