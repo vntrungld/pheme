@@ -56,6 +56,7 @@ arboard = { version = "3.6", default-features = false, features = ["wayland-data
 mdns-sd = "0.21"
 tray-icon = "0.24"
 png = "0.18"
+eframe = "0.32"
 zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
 
 [profile.release]

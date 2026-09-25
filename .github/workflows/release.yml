@@ -31,13 +31,16 @@ jobs:
       # libappindicator are the tray icon's own Linux runtime dependencies;
       # the release tarball is no longer self-contained on Linux because of
       # them, which sub-project 7's packaging still has to account for.
+      # libxcb-render0-dev, libxcb-shape0-dev, libxcb-xfixes0-dev and
+      # libxkbcommon-dev are eframe's own native (winit/glow) build deps.
       - name: Linux build deps
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libx11-dev libxi-dev libxtst-dev libxfixes-dev \
             libxrandr-dev libpipewire-0.3-dev libspa-0.2-dev clang pkg-config \
-            libgtk-3-dev libayatana-appindicator3-dev libxdo-dev
+            libgtk-3-dev libayatana-appindicator3-dev libxdo-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
 
       - name: Build (Linux)
         if: runner.os == 'Linux'

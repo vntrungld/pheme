@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 use pheme_app::config::Config;
 use tracing_subscriber::EnvFilter;
@@ -16,8 +17,9 @@ struct Cli {
     /// Increase log verbosity (-v, -vv)
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     verbose: u8,
+    /// With no subcommand, opens the front-end window instead.
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
@@ -84,11 +86,25 @@ fn init_logging(verbose: u8) {
         .init();
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     init_logging(cli.verbose);
-    match cli.cmd {
+    let Some(cmd) = cli.cmd else {
+        // No subcommand: open the front-end window. This builds and owns
+        // its own tokio runtime rather than sharing one with the block
+        // below, so the GUI's blocking event loop never runs nested inside
+        // a runtime that is already driving it -- see `frontend::run`.
+        return pheme_app::frontend::run();
+    };
+    // Every existing subcommand keeps its exact behaviour, just no longer
+    // riding on `#[tokio::main]`'s own runtime: `Runtime::new()` builds the
+    // same multi-threaded, fully-enabled runtime that macro used to.
+    let rt = tokio::runtime::Runtime::new().context("building the tokio runtime")?;
+    rt.block_on(run_subcommand(cmd))
+}
+
+async fn run_subcommand(cmd: Cmd) -> anyhow::Result<()> {
+    match cmd {
         Cmd::Server {
             config,
             pair,

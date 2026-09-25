@@ -31,18 +31,19 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tray-icon = { workspace = true }
 png = { workspace = true }
+eframe = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
 
 # Only the platforms `tray-icon`'s "gtk" feature actually targets need a way
-# to ask D-Bus whether a tray host is listening, and only they get a GTK
-# main loop to drive by hand in the manual smoke test below `tray.rs`
-# (`cargo test -p pheme-app --lib frontend::tray::tests::manual_smoke --
+# to ask D-Bus whether a tray host is listening, and only they need GTK
+# itself: its Linux backend is GTK-based and panics unless something has
+# called `gtk::init()` and is pumping its event loop, which is `frontend::run`'s
+# job (see the manual smoke test below `tray.rs` for the same pattern by hand:
+# `cargo test -p pheme-app --lib frontend::tray::tests::manual_smoke --
 # --ignored --nocapture`). Windows and macOS have their own tray hosts built
 # into the shell, so neither dependency is asked of them.
 [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
 zbus = { workspace = true }
-
-[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dev-dependencies]
 gtk = "0.18"
