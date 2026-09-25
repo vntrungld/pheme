@@ -104,6 +104,7 @@ fn spawn_pair_with_hotkeys(hotkeys: Hotkeys) -> Pair {
             audio_stats: None,
             mic: pheme_app::audio::CaptureSource::Disabled,
             mic_counters: None,
+            clipboard: None,
         },
         shutdown_rx.clone(),
     ));
@@ -118,6 +119,7 @@ fn spawn_pair_with_hotkeys(hotkeys: Hotkeys) -> Pair {
             audio_counters: None,
             mic: pheme_app::audio::PlaybackSource::Disabled,
             mic_stats: None,
+            clipboard: None,
         },
         shutdown_rx,
     ));
@@ -192,6 +194,7 @@ async fn server_and_client_exchange_input_over_quic() {
             audio_stats: None,
             mic: pheme_app::audio::CaptureSource::Disabled,
             mic_counters: None,
+            clipboard: None,
         },
         shutdown_rx.clone(),
     ));
@@ -206,6 +209,7 @@ async fn server_and_client_exchange_input_over_quic() {
             audio_counters: None,
             mic: pheme_app::audio::PlaybackSource::Disabled,
             mic_stats: None,
+            clipboard: None,
         },
         shutdown_rx.clone(),
     ));
@@ -337,6 +341,7 @@ async fn client_reconnects_after_server_restart() {
             audio_counters: None,
             mic: pheme_app::audio::PlaybackSource::Disabled,
             mic_stats: None,
+            clipboard: None,
         },
         shutdown_rx.clone(),
     ));
@@ -360,6 +365,7 @@ async fn client_reconnects_after_server_restart() {
                 audio_stats: None,
                 mic: pheme_app::audio::CaptureSource::Disabled,
                 mic_counters: None,
+                clipboard: None,
             },
             stop,
         ));
@@ -447,6 +453,7 @@ async fn server_releases_grab_when_client_vanishes_silently() {
             audio_stats: None,
             mic: pheme_app::audio::CaptureSource::Disabled,
             mic_counters: None,
+            clipboard: None,
         },
         shutdown_rx.clone(),
     ));
@@ -461,6 +468,7 @@ async fn server_releases_grab_when_client_vanishes_silently() {
             audio_counters: None,
             mic: pheme_app::audio::PlaybackSource::Disabled,
             mic_stats: None,
+            clipboard: None,
         },
         shutdown_rx.clone(),
     ));

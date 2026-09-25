@@ -17,6 +17,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::audio::{CaptureSource, InStats, OutCounters, PlaybackSource, RecvSide, SendSide};
 use crate::backoff::Backoff;
+use crate::clipboard::ClipboardService;
 use crate::config::{config_dir, Config};
 
 pub struct ClientDeps {
@@ -36,6 +37,8 @@ pub struct ClientDeps {
     pub mic: PlaybackSource,
     /// Counters the mic worker publishes. `None` allocates a private set.
     pub mic_stats: Option<Arc<InStats>>,
+    /// The clipboard worker, or `None` where no clipboard is reachable.
+    pub clipboard: Option<ClipboardService>,
 }
 
 /// The mic frame in `m`, if it is one this client should play.
@@ -129,6 +132,7 @@ pub async fn run_client(
         audio_counters,
         mic,
         mic_stats,
+        clipboard,
     } = deps;
     let counters = audio_counters.unwrap_or_default();
     // The client's speaker capture is never gated: it starts open.
@@ -158,6 +162,7 @@ pub async fn run_client(
                         mic: &mic,
                         mic_stats: &mic_stats,
                     },
+                    clipboard.clone(),
                     &mut shutdown,
                 )
                 .await
@@ -194,6 +199,7 @@ async fn session(
     inject: &mut dyn InputInject,
     stats: bool,
     audio: SessionAudio<'_>,
+    clipboard: Option<ClipboardService>,
     shutdown: &mut watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let SessionAudio {
@@ -205,6 +211,7 @@ async fn session(
     let screens = inject.screens();
     let mut rx = peer.take_incoming();
     let mut audio_rx = peer.take_audio();
+    let mut clip_rx = peer.take_clipboard();
     let mut mic_wanted = mic.wanted();
     let sender = peer.sender();
     sender
@@ -275,10 +282,22 @@ async fn session(
                 Some(Msg::Ping(n)) => { let _ = sender.send_control(&Msg::Pong(n)).await; }
                 Some(Msg::Pong(_)) => {}
                 Some(Msg::Bye { reason }) => {
+                    // The pointer is going back to the server (or the server is
+                    // gone), so the client's clipboard goes with it (§3.1).
+                    if let Some(c) = &clipboard {
+                        c.send_to(sender.clone());
+                    }
                     for a in core.on_msg(&Msg::Bye { reason: reason.clone() }) { apply(inject, a); }
                     break Ok(());
                 }
                 Some(m) => {
+                    // The pointer is going back to the server, so the client's
+                    // clipboard goes with it (§3.1).
+                    if matches!(m, Msg::Leave { .. }) {
+                        if let Some(c) = &clipboard {
+                            c.send_to(sender.clone());
+                        }
+                    }
                     received += 1;
                     if let Some(seq) = input_seq(&m) {
                         let (gap, next) = count_gap(last_seq, seq);
@@ -293,6 +312,14 @@ async fn session(
                 Some(m) => {
                     if let Some(f) = mic_frame(&m) {
                         mic.push(f);
+                    }
+                }
+                None => break Ok(()),
+            },
+            m = clip_rx.recv() => match m {
+                Some(m) => {
+                    if let Some(c) = &clipboard {
+                        c.apply(&m);
                     }
                 }
                 None => break Ok(()),
@@ -381,6 +408,7 @@ pub async fn main(cfg: Config, host: Option<&str>, stats: bool) -> anyhow::Resul
         info!("shutting down");
         let _ = shutdown_tx.send(true);
     });
+    let clipboard = ClipboardService::spawn(pheme_clip::open);
     run_client(
         ClientDeps {
             name: cfg.name.clone(),
@@ -392,6 +420,7 @@ pub async fn main(cfg: Config, host: Option<&str>, stats: bool) -> anyhow::Resul
             audio_counters: None,
             mic: PlaybackSource::DetectVirtualMic(None),
             mic_stats: None,
+            clipboard,
         },
         shutdown_rx,
     )

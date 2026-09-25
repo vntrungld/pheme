@@ -15,6 +15,7 @@ use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
 use crate::audio::{CaptureSource, InStats, OutCounters, PlaybackSource, RecvSide, SendSide};
+use crate::clipboard::ClipboardService;
 use crate::config::{config_dir, Config};
 
 /// How long shutdown waits for the router thread to notice that every `CaptureEvent`
@@ -57,6 +58,10 @@ pub struct ServerDeps {
     pub mic: CaptureSource,
     /// Counters the mic packer thread publishes. `None` allocates a private set.
     pub mic_counters: Option<Arc<OutCounters>>,
+    /// The clipboard worker, or `None` where no clipboard is reachable — GNOME
+    /// Wayland, or a headless session. `None` disables clipboard sharing and
+    /// nothing else.
+    pub clipboard: Option<ClipboardService>,
 }
 
 /// The currently connected client, as seen by the router thread.
@@ -84,6 +89,7 @@ struct Shared {
     counters: Counters,
     audio: RecvSide,
     mic: SendSide,
+    clipboard: Option<ClipboardService>,
     /// Set when an edge set could not be pushed to the backend because the core was
     /// remote, and cleared by the push that finally happens on the way back to local.
     /// Always locked *inside* `core`, never the other way round, so the "is the core
@@ -131,6 +137,15 @@ impl Shared {
                 }
                 Action::SendControl(m) => {
                     if let Some(l) = &link {
+                        // The clipboard crosses with the pointer (§3.1). Reading
+                        // it happens on the clipboard thread and the send happens
+                        // on the runtime, so this call returns at once and the
+                        // handover below is not delayed by either.
+                        if matches!(m, Msg::Enter { .. }) {
+                            if let Some(c) = &self.clipboard {
+                                c.send_to(l.sender.clone());
+                            }
+                        }
                         let _ = l.control.send(m);
                         self.counters.control_sent.fetch_add(1, Ordering::Relaxed);
                     }
@@ -298,6 +313,7 @@ pub async fn run_server(
         audio_stats,
         mic,
         mic_counters,
+        clipboard,
     } = deps;
     let audio_stats = audio_stats.unwrap_or_default();
     let audio_in = RecvSide::spawn(audio, audio_stats.clone());
@@ -325,6 +341,7 @@ pub async fn run_server(
         counters: Counters::default(),
         audio: audio_in,
         mic,
+        clipboard,
         edges_deferred: Mutex::new(false),
     });
 
@@ -540,6 +557,7 @@ async fn handle_peer(
 ) -> anyhow::Result<()> {
     let mut rx = peer.take_incoming();
     let mut audio_rx = peer.take_audio();
+    let mut clip_rx = peer.take_clipboard();
     let hello = tokio::select! {
         _ = shutdown.changed() => {
             peer.close("server shutting down");
@@ -646,6 +664,14 @@ async fn handle_peer(
                 }
                 None => break Ok(()),
             },
+            m = clip_rx.recv() => match m {
+                Some(m) => {
+                    if let Some(c) = &shared.clipboard {
+                        c.apply(&m);
+                    }
+                }
+                None => break Ok(()),
+            },
             _ = shutdown.changed() => {
                 let _ = peer.sender().send_control(&Msg::Bye { reason: "server shutting down".into() }).await;
                 break Ok(());
@@ -714,6 +740,7 @@ pub async fn main(cfg: Config, pair: bool, stats: bool) -> anyhow::Result<()> {
         info!("shutting down");
         let _ = shutdown_tx.send(true);
     });
+    let clipboard = ClipboardService::spawn(pheme_clip::open);
     run_server(
         ServerDeps {
             name: cfg.name.clone(),
@@ -727,6 +754,7 @@ pub async fn main(cfg: Config, pair: bool, stats: bool) -> anyhow::Result<()> {
             audio_stats: None,
             mic: CaptureSource::Detect(cfg.audio.mic_device.clone()),
             mic_counters: None,
+            clipboard,
         },
         shutdown_rx,
     )

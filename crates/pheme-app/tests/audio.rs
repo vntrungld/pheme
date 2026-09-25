@@ -127,6 +127,7 @@ fn spawn_pair(fail_capture: bool) -> Pair {
             audio_stats: Some(heard.clone()),
             mic: CaptureSource::Disabled,
             mic_counters: None,
+            clipboard: None,
         },
         shutdown_rx.clone(),
     ));
@@ -141,6 +142,7 @@ fn spawn_pair(fail_capture: bool) -> Pair {
             audio_counters: Some(sent.clone()),
             mic: PlaybackSource::Disabled,
             mic_stats: None,
+            clipboard: None,
         },
         shutdown_rx,
     ));
