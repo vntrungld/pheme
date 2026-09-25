@@ -49,23 +49,34 @@ impl Target {
     pub async fn resolve(&self) -> anyhow::Result<SocketAddr> {
         match self {
             Target::Fixed(a) => Ok(*a),
-            Target::Dns(host) => resolve_dns(host),
+            Target::Dns(host) => resolve_dns_off_runtime(host.clone()).await,
             Target::Mdns(name) => {
                 match pheme_net::discovery::resolve(name, MDNS_TIMEOUT).await {
                     Ok(Some(a)) => Ok(a),
                     Ok(None) => {
                         // A bare name the local resolver knows still works.
                         debug!(%name, "no mdns answer; trying the system resolver");
-                        resolve_dns(name)
+                        resolve_dns_off_runtime(name.clone()).await
                     }
                     Err(e) => {
                         debug!(%name, "mdns lookup failed: {e}; trying the system resolver");
-                        resolve_dns(name)
+                        resolve_dns_off_runtime(name.clone()).await
                     }
                 }
             }
         }
     }
+}
+
+/// Runs the system resolver without occupying a runtime thread.
+///
+/// `to_socket_addrs` is a blocking call that can take seconds, and `resolve`
+/// runs on every reconnect attempt: left on the runtime it would starve every
+/// other task scheduled on that worker for the length of the lookup.
+async fn resolve_dns_off_runtime(host: String) -> anyhow::Result<SocketAddr> {
+    tokio::task::spawn_blocking(move || resolve_dns(&host))
+        .await
+        .context("the DNS lookup task failed")?
 }
 
 fn resolve_dns(host: &str) -> anyhow::Result<SocketAddr> {
