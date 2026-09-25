@@ -184,7 +184,8 @@ pub struct DisplaySwitch {
 impl DisplaySwitch {
     pub fn new(cooldown: Duration) -> Self;
     /// Seed `selected` from a successful read at startup, or from the
-    /// moment this machine becomes the displayed input (below).
+    /// moment this machine becomes the displayed input (below). Also
+    /// drops anything held: see "A held request the return makes stale".
     pub fn observe(&mut self, value: u16);
     /// A crossing asks for `value`. `Some(v)` means issue it now.
     pub fn request(&mut self, value: u16, now: Instant) -> Option<u16>;
@@ -251,6 +252,18 @@ displayed input**. Both sides know it exactly:
 `DisplayService::became_displayed(own_input)` carries it, alongside
 `switch_to` and `force` and with the same never-blocks, never-fails
 contract. The service thread answers it with `observe(own_input)`.
+
+**A held request the return makes stale.** Every value a machine
+`request`s is the peer's input -- a hand-away -- and every value it observes
+is its own, so `selected` and `pending` always name different machines and
+rule 3's converged-discard in `poll` can never fire. Without more, a
+crossing held by the cooldown is handed out after the pointer has come home:
+cross out at t=0 (issued), home at t=300 (`observe`), out again at t=600
+(held, because `selected` now names this machine and rule 1 no longer
+refuses it), home at t=800, and at t=1000 `poll` throws the picture to the
+machine the pointer left. So `observe` clears `pending`, which is what takes
+the discard clause's place: at the moment this machine becomes the displayed
+input, any hand-away it is still holding is stale by definition.
 
 `own_input`, and deliberately **not** a fresh `get_input()`. The event is
 the stronger evidence: it means the peer has just commanded the monitor to

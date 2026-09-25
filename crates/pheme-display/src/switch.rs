@@ -46,9 +46,21 @@ impl DisplaySwitch {
     }
 
     /// Seed `selected` from a successful read, so the first crossing to the
-    /// input already showing costs no command.
+    /// input already showing costs no command, and drop anything held.
+    ///
+    /// The drop is not incidental. Every value a machine `request`s is the
+    /// *peer's* input -- a hand-away -- and every value it observes is its
+    /// own, because the only two moments it learns anything are the read at
+    /// startup and becoming the displayed input itself. So `selected` and
+    /// `pending` always name different machines, `poll`'s converged-discard
+    /// can never fire, and a request still held at this moment is a
+    /// hand-away that the pointer's return has just made stale. Handing it
+    /// out when the cooldown ends would throw the picture to the machine
+    /// the pointer is no longer on -- the exact outcome rule 3's discard
+    /// clause exists to prevent. This is what takes its place.
     pub fn observe(&mut self, value: u16) {
         self.selected = Some(value);
+        self.pending = None;
     }
 
     /// A crossing asks for `value`. `Some(v)` means issue it now.
@@ -231,6 +243,35 @@ mod tests {
         assert_eq!(s.request(0x11, t0), Some(0x11));
         s.confirm(0x11);
         assert_eq!(s.force(0x11, at(t0, 10)), 0x11);
+    }
+
+    /// The hand-away that the pointer's return made stale.
+    ///
+    /// Two crossings out inside one cooldown, each answered by a crossing
+    /// back. The second one is held by rule 2, and by the time it comes due
+    /// the pointer is home again -- so it must not be handed out.
+    ///
+    /// Break it by deleting `self.pending = None` from `observe`: `poll`
+    /// then returns `Some(0x0f)` and the picture goes to the machine the
+    /// pointer left. `poll`'s own discard clause cannot save it, because
+    /// `selected` names this machine and `pending` names the peer; they are
+    /// never equal in this direction, which is what makes this case
+    /// reachable at all.
+    #[test]
+    fn becoming_the_displayed_input_drops_a_held_hand_away() {
+        let t0 = Instant::now();
+        let mut s = DisplaySwitch::new(COOLDOWN);
+        // Out, and the command goes.
+        assert_eq!(s.request(0x0f, t0), Some(0x0f));
+        s.confirm(0x0f);
+        // Home: the peer switched the monitor back to this machine.
+        s.observe(0x11);
+        // Out again, inside the cooldown, so it is held.
+        assert_eq!(s.request(0x0f, at(t0, 600)), None);
+        // And home again before it comes due.
+        s.observe(0x11);
+        assert_eq!(s.poll(at(t0, 1_001)), None);
+        assert_eq!(s.deadline(), None, "nothing is held any more");
     }
 
     /// Review Focus 2. Break it by making `in_cooldown` return `true` when

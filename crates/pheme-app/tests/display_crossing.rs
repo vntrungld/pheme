@@ -83,14 +83,12 @@ impl Pair {
     }
 }
 
-fn display_service(input: u16, mon: MockMonitor) -> DisplayService {
+fn display_service(input: u16, mon: MockMonitor, cooldown_ms: u64) -> DisplayService {
     DisplayService::spawn(
         &DisplayCfg {
             input: Some(input),
             monitor: None,
-            // No cooldown: the policy's holding behaviour has its own tests
-            // in `display.rs`, and a real one would only make these wait.
-            cooldown_ms: 0,
+            cooldown_ms,
         },
         Box::new(opens_once(mon)),
     )
@@ -98,6 +96,12 @@ fn display_service(input: u16, mon: MockMonitor) -> DisplayService {
 }
 
 fn spawn_pair() -> Pair {
+    // No cooldown by default: the policy's holding behaviour has its own
+    // tests, and a real one would only make these wait.
+    spawn_pair_with_cooldowns(0, 0)
+}
+
+fn spawn_pair_with_cooldowns(server_cooldown_ms: u64, client_cooldown_ms: u64) -> Pair {
     let sdir = tempfile::tempdir().unwrap();
     let cdir = tempfile::tempdir().unwrap();
     let sid = Identity::load_or_create(sdir.path(), "server").unwrap();
@@ -139,7 +143,11 @@ fn spawn_pair() -> Pair {
             mic: pheme_app::audio::CaptureSource::Disabled,
             mic_counters: None,
             clipboard: None,
-            display: Some(display_service(SERVER_INPUT, server_monitor)),
+            display: Some(display_service(
+                SERVER_INPUT,
+                server_monitor,
+                server_cooldown_ms,
+            )),
             display_input: Some(SERVER_INPUT),
             ipc: None,
         },
@@ -158,7 +166,11 @@ fn spawn_pair() -> Pair {
             mic: pheme_app::audio::PlaybackSource::Disabled,
             mic_stats: None,
             clipboard: None,
-            display: Some(display_service(CLIENT_INPUT, client_monitor)),
+            display: Some(display_service(
+                CLIENT_INPUT,
+                client_monitor,
+                client_cooldown_ms,
+            )),
             display_input: Some(CLIENT_INPUT),
             ipc: None,
         },
@@ -256,5 +268,54 @@ async fn the_picture_follows_the_pointer_across_repeated_crossings() {
     cross_back(&pair.cap).await;
     expect_monitor(&pair.mon, SERVER_INPUT, "second crossing back").await;
 
+    pair.shutdown().await;
+}
+
+/// The held hand-away, end to end, at a cooldown a person would really
+/// configure.
+///
+/// Rule 3 holds a crossing made inside the cooldown and hands it out when
+/// the cooldown ends. If the pointer has come home by then, that held
+/// value is a command to throw the picture at the machine the pointer left.
+/// `poll`'s own discard clause cannot catch it, because `selected` names
+/// this machine and `pending` names the peer, so the two are never equal in
+/// this direction.
+///
+/// Break it by deleting `self.pending = None` from `DisplaySwitch::observe`
+/// (`pheme-display/src/switch.rs`): the server's held crossing comes due
+/// after the pointer is home, the monitor goes to the client, and the last
+/// assertion fails. Nothing corrects it afterwards -- the client's cooldown
+/// is zero here on purpose, so its own commands are never held and cannot
+/// heal the server's mistake and hide it.
+///
+/// The precondition is asserted rather than assumed: every crossing has to
+/// happen inside the server's cooldown for anything to be held at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_crossing_held_by_the_cooldown_is_dropped_when_the_pointer_comes_home() {
+    const COOLDOWN_MS: u64 = 2_000;
+    let pair = spawn_pair_with_cooldowns(COOLDOWN_MS, 0);
+
+    let t0 = Instant::now();
+    cross_out(&pair.cap).await;
+    expect_monitor(&pair.mon, CLIENT_INPUT, "first crossing out").await;
+    cross_back(&pair.cap).await;
+    expect_monitor(&pair.mon, SERVER_INPUT, "first crossing back").await;
+    // Inside the server's cooldown, so this one is held rather than issued.
+    cross_out(&pair.cap).await;
+    // And home again before it comes due.
+    cross_back(&pair.cap).await;
+    expect_monitor(&pair.mon, SERVER_INPUT, "second crossing back").await;
+    assert!(
+        t0.elapsed() < Duration::from_millis(COOLDOWN_MS),
+        "the crossings must all fall inside one cooldown for anything to be held"
+    );
+
+    // Past the point where a held command would come due.
+    tokio::time::sleep(Duration::from_millis(COOLDOWN_MS + 500) - t0.elapsed()).await;
+    assert_eq!(
+        pair.mon.input(),
+        SERVER_INPUT,
+        "the picture was thrown to the client after the pointer had come home"
+    );
     pair.shutdown().await;
 }
