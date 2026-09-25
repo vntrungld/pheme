@@ -27,13 +27,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       # Same packages as the ci workflow: the PipeWire bindings are generated at
-      # build time, so the headers and clang have to be present.
+      # build time, so the headers and clang have to be present. GTK 3 and
+      # libappindicator are the tray icon's own Linux runtime dependencies;
+      # the release tarball is no longer self-contained on Linux because of
+      # them, which sub-project 7's packaging still has to account for.
       - name: Linux build deps
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libx11-dev libxi-dev libxtst-dev libxfixes-dev \
-            libxrandr-dev libpipewire-0.3-dev libspa-0.2-dev clang pkg-config
+            libxrandr-dev libpipewire-0.3-dev libspa-0.2-dev clang pkg-config \
+            libgtk-3-dev libayatana-appindicator3-dev libxdo-dev
 
       - name: Build (Linux)
         if: runner.os == 'Linux'
