@@ -339,7 +339,6 @@ cooldown_ms = 1000
 pub struct DisplayCfg {
     pub input: Option<u16>,
     pub monitor: Option<String>,
-    #[serde(default = "default_cooldown_ms")]
     pub cooldown_ms: u64,
 }
 ```
