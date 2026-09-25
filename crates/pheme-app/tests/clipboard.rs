@@ -238,7 +238,20 @@ async fn crossing_twice_without_copying_sends_one_clipboard() {
     assert_eq!(
         p.client_clip.sets(),
         1,
-        "the same clipboard was written again; the echo guard is not holding"
+        "the far clipboard was written again on the second crossing"
+    );
+    // The server's clipboard must never be written here: the only text in play
+    // is the server's own, and text received from a peer must not be sent
+    // back to it. `ClipSync::last` on the client's side is shared by both
+    // directions, so a single broken check there is masked by the other one
+    // -- but a client whose received-text bookkeeping stopped working
+    // altogether would bounce "just once" back on the return crossing, and
+    // this would be nonzero. That is the one direction nothing else in this
+    // file checks.
+    assert_eq!(
+        p.server_clip.sets(),
+        0,
+        "the server's own text came back to it"
     );
     p.shutdown().await;
 }
