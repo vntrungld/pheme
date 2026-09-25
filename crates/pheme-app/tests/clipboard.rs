@@ -86,8 +86,8 @@ impl ClipPair {
 }
 
 /// Builds a `ClipPair`, optionally without a clipboard on the client side (`with_client_clip
-/// = false`), which is what a GNOME Wayland client looks like: `ClipboardService::spawn`
-/// returned `None` and input must not notice.
+/// = false`), which is what a bare-compositor or headless client looks like:
+/// `ClipboardService::spawn` returned `None` and input must not notice.
 ///
 /// Modelled on `spawn_pair_with_hotkeys` in `integration.rs`.
 async fn spawn_clip_pair(with_client_clip: bool) -> ClipPair {
@@ -259,9 +259,14 @@ async fn crossing_twice_without_copying_sends_one_clipboard() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_client_without_a_clipboard_still_crosses_the_edge() {
-    // GNOME Wayland on the client: `ClipboardService::spawn` returned None.
-    // Input must be completely unaffected.
+    // A bare-compositor or headless client: `ClipboardService::spawn`
+    // returned `None`. The server has real text to send, so a
+    // `Msg::Clipboard` genuinely arrives at a peer whose clipboard service
+    // is `None` -- the configuration the README says works -- and that
+    // must not stop the `Enter` from landing. Input must be completely
+    // unaffected.
     let p = spawn_clip_pair(false).await;
+    p.server_clip.copy("copied on the server");
     cross_to_the_client(&p.cap).await;
     assert!(
         wait_until(|| p.injected_enter(), Duration::from_secs(5)).await,
