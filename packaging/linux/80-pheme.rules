@@ -1,0 +1,4 @@
+# Pheme: allow members of the input group to create virtual input devices
+KERNEL=="uinput", MODE="0660", GROUP="input", TAG+="uaccess"
+# Pheme: allow the logged-in user to speak DDC/CI to monitors over i2c
+KERNEL=="i2c-[0-9]*", MODE="0660", GROUP="i2c", TAG+="uaccess"

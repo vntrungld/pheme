@@ -1,5 +1,6 @@
 [package]
 name = "pheme-app"
+description = "Share one keyboard, mouse, clipboard and audio between two machines over the LAN"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

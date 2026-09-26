@@ -1,0 +1,12 @@
+[Unit]
+Description=Pheme keyboard, mouse and audio sharing
+Documentation=https://github.com/vntrungld/pheme
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/pheme
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

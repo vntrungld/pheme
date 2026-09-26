@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Pheme
+Comment=Share one keyboard, mouse, clipboard and audio between two machines
+Exec=pheme
+Icon=pheme
+Terminal=false
+Categories=Utility;Network;RemoteAccess;
+Keywords=kvm;keyboard;mouse;share;

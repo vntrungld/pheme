@@ -15,7 +15,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-only"
-repository = "https://github.com/trungld/pheme"
+repository = "https://github.com/vntrungld/pheme"
 rust-version = "1.87"
 
 [workspace.dependencies]
