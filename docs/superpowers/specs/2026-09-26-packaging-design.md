@@ -83,7 +83,7 @@ install-and-run step is what proves the declaration is complete.
 | `/usr/share/icons/hicolor/32x32/apps/pheme.png` | `assets/tray-connected.png` |
 | `/usr/share/doc/pheme/README.md` | |
 | `/usr/share/doc/pheme/testing.md` | |
-| `/usr/share/doc/pheme/LICENSE` | |
+| `/usr/share/doc/pheme/LICENSE` | the `.rpm`; the `.deb` puts it at `/usr/share/doc/pheme/copyright`, which is what Debian policy asks for |
 
 The udev rule and the modules file are the same text `pheme setup` writes.
 They are generated from the constants at build time rather than copied by
