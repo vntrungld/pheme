@@ -170,8 +170,10 @@ Each sub-project gets its own spec and plan, building on the previous one.
    a local socket, audio device enumeration.
 7. **Display input switching** — DDC/CI on the monitor's VCP 0x60, so a
    single monitor cabled to both machines follows the pointer.
-8. **Packaging** — Windows installer (Inno Setup), start with Windows,
-   systemd user unit, GTK/AppIndicator packaging notes, CI release.
+8. **Packaging** — a `.deb` and an `.rpm` that declare their own runtime
+   dependencies, a Windows installer (Inno Setup) needing no administrator,
+   start with Windows, a systemd `--user` unit, and CI that installs each
+   package and runs the binary from it.
 
 ## 10. Testing
 
