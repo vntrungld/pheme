@@ -1,0 +1,6 @@
+# The packaged data files are installed verbatim on Linux machines and are
+# compared byte for byte against the constants `pheme setup` writes. A
+# checkout that converted them to CRLF would both fail that comparison and
+# ship a udev rule with carriage returns in it, so their line endings are
+# pinned rather than left to each machine's Git configuration.
+packaging/** text eol=lf
