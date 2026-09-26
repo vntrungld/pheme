@@ -162,14 +162,30 @@ fn the_unit_starts_the_binary_where_the_packages_install_it() {
 }
 
 /// The unit is shipped so a person can enable it, not enabled by the
-/// package. Break it by adding `WantedBy=default.target`, which would make
-/// `systemctl --user enable` hook it into a non-graphical target and start
-/// a GUI front-end on a machine with no session to draw into.
+/// package. Break it by changing either line to name `default.target`, or
+/// by adding a second `WantedBy=` beside the right one: `systemctl --user
+/// enable` would then hook the unit into a target that exists with no
+/// graphical session, and start a GUI front-end on a machine with nothing
+/// to draw into.
+///
+/// The exclusivity assertion is what makes the second half of that claim
+/// true. Presence assertions alone pass for a unit naming both targets,
+/// and a unit naming both is exactly the broken case -- systemd honours
+/// every `WantedBy` it finds.
 #[test]
 fn the_unit_belongs_to_the_graphical_session() {
     let unit = read("packaging/linux/pheme.service");
     assert!(unit.lines().any(|l| l == "WantedBy=graphical-session.target"));
     assert!(unit.lines().any(|l| l == "PartOf=graphical-session.target"));
+    let wanted: Vec<&str> = unit
+        .lines()
+        .filter(|l| l.starts_with("WantedBy="))
+        .collect();
+    assert_eq!(
+        wanted,
+        ["WantedBy=graphical-session.target"],
+        "the unit must name exactly one WantedBy"
+    );
 }
 ```
 
