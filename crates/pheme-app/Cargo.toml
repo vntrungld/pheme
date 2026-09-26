@@ -49,3 +49,36 @@ tempfile = "3"
 [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
 zbus = { workspace = true }
 gtk = "0.18"
+
+# The binary's own path is written `target/release/pheme` on purpose, with
+# no `../../`: cargo-deb matches that exact prefix to work out what to
+# build and substitutes the real target directory itself, and its own
+# README warns that "correcting" the path breaks it. Every other source is
+# relative to this manifest's directory, which is why they carry `../../`.
+[package.metadata.deb]
+name = "pheme"
+maintainer = "Lam Duc Trung <oedevai7@gmail.com>"
+copyright = "2026 Lam Duc Trung"
+license-file = ["../../LICENSE", "0"]
+section = "utils"
+priority = "optional"
+extended-description = """
+Pheme shares one keyboard, mouse, clipboard and audio stream between two \
+machines on the same network. The pointer crosses the screen edge and the \
+input follows it; a monitor cabled to both machines can follow it too."""
+# $auto asks dpkg which package provides each soname ldd reports, so the
+# dependency list is derived from the binary that was built rather than
+# remembered. It cannot see libayatana-appindicator, which the tray opens
+# with dlopen at runtime rather than linking, so that one is named here.
+depends = "$auto, libayatana-appindicator3-1 | libappindicator3-1"
+assets = [
+    ["target/release/pheme", "usr/bin/", "755"],
+    ["../../packaging/linux/80-pheme.rules", "usr/lib/udev/rules.d/", "644"],
+    ["../../packaging/linux/pheme-modules.conf", "usr/lib/modules-load.d/pheme.conf", "644"],
+    ["../../packaging/linux/pheme.service", "usr/lib/systemd/user/", "644"],
+    ["../../packaging/linux/pheme.desktop", "usr/share/applications/", "644"],
+    ["assets/tray-connected.png", "usr/share/icons/hicolor/32x32/apps/pheme.png", "644"],
+    ["../../README.md", "usr/share/doc/pheme/", "644"],
+    ["../../docs/testing.md", "usr/share/doc/pheme/", "644"],
+]
+maintainer-scripts = "../../packaging/debian/"

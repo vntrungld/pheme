@@ -1,0 +1,20 @@
+#!/bin/sh
+set -e
+
+# The same sequence, in the same order, that the root path of `pheme setup`
+# runs, and for the same reason: modprobe creates the device nodes, the
+# reload picks up the rule file just installed, and the triggers reprocess
+# those nodes against it. Without the triggers the rule applies to nothing
+# until a reboot.
+#
+# Every step tolerates failure. A container has no /sys to trigger against
+# and no module to load, and a package install must not fail there.
+if [ "$1" = "configure" ]; then
+    modprobe uinput || true
+    modprobe i2c-dev || true
+    udevadm control --reload || true
+    udevadm trigger --name-match=uinput || true
+    udevadm trigger --subsystem-match=i2c-dev || true
+fi
+
+#DEBHELPER#
