@@ -1,2 +1,9 @@
 /target
+# packaging/verify-deb.sh and packaging/verify-rpm.sh build inside a
+# container, which cannot share /target with the host: the host's artifacts
+# are linked against a different glibc. Each gets its own directory under
+# the checkout, and each is gigabytes of build output that a careless
+# `git add .` would otherwise stage.
+/target-debian
+/target-fedora
 *.log
