@@ -43,7 +43,8 @@ jobs:
       # build time, so the headers and clang have to be present. GTK 3 and
       # libappindicator are the tray icon's own Linux runtime dependencies;
       # the release tarball is no longer self-contained on Linux because of
-      # them, which sub-project 7's packaging still has to account for.
+      # them, which is what the .deb and the .rpm built below are for. The
+      # tarball still ships, and the README lists what to install beside it.
       # libxcb-render0-dev, libxcb-shape0-dev, libxcb-xfixes0-dev and
       # libxkbcommon-dev are eframe's own native (winit/glow) build deps.
       - name: Linux build deps
