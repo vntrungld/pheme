@@ -82,3 +82,36 @@ assets = [
     ["../../docs/testing.md", "usr/share/doc/pheme/", "644"],
 ]
 maintainer-scripts = "../../packaging/debian/"
+
+# Asset sources here resolve against the working directory the command is
+# run from -- the workspace root -- which is why these carry no `../../`,
+# unlike the cargo-deb block above. `dest` is absolute here and relative
+# there. The two tools disagree about both.
+[package.metadata.generate-rpm]
+name = "pheme"
+summary = "Share one keyboard, mouse, clipboard and audio between two machines"
+assets = [
+    { source = "target/release/pheme", dest = "/usr/bin/pheme", mode = "755" },
+    { source = "packaging/linux/80-pheme.rules", dest = "/usr/lib/udev/rules.d/80-pheme.rules", mode = "644" },
+    { source = "packaging/linux/pheme-modules.conf", dest = "/usr/lib/modules-load.d/pheme.conf", mode = "644" },
+    { source = "packaging/linux/pheme.service", dest = "/usr/lib/systemd/user/pheme.service", mode = "644" },
+    { source = "packaging/linux/pheme.desktop", dest = "/usr/share/applications/pheme.desktop", mode = "644" },
+    { source = "crates/pheme-app/assets/tray-connected.png", dest = "/usr/share/icons/hicolor/32x32/apps/pheme.png", mode = "644" },
+    { source = "README.md", dest = "/usr/share/doc/pheme/README.md", mode = "644" },
+    { source = "docs/testing.md", dest = "/usr/share/doc/pheme/testing.md", mode = "644" },
+    { source = "LICENSE", dest = "/usr/share/doc/pheme/LICENSE", mode = "644" },
+]
+post_install_script = """
+modprobe uinput || true
+modprobe i2c-dev || true
+udevadm control --reload || true
+udevadm trigger --name-match=uinput || true
+udevadm trigger --subsystem-match=i2c-dev || true
+"""
+
+# The soname rather than a package name: what provides it differs between
+# Fedora and openSUSE, the soname does not. Automatic requirement detection
+# cannot find this one, because the tray opens it with dlopen rather than
+# linking it.
+[package.metadata.generate-rpm.requires]
+"libayatana-appindicator3.so.1()(64bit)" = "*"
