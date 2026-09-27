@@ -41,7 +41,7 @@ existing subcommand is unchanged.
 
 ## Installing
 
-### Ubuntu
+### Ubuntu (24.04 or newer)
 
 ```bash
 sudo apt install ./pheme_*_amd64.deb
@@ -64,6 +64,14 @@ release actually ships. Either way, what a given build asks for is:
 ```bash
 dpkg-deb -f pheme_*_amd64.deb Depends
 ```
+
+**Ubuntu 24.04 or newer.** The `Depends` that command prints includes
+`libc6 (>= 2.39)` today, and 2.39 is the glibc Ubuntu 24.04 ships; 22.04
+has 2.35, so apt there reports unsatisfiable dependencies and stops. Do
+not read 2.39 as a promise — it was 2.35 until the build host moved, and
+it moves again whenever the build host does. The heading above names the
+release this build targets; the command above is how to check the build in
+front of you.
 
 ### Fedora
 
