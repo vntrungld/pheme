@@ -62,6 +62,40 @@ libwayland-client.so.0
 libwayland-egl.so.1
 "
 
+# With --pid, report which of the same sonames a running pheme has actually
+# mapped, by reading /proc/PID/maps. This answers a different question from
+# the default mode and is deliberately not pass/fail: which libraries a
+# single run opens depends on the session, because eframe asks glutin for
+# GLX-then-EGL and winit takes its keymap from the compositor on Wayland.
+# So libGL and libxkbcommon-x11 load only under X11, and libEGL only when
+# GLX is unavailable or fails. The manual rows F1b and F1c in
+# docs/testing.md run this in both session types; the criterion is that
+# every soname below is mapped in at least one of the two, which no single
+# run can show.
+if [ "${1:-}" = "--pid" ]; then
+    pid="${2:?usage: $0 --pid PID}"
+    maps="/proc/$pid/maps"
+    [ -r "$maps" ] || { echo "cannot read $maps" >&2; exit 1; }
+    absent=""
+    for so in $sonames; do
+        # The mapped file carries the full version ("libGL.so.1.7.0"), so
+        # match the soname as a prefix rather than for equality.
+        if grep -qE "/${so}([.0-9]*)\$" "$maps" || grep -qF "/$so" "$maps"; then
+            echo "mapped:     $so"
+        else
+            echo "not mapped: $so"
+            absent="$absent $so"
+        fi
+    done
+    if [ -n "$absent" ]; then
+        echo "not opened by this run:$absent"
+        echo "(expected for the other session type -- see the comment above)"
+    else
+        echo "this run opened all of them"
+    fi
+    exit 0
+fi
+
 # Report every missing one rather than stopping at the first, so a person
 # reading a failed job learns the whole gap in one run.
 missing=""
