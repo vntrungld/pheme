@@ -22,6 +22,11 @@ docker run --rm -v "$PWD:/w" -w /w rust:1-bookworm sh -eux -c '
     # linked against a different glibc.
     export CARGO_TARGET_DIR=/w/target-debian
 
+    # The container runs as root, so anything it creates under the bind
+    # mount is root-owned on the host. Hand it back on the way out, whether
+    # or not the rest of the script succeeds.
+    trap '\''chown -R "$(stat -c %u:%g /w)" /w/target-debian 2>/dev/null || true'\'' EXIT
+
     cargo install cargo-deb --locked
     cargo build --release --locked
     cargo deb -p pheme-app --no-build --no-strip
