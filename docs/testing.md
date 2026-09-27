@@ -240,7 +240,8 @@ reboot, and what a person actually meets.
 | # | Action | Pass |
 |---|---|---|
 | F1 | `apt install ./pheme_*.deb` on an Ubuntu with no GTK installed | apt pulls GTK and the AppIndicator library; `pheme --version` runs |
-| F1b | After F1, on a real desktop session, run `pheme` with **no subcommand** | the window opens. `--version` exits inside clap before the first `dlopen`, so F1 says nothing about the thirteen libraries opened that way; this row is the only manual one that reaches them. It proves the binary can open a window on *this* machine — a desktop session already has GL and X11 installed, so it cannot prove the *package* declared them. Only the clean-container soname check does that |
+| F1b | After F1, in a **Wayland** session, run `pheme` with **no subcommand** | the window opens, and `grep -oE 'lib(EGL\|GL\|X11-xcb\|xkbcommon-x11)\.so[0-9.]*' /proc/$(pgrep -f 'bin/pheme$')/maps \| sort -u` lists `libEGL` and `libX11-xcb`. `--version` exits inside clap before the first `dlopen`, so F1 says nothing about the thirteen libraries opened that way |
+| F1c | The same, with `WAYLAND_DISPLAY= pheme` so winit falls back to X11 | the window opens, and the same grep lists `libGL` and `libxkbcommon-x11` instead. Both rows are needed: eframe asks glutin for `FallbackEgl`, which is GLX-first, so `libGL.so.1` is opened **only** on X11, and `libxkbcommon-x11.so.0` only when the keymap comes from an X server. Neither can load in a Wayland session, so F1b alone leaves two of the thirteen untouched |
 | F2 | `dnf install ./pheme-*.rpm` on a clean Fedora | the same two |
 | F3 | After F1, without rebooting, `pheme displays` | `/dev/i2c-*` is readable; no permission error |
 | F4 | After F1, `systemctl --user enable --now pheme`, then sign out and in | the tray icon or the window appears |
@@ -252,3 +253,11 @@ reboot, and what a person actually meets.
 | F10 | Install again over the top, with the PATH task ticked both times | PATH contains the directory once, not twice |
 | F11 | Uninstall on Windows | the directory, the shortcut, the Run value and the PATH entry are gone; `%APPDATA%\pheme\config.toml` is untouched |
 | F12 | Download the installer in a browser | SmartScreen warns; the README's steps get past it; the published SHA256 matches |
+
+F1b and F1c prove the binary can open the libraries on *this* machine, not
+that the package declared them: a desktop session already has GL and X11
+installed. Only `packaging/check-dlopen-sonames.sh` inside a clean container
+proves the declaration, which is what F1/F2 and the release workflow run it
+for. Measured on Ubuntu 24.04 with only GTK 3 and the AppIndicator library
+present, that check reports `libEGL.so.1`, `libGL.so.1`, `libX11-xcb.so.1`
+and `libxkbcommon-x11.so.0` missing and exits 1.

@@ -372,7 +372,8 @@ disable a security feature.
 | # | Action | Pass |
 |---|---|---|
 | F1 | `apt install ./pheme_*.deb` on a clean Ubuntu with no GTK | apt pulls GTK and appindicator; `pheme --version` runs |
-| F1b | After F1, on a real desktop session, `pheme` with no subcommand | the window opens — the only row that exercises the `dlopen`'d GL, X11/Wayland and xkbcommon libraries of §2 |
+| F1b | After F1, in a Wayland session, `pheme` with no subcommand | the window opens, having opened `libEGL` and `libX11-xcb` |
+| F1c | The same with `WAYLAND_DISPLAY=` so winit falls back to X11 | the window opens, having opened `libGL` and `libxkbcommon-x11` instead. Two rows, not one: eframe asks glutin for `FallbackEgl` (GLX-first), so `libGL.so.1` is reachable only on X11, and `libxkbcommon-x11.so.0` only when an X server supplies the keymap |
 | F2 | `dnf install ./pheme-*.rpm` on a clean Fedora | the same two |
 | F3 | After F1, without a reboot, `pheme displays` | `/dev/i2c-*` is readable; the command does not report a permission error |
 | F4 | After F1, `systemctl --user enable --now pheme` then log out and back in | the tray icon or the window appears |
