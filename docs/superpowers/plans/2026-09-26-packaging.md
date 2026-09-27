@@ -482,23 +482,23 @@ git commit -F - <<'EOF'
 Update: build a .deb that declares its own dependencies
 
 cargo-deb's default for Depends is $auto: it runs ldd over the binary
-that was actually built and asks dpkg which package provides each soname.
-The dependency list is therefore derived rather than remembered, which is
-the point -- the README's hand-written list of libraries to install first
-is wrong the moment a dependency changes and nobody notices until
-somebody's binary dies at load time.
+that was actually built and asks dpkg which package provides each
+soname. The dependency list is therefore derived rather than remembered,
+which is the point -- the README's hand-written list of libraries to
+install first is wrong the moment a dependency changes and nobody
+notices until somebody's binary dies at load time.
 
-libayatana-appindicator is named by hand because $auto cannot see it: the
-tray opens it with dlopen at runtime rather than linking it, so it is
-absent from the ELF header automatic detection reads.
+libayatana-appindicator is named by hand because $auto cannot see it:
+the tray opens it with dlopen at runtime rather than linking it, so it
+is absent from the ELF header automatic detection reads.
 
 There is no systemd-units key. cargo-deb's systemd support is for system
 units and has no notion of a user unit, and a user unit should not be
 enabled by a package in any case; it ships as a plain asset, disabled.
 
-postinst repeats the sequence the root path of `pheme setup` runs, in the
-same order and tolerant of failure, so that installing the package leaves
-/dev/uinput and /dev/i2c-* usable without a reboot.
+postinst repeats the sequence the root path of `pheme setup` runs, in
+the same order and tolerant of failure, so that installing the package
+leaves /dev/uinput and /dev/i2c-* usable without a reboot.
 
 verify-deb.sh builds and installs the package inside a Debian container,
 which is the only way to see what $auto resolves to: there is no dpkg on
@@ -588,6 +588,10 @@ docker run --rm -v "$PWD:/w" -w /w fedora:latest sh -eux -c '
         libxdo-devel libxkbcommon-devel
 
     export CARGO_TARGET_DIR=/w/target-fedora
+    # The container runs as root, so anything it creates under the bind
+    # mount is root-owned on the host. Hand it back on the way out, whether
+    # or not the rest of the script succeeds.
+    trap 'chown -R "$(stat -c %u:%g /w)" /w/target-fedora 2>/dev/null || true' EXIT
 
     cargo install cargo-generate-rpm --locked
     cargo build --release --locked
@@ -642,8 +646,8 @@ git commit -F - <<'EOF'
 Update: build an .rpm that declares its own dependencies
 
 cargo-generate-rpm's automatic requirement detection falls back to its
-built-in ELF reader when it finds no /usr/lib/rpm/find-requires, which is
-the case on every Debian-family host. That fallback is what lets one
+built-in ELF reader when it finds no /usr/lib/rpm/find-requires, which
+is the case on every Debian-family host. That fallback is what lets one
 Ubuntu runner produce both packages.
 
 Its asset paths resolve against the working directory rather than the
@@ -651,14 +655,14 @@ manifest directory, and its dest is absolute rather than relative -- the
 opposite of cargo-deb on both counts, which the comment in the manifest
 records so the two blocks are not copied into each other.
 
-The appindicator requirement is written as a soname rather than a package
-name, because what provides it differs between Fedora and openSUSE while
-the soname does not. Automatic detection cannot find it either way: the
-tray opens it with dlopen rather than linking it.
+The appindicator requirement is written as a soname rather than a
+package name, because what provides it differs between Fedora and
+openSUSE while the soname does not. Automatic detection cannot find it
+either way: the tray opens it with dlopen rather than linking it.
 
 verify-rpm.sh builds and installs inside Fedora. The package could be
-built on the development machine, since no rpm tooling is needed, but the
-binary would be linked against Arch's glibc.
+built on the development machine, since no rpm tooling is needed, but
+the binary would be linked against Arch's glibc.
 
 Co-Authored-By: Claude <noreply@anthropic.com>
 EOF
@@ -998,13 +1002,13 @@ Update: build, verify and publish the packages
 The release now carries a .deb, an .rpm and a Windows installer beside
 the tarball and the zip it already produced.
 
-Each is installed and run in the same job that built it. That is the only
-real test this sub-project has: a dependency that was never declared
-fails the install, one declared wrongly fails the run, and neither is
-visible from reading the manifest. The .deb is also installed a second
-time over itself, because postinst runs again on upgrade and must not
-fail there; the Windows installer is uninstalled again and checked for
-the Run value it should have removed.
+Each is installed and run in the same job that built it. That is the
+only real test this sub-project has: a dependency that was never
+declared fails the install, one declared wrongly fails the run, and
+neither is visible from reading the manifest. The .deb is also installed
+a second time over itself, because postinst runs again on upgrade and
+must not fail there; the Windows installer is uninstalled again and
+checked for the Run value it should have removed.
 
 A tag that disagrees with the crate version fails the job before
 anything is built, rather than publishing pheme_0.1.0_amd64.deb inside a
@@ -1043,6 +1047,15 @@ The package declares what it needs, so apt installs GTK 3, PipeWire and
 the AppIndicator library for you. It also installs the udev rule and
 loads the kernel modules, which means `pheme setup` is not needed — it
 is there for people installing from the tarball.
+
+It is built on current Debian stable and declares a glibc floor to
+match, so it wants Debian 12 or Ubuntu 22.04 and newer. On anything
+older apt will refuse it, and the tarball is the way in. Check what the
+build actually asks for with:
+
+```bash
+dpkg-deb -f pheme_*_amd64.deb Depends
+```
 
 ### Fedora
 
@@ -1151,9 +1164,9 @@ SmartScreen will warn, and how to get past it, with the published SHA256
 as the thing a person can actually check. No euphemism, and no advice to
 turn a security feature off.
 
-F1 to F12 cover what CI cannot: a real desktop session, a reboot, PATH in
-a new terminal, and what a person meets when they download the installer
-in a browser.
+F1 to F12 cover what CI cannot: a real desktop session, a reboot, PATH
+in a new terminal, and what a person meets when they download the
+installer in a browser.
 
 Co-Authored-By: Claude <noreply@anthropic.com>
 EOF
