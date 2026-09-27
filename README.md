@@ -171,7 +171,9 @@ window's three device menus are filled from this same list.
 1. **Server** (the machine with the keyboard and mouse), once:
    `pheme server --pair` → note the 6-digit code.
 2. **Client**, once: `pheme pair <server-ip> <code>`.
-   On Linux also run `sudo pheme setup` and log out/in (uinput permissions).
+   On Linux, if you installed from the tarball, also run
+   `sudo pheme setup` and log out/in (uinput permissions). The `.deb` and
+   the `.rpm` have already done it (see "Installing" above).
 3. Put a config on the server (`~/.config/pheme/config.toml`, or
    `%APPDATA%\pheme\config.toml` on Windows):
    ```toml
@@ -444,8 +446,9 @@ Requirements and limits:
 - `monitor` is best given as part of the identity rather than the bus
   path: i2c bus numbers can move between boots, and a `monitor` that names
   one stops matching when they do.
-- On Linux, `pheme setup` loads `i2c-dev` and adds the udev rule. If it
-  still fails, `usermod -aG i2c $USER` and log in again.
+- On Linux, `pheme setup` loads `i2c-dev` and adds the udev rule, and the
+  `.deb` and the `.rpm` do the same at install time. If it still fails,
+  `usermod -aG i2c $USER` and log in again.
 - With no `[display]` section, nothing here runs and nothing changes.
 
 ## Clipboard
