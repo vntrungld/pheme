@@ -36,6 +36,12 @@ docker run --rm -v "$PWD:/w" -w /w fedora:latest sh -eux -c '
     dnf install -y "$rpm"
     pheme --version
 
+    # Again, over the top. dnf re-runs post_install_script on an upgrade and
+    # the .deb'\''s script proves the same property for postinst; without this
+    # the two packages are not verified to the same standard.
+    dnf reinstall -y "$rpm"
+    pheme --version
+
     for p in /usr/bin/pheme \
              /usr/lib/udev/rules.d/80-pheme.rules \
              /usr/lib/modules-load.d/pheme.conf \
