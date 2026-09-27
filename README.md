@@ -119,10 +119,16 @@ Windows installer — is published with a `.sha256` file beside it holding
 the hash and the filename, the format `sha256sum` writes. Download both
 into the same directory and check the asset against it.
 
-On Linux, macOS or Git Bash:
+On Linux or Git Bash:
 
 ```bash
 sha256sum -c pheme-*-setup.exe.sha256     # or any other asset's .sha256
+```
+
+On macOS, which ships no `sha256sum`, with the same file:
+
+```bash
+shasum -a 256 -c pheme-*-setup.exe.sha256
 ```
 
 It prints `<filename>: OK`, or `FAILED` and a non-zero exit. Pass
