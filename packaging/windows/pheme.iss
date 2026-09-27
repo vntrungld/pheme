@@ -52,9 +52,16 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; \
     ValueType: string; ValueName: "Pheme"; ValueData: """{app}\pheme.exe"""; \
     Flags: uninsdeletevalue; Tasks: startup
 ; Guarded by NeedsAddPath so a repeat install appends once, not twice.
+; Two entries with complementary checks rather than one: on a profile that
+; has never had a user Path, {olddata} expands to nothing and a single
+; entry would write ";C:\...", whose empty leading segment Windows resolves
+; as the current directory.
 Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; \
     ValueData: "{olddata};{app}"; Tasks: addtopath; \
-    Check: NeedsAddPath(ExpandConstant('{app}'))
+    Check: NeedsAddPath(ExpandConstant('{app}')) and HasExistingPath
+Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; \
+    ValueData: "{app}"; Tasks: addtopath; \
+    Check: NeedsAddPath(ExpandConstant('{app}')) and not HasExistingPath
 
 [Code]
 const
@@ -73,6 +80,18 @@ begin
     Exit;
   end;
   Result := Pos(';' + Uppercase(Param) + ';', ';' + Uppercase(OrigPath) + ';') = 0;
+end;
+
+{ True when the user already has a non-empty Path, so a new entry needs a
+  separator in front of it. Without this test, {olddata} expands to nothing
+  on a profile that never had one and the value becomes ";C:\...", whose
+  empty leading segment Windows resolves as the current directory. }
+function HasExistingPath(): Boolean;
+var
+  OrigPath: string;
+begin
+  Result := RegQueryStringValue(HKEY_CURRENT_USER, EnvironmentKey, 'Path', OrigPath)
+            and (OrigPath <> '');
 end;
 
 { Take {app} back out of PATH without disturbing anything else in it. }
