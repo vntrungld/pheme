@@ -24,6 +24,19 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
+
+      # A tag of v0.2.0 against a crate at 0.1.0 would produce
+      # pheme_0.1.0_amd64.deb inside a release called v0.2.0. Fail before
+      # anything is built rather than publish files that disagree with
+      # their own release name.
+      - name: The tag must match the crate version
+        if: startsWith(github.ref, 'refs/tags/') && runner.os == 'Linux'
+        run: |
+          v=$(cargo metadata --format-version 1 --no-deps \
+              | jq -r '.packages[] | select(.name=="pheme-app") | .version')
+          test "v$v" = "$GITHUB_REF_NAME" \
+            || { echo "tag $GITHUB_REF_NAME does not match crate version $v"; exit 1; }
+
       - uses: dtolnay/rust-toolchain@stable
 
       # Same packages as the ci workflow: the PipeWire bindings are generated at
@@ -46,6 +59,55 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo build --release --locked
 
+      - name: Build the Linux packages
+        if: runner.os == 'Linux'
+        run: |
+          cargo install cargo-deb cargo-generate-rpm --locked
+          # --no-build reuses the binary the previous step produced rather
+          # than compiling the workspace a second time.
+          cargo deb -p pheme-app --no-build --no-strip
+          cargo generate-rpm -p crates/pheme-app
+          cp target/debian/*.deb target/generate-rpm/*.rpm .
+
+      # The only real test this sub-project has. A dependency that was
+      # never declared fails the install; one declared wrongly fails the
+      # run. Neither is visible from reading the manifest.
+      - name: The .deb installs and runs
+        if: runner.os == 'Linux'
+        run: |
+          echo "--- Depends ---"
+          dpkg-deb -f ./pheme_*_amd64.deb Depends
+          sudo apt-get install -y ./pheme_*_amd64.deb
+          pheme --version
+          for p in /usr/bin/pheme \
+                   /usr/lib/udev/rules.d/80-pheme.rules \
+                   /usr/lib/modules-load.d/pheme.conf \
+                   /usr/lib/systemd/user/pheme.service \
+                   /usr/share/applications/pheme.desktop \
+                   /usr/share/icons/hicolor/32x32/apps/pheme.png; do
+            test -f "$p" || { echo "MISSING: $p"; exit 1; }
+          done
+          # postinst runs again on upgrade; it must not fail the second time.
+          sudo apt-get install -y --reinstall ./pheme_*_amd64.deb
+          pheme --version
+          sudo apt-get remove -y pheme
+          test ! -e /usr/bin/pheme || { echo "remove left the binary"; exit 1; }
+
+      - name: The .rpm installs and runs
+        if: runner.os == 'Linux'
+        run: |
+          docker run --rm -v "$PWD:/w" fedora:latest sh -euxc '
+            echo "--- Requires ---"
+            rpm -qp --requires /w/pheme-*.x86_64.rpm
+            dnf install -y /w/pheme-*.x86_64.rpm
+            pheme --version
+            test -f /usr/lib/systemd/user/pheme.service
+            # post_install_script re-runs on an upgrade and must not fail
+            # there, the same property the .deb step checks for postinst.
+            dnf reinstall -y /w/pheme-*.x86_64.rpm
+            pheme --version
+          '
+
       # Link the CRT statically on Windows. Without this the binary imports
       # VCRUNTIME140.dll, which a clean Windows install does not have, and it dies
       # at load time with no output at all — not even --version. A single-file CLI
@@ -63,6 +125,11 @@ jobs:
           cp target/release/pheme README.md LICENSE docs/testing.md dist/pheme/
           tar -C dist -czf pheme-${{ matrix.name }}.tar.gz pheme
           sha256sum pheme-${{ matrix.name }}.tar.gz > pheme-${{ matrix.name }}.tar.gz.sha256
+          # The .deb and the .rpm were built and verified by the two steps
+          # above; checksum them here too, alongside the tarball.
+          for f in pheme_*_amd64.deb pheme-*.x86_64.rpm; do
+            sha256sum "$f" > "$f.sha256"
+          done
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -74,11 +141,65 @@ jobs:
           (Get-FileHash pheme-${{ matrix.name }}.zip -Algorithm SHA256).Hash `
             | Out-File -Encoding ascii pheme-${{ matrix.name }}.zip.sha256
 
+      - name: Build the Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          # The runner image ships Inno Setup. Install it if a future image
+          # stops doing so, rather than fail on a missing tool.
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          if (-not (Test-Path $iscc)) { throw "Inno Setup is not available at $iscc" }
+          # The script uses x64compatible, which needs Inno Setup 6.3 or
+          # newer. If a compile fails on an unknown identifier, the runner's
+          # Inno Setup is older than that and this is the line to look at.
+          $version = ((cargo metadata --format-version 1 --no-deps | ConvertFrom-Json).packages |
+            Where-Object { $_.name -eq 'pheme-app' }).version
+          & $iscc "/DAppVersion=$version" packaging\windows\pheme.iss
+          if ($LASTEXITCODE -ne 0) { throw "iscc failed" }
+          Copy-Item packaging\windows\Output\*.exe .
+          # Checksum the installer alongside the zip, the same way the Linux
+          # job checksums the .deb and the .rpm alongside the tarball.
+          $exe = (Get-ChildItem pheme-*-setup.exe)[0]
+          (Get-FileHash $exe.FullName -Algorithm SHA256).Hash `
+            | Out-File -Encoding ascii "$($exe.Name).sha256"
+
+      - name: The installer installs, runs and uninstalls
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $setup = (Get-ChildItem pheme-*-setup.exe)[0].FullName
+          Start-Process -Wait $setup -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/TASKS=startup,addtopath'
+          # Again, over the top, with the PATH task ticked both times. The
+          # Check guard in the script is the only thing stopping the
+          # directory being appended twice, and nothing else exercises it.
+          Start-Process -Wait $setup -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/TASKS=startup,addtopath'
+          $app = "$env:LOCALAPPDATA\Programs\Pheme"
+          if (-not (Test-Path "$app\pheme.exe")) { throw "pheme.exe was not installed" }
+          & "$app\pheme.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw "the installed binary does not run" }
+          $run = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' `
+                   -Name Pheme -ErrorAction SilentlyContinue
+          if (-not $run) { throw "the startup task did not write its Run value" }
+          $path = (Get-ItemProperty 'HKCU:\Environment' -Name Path).Path
+          $hits = ($path -split ';' | Where-Object { $_ -eq $app }).Count
+          if ($hits -ne 1) { throw "PATH holds the directory $hits times, expected once" }
+          Start-Process -Wait "$app\unins000.exe" -ArgumentList '/VERYSILENT'
+          if (Test-Path "$app\pheme.exe") { throw "uninstall left the binary behind" }
+          $run = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' `
+                   -Name Pheme -ErrorAction SilentlyContinue
+          if ($run) { throw "uninstall left the Run value behind" }
+          $path = (Get-ItemProperty 'HKCU:\Environment' -Name Path).Path
+          if ($path -split ';' -contains $app) { throw "uninstall left the PATH entry behind" }
+
       - uses: actions/upload-artifact@v4
         with:
           name: pheme-${{ matrix.name }}
           path: |
             pheme-${{ matrix.name }}.*
+            pheme_*.deb*
+            pheme-*.rpm*
+            pheme-*-setup.exe*
           if-no-files-found: error
 
   publish:
