@@ -57,14 +57,17 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; \
 ; entry would write ";C:\...", whose empty leading segment Windows resolves
 ; as the current directory.
 ;
-; Exactly one of the two fires. `HasExistingPath` and `not HasExistingPath`
-; are true complements, and Inno evaluates each Check immediately before
-; writing that entry rather than batching them, so the second one also sees
-; whatever the first wrote -- and `NeedsAddPath` re-reads the registry, so
-; it is already false by then. Anything added later that writes
-; Environment\Path must keep that property, or PATH gains a second copy of
-; the directory: a third entry needs a Check that cannot be true at the same
-; time as either of these.
+; At most one of the two fires, and on a repeat install neither does.
+; `HasExistingPath` and `not HasExistingPath` are true complements, so they
+; cannot both write; `NeedsAddPath` is what stops either of them writing a
+; second copy, because it re-reads the registry and is already false once
+; the directory is on PATH. Inno evaluates each Check immediately before
+; writing its own entry rather than batching them, so the second entry also
+; sees whatever the first wrote -- though here the complementary guards
+; alone would be enough, which is why the order of the two is irrelevant.
+; Anything added later that writes Environment\Path must be guarded by
+; NeedsAddPath too; that alone keeps PATH from gaining a second copy of the
+; directory, whatever the other entries do.
 Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; \
     ValueData: "{olddata};{app}"; Tasks: addtopath; \
     Check: NeedsAddPath(ExpandConstant('{app}')) and HasExistingPath

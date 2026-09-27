@@ -338,8 +338,10 @@ instead is better, and it runs in CI on every release build:
   of them. One container for both halves cannot test a dependency at all:
   every `-dev` package pulls in the runtime library beside it, so the whole
   `Depends` is already satisfied before the install begins.
-- **File placement:** `dpkg -c` and `rpm -qlp` list the archive contents;
-  assert every path in §3.1 is present, once, with the right mode.
+- **File placement:** every path in §3.1 is asserted present with
+  `test -f` after the install, inside the same clean container. Modes are
+  not checked there; `dpkg -c` and `rpm -qlp` print them for a person
+  reading the log.
 - **Windows:** run the installer with `/VERYSILENT /SUPPRESSMSGBOXES`,
   assert `pheme.exe` exists and `--version` runs, assert the `Run` value
   exists, then run the uninstaller with `/VERYSILENT` and assert the
@@ -417,7 +419,10 @@ disable a security feature.
 - **`cargo-deb` and `cargo-generate-rpm` are build-time tools installed
   from crates.io in CI**, so a release build depends on crates.io being up
   and on those tools not breaking. `--locked` is used where the tools
-  support it.
+  support it, and `cargo-deb` and `cargo-generate-rpm` are installed at
+  exact versions (`3.8.0` and `0.21.0`) in both the release workflow and
+  the two local verify scripts, so a new release of either cannot change
+  an artifact's filename or its dependency list without an edit here.
 - **Fedora testing runs in a container**, which is not the same as a real
   Fedora desktop: it proves dependency resolution and that the binary
   starts, not that the tray works there.
