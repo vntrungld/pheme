@@ -110,8 +110,34 @@ profile, creates no service and writes nothing outside it.
 Windows will warn that it does not recognise the program, because the
 installer is not signed — a code-signing certificate is a recurring cost
 this project does not carry. Choose **More info**, then **Run anyway**.
-The SHA256 published beside the download is what you can check first, and
-it is worth checking.
+Before doing that, check the SHA256 published beside the download, below.
+
+### Checking a download's SHA256
+
+Every release asset — the `.deb`, the `.rpm`, the tarball, the zip and the
+Windows installer — is published with a `.sha256` file beside it holding
+the hash and the filename, the format `sha256sum` writes. Download both
+into the same directory and check the asset against it.
+
+On Linux, macOS or Git Bash:
+
+```bash
+sha256sum -c pheme-*-setup.exe.sha256     # or any other asset's .sha256
+```
+
+It prints `<filename>: OK`, or `FAILED` and a non-zero exit. Pass
+whichever `.sha256` you downloaded; the form is the same for all five.
+
+In PowerShell, where there is no `sha256sum`:
+
+```powershell
+$f = (Get-ChildItem pheme-*-setup.exe)[0]
+$want = (Get-Content "$($f.Name).sha256").Split()[0]
+if ((Get-FileHash $f -Algorithm SHA256).Hash -eq $want) { "OK" } else { "MISMATCH" }
+```
+
+`-eq` compares strings case-insensitively, so it does not matter that
+`Get-FileHash` prints uppercase and the file holds lowercase.
 
 ### From the tarball
 

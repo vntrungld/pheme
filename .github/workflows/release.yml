@@ -177,8 +177,16 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist/pheme | Out-Null
           Copy-Item target/release/pheme.exe, README.md, LICENSE, docs/testing.md dist/pheme/
           Compress-Archive -Path dist/pheme -DestinationPath pheme-${{ matrix.name }}.zip
-          (Get-FileHash pheme-${{ matrix.name }}.zip -Algorithm SHA256).Hash `
-            | Out-File -Encoding ascii pheme-${{ matrix.name }}.zip.sha256
+          # "<lowercase hash><two spaces><filename>", which is what
+          # sha256sum writes on the Linux leg and the only format
+          # `sha256sum -c` can read. Get-FileHash alone gives a bare
+          # uppercase hash with no filename, which nothing can check
+          # automatically. -NoNewline keeps the CRLF that Out-File would
+          # have appended out of the filename field.
+          $zip = "pheme-${{ matrix.name }}.zip"
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          Set-Content -Path "$zip.sha256" -Value "$hash  $zip" `
+            -NoNewline -Encoding ascii
 
       - name: Build the Windows installer
         if: runner.os == 'Windows'
@@ -215,8 +223,10 @@ jobs:
           # Checksum the installer alongside the zip, the same way the Linux
           # job checksums the .deb and the .rpm alongside the tarball.
           $exe = (Get-ChildItem pheme-*-setup.exe)[0]
-          (Get-FileHash $exe.FullName -Algorithm SHA256).Hash `
-            | Out-File -Encoding ascii "$($exe.Name).sha256"
+          # Same sha256sum-readable format as the zip above.
+          $hash = (Get-FileHash $exe.FullName -Algorithm SHA256).Hash.ToLower()
+          Set-Content -Path "$($exe.Name).sha256" `
+            -Value "$hash  $($exe.Name)" -NoNewline -Encoding ascii
 
       - name: The installer installs, runs and uninstalls
         if: runner.os == 'Windows'
