@@ -323,6 +323,12 @@ instead is better, and it runs in CI on every release build:
 - **Fedora:** the same three, inside `docker run --rm fedora:latest`, with
   `dnf install -y`. The runner has Docker and the image is the only place
   an `.rpm` can honestly be tested from an Ubuntu host.
+- The same three run locally from `packaging/verify-deb.sh` and
+  `packaging/verify-rpm.sh`, which each build in a container holding the
+  `-dev` packages and then install in a **second** container holding none
+  of them. One container for both halves cannot test a dependency at all:
+  every `-dev` package pulls in the runtime library beside it, so the whole
+  `Depends` is already satisfied before the install begins.
 - **File placement:** `dpkg -c` and `rpm -qlp` list the archive contents;
   assert every path in §3.1 is present, once, with the right mode.
 - **Windows:** run the installer with `/VERYSILENT /SUPPRESSMSGBOXES`,

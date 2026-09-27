@@ -1,11 +1,21 @@
 #!/bin/sh
-# Build the .deb inside Ubuntu and install it there, because this is the
-# only way to see what `$auto` resolves to: cargo-deb asks dpkg which
-# package owns each soname, and there is no dpkg on the development
-# machine. Ubuntu 24.04 specifically, and not a Debian image: it is what
-# CI's own runner is, so this validates the same package CI ships (with
-# Ubuntu 24.04's post-time_t "t64" library names) rather than a
-# Debian-named package nobody will actually download.
+# Build the .deb and then install it, in two separate containers.
+#
+# The build has to happen inside Ubuntu, because this is the only way to
+# see what `$auto` resolves to: cargo-deb asks dpkg which package owns each
+# soname, and there is no dpkg on the development machine. Ubuntu 24.04
+# specifically, and not a Debian image: it is what CI's own runner is, so
+# this validates the same package CI ships (with Ubuntu 24.04's post-time_t
+# "t64" library names) rather than a Debian-named package nobody will
+# actually download.
+#
+# The install has to happen somewhere else. The build container has every
+# `-dev` package installed, and each of those pulls in the runtime library
+# beside it, so every dependency the package could possibly declare is
+# already satisfied there -- a wrong or missing `Depends` cannot fail an
+# install in the container that just built it. The second container starts
+# from a bare ubuntu:24.04 and has nothing but the package, so apt has to
+# resolve the dependency list for real.
 #
 # Usage: packaging/verify-deb.sh
 # Needs: docker, and a user in the docker group.
@@ -13,6 +23,7 @@ set -eu
 
 cd "$(dirname "$0")/.."
 
+echo "=== build (ubuntu:24.04, with the -dev packages) ==="
 docker run --rm -v "$PWD:/w" -w /w ubuntu:24.04 sh -eux -c '
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
@@ -48,11 +59,26 @@ docker run --rm -v "$PWD:/w" -w /w ubuntu:24.04 sh -eux -c '
     dpkg-deb -f "$deb" Depends
     echo "--- contents ---"
     dpkg-deb -c "$deb"
+'
+
+echo "=== install (a clean ubuntu:24.04, with nothing) ==="
+# The mount is read-only: this container must not be able to leave anything
+# behind in the checkout, and it has no reason to.
+docker run --rm -v "$PWD:/w:ro" ubuntu:24.04 sh -eux -c '
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+
+    deb=$(ls /w/target-debian/debian/pheme_*_amd64.deb)
 
     # Install it the way a person would, so apt resolves the dependencies
     # rather than dpkg refusing them.
     apt-get install -y "$deb"
     pheme --version
+
+    # --version exits inside clap, before the first dlopen, so it proves
+    # nothing about the twelve libraries that are opened that way. This is
+    # the check that can fail.
+    sh /w/packaging/check-dlopen-sonames.sh
 
     # Every path the design promises, present exactly once.
     for p in /usr/bin/pheme \

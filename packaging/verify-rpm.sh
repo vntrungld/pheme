@@ -1,8 +1,18 @@
 #!/bin/sh
-# Build the .rpm and install it in Fedora. Unlike the .deb this could be
-# built on the development machine -- cargo-generate-rpm needs no rpm
-# tooling, only an ELF reader -- but the binary would be linked against
-# Arch's glibc, so the build happens in the container that will install it.
+# Build the .rpm and then install it, in two separate containers.
+#
+# Unlike the .deb the build could happen on the development machine --
+# cargo-generate-rpm needs no rpm tooling, only an ELF reader -- but the
+# binary would be linked against Arch's glibc, so the build happens in
+# Fedora instead.
+#
+# The install happens in a second, bare container. The build container has
+# every `-devel` package installed, and each of those pulls in the runtime
+# library beside it, so every requirement the package could possibly
+# declare is already satisfied there -- a wrong or missing `Requires`
+# cannot fail an install in the container that just built it. The second
+# container has nothing but the package, so dnf has to resolve the
+# requirements for real.
 #
 # Usage: packaging/verify-rpm.sh
 # Needs: docker, and a user in the docker group.
@@ -10,6 +20,7 @@ set -eu
 
 cd "$(dirname "$0")/.."
 
+echo "=== build (fedora:latest, with the -devel packages) ==="
 docker run --rm -v "$PWD:/w" -w /w fedora:latest sh -eux -c '
     dnf install -y --setopt=install_weak_deps=False \
         cargo rust clang pkgconf-pkg-config \
@@ -32,9 +43,21 @@ docker run --rm -v "$PWD:/w" -w /w fedora:latest sh -eux -c '
     rpm -qp --requires "$rpm"
     echo "--- contents ---"
     rpm -qlp "$rpm"
+'
+
+echo "=== install (a clean fedora:latest, with nothing) ==="
+# The mount is read-only: this container must not be able to leave anything
+# behind in the checkout, and it has no reason to.
+docker run --rm -v "$PWD:/w:ro" fedora:latest sh -eux -c '
+    rpm=$(ls /w/target-fedora/generate-rpm/pheme-*.rpm)
 
     dnf install -y "$rpm"
     pheme --version
+
+    # --version exits inside clap, before the first dlopen, so it proves
+    # nothing about the twelve libraries that are opened that way. This is
+    # the check that can fail.
+    sh /w/packaging/check-dlopen-sonames.sh
 
     # Again, over the top. dnf re-runs post_install_script on an upgrade and
     # the .deb'\''s script proves the same property for postinst; without this
