@@ -1,6 +1,14 @@
 [package]
 name = "pheme-app"
-description = "Share one keyboard, mouse, clipboard and audio between two machines over the LAN"
+# Keep this at 79 characters or fewer, and keep it the same text as
+# [package.metadata.generate-rpm]'s `summary` below. cargo-deb has no way to
+# override the .deb's synopsis -- it always takes this field and hard-wraps
+# it at 79 -- so at 80 characters the shipped control file's Description:
+# line ended mid-phrase at "...over the" and the extended description then
+# opened with a paragraph consisting of the single word "LAN", which is what
+# `apt search pheme` and `apt show pheme` displayed. The full sentence,
+# "over the LAN" included, is in the extended description and in the README.
+description = "Share one keyboard, mouse, clipboard and audio between two machines"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -104,6 +112,8 @@ maintainer-scripts = "../../packaging/debian/"
 # there. The two tools disagree about both.
 [package.metadata.generate-rpm]
 name = "pheme"
+# Deliberately the same text as the crate's `description`, which is what the
+# .deb's synopsis is forced to be; both packages then show one synopsis.
 summary = "Share one keyboard, mouse, clipboard and audio between two machines"
 assets = [
     { source = "target/release/pheme", dest = "/usr/bin/pheme", mode = "755" },
