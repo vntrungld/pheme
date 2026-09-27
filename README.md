@@ -146,17 +146,27 @@ yours to install:
 
 ```bash
 # Debian/Ubuntu
-sudo apt install libgtk-3-0 libayatana-appindicator3-1
+sudo apt install libgtk-3-0 libayatana-appindicator3-1 \
+                 libgl1 libegl1 libx11-xcb1 libxkbcommon-x11-0
 # Arch
-sudo pacman -S gtk3 libayatana-appindicator
+sudo pacman -S gtk3 libayatana-appindicator libglvnd libx11 libxkbcommon-x11
 # Fedora
-sudo dnf install gtk3 libayatana-appindicator-gtk3
+sudo dnf install gtk3 libayatana-appindicator-gtk3 \
+                 libglvnd-glx libglvnd-egl libX11-xcb libxkbcommon-x11
 ```
 
 `pheme` links GTK 3 directly, so it has to be present to run the binary
 **at all** — every subcommand, not only the tray and the window. Then run
 `sudo pheme setup` once, which installs the udev rule and loads the
 modules the packages would have handled.
+
+The second line of each command is the part that is easy to miss. Those
+libraries are opened with `dlopen` when the window is created rather than
+linked, so nothing reports them missing until you run `pheme` with no
+subcommand and no window appears — `pheme --version` and every other
+subcommand keep working without them. Installing GTK 3 does not bring
+them either: a clean Ubuntu 24.04 with GTK 3 satisfied has none of the
+four. The packages declare them for you; the tarball cannot.
 
 Building from source on Linux needs the matching `-dev` packages, plus
 a few X11/xcb headers `eframe` needs — see the packages
