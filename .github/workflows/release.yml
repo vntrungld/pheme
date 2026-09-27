@@ -72,26 +72,39 @@ jobs:
       # The only real test this sub-project has. A dependency that was
       # never declared fails the install; one declared wrongly fails the
       # run. Neither is visible from reading the manifest.
+      #
+      # This has to install inside a clean container, not on this runner:
+      # the runner just ran "Linux build deps", so every runtime library the
+      # .deb depends on is already present here, and `pheme --version` never
+      # touches libayatana-appindicator anyway (it's dlopen'd by the tray,
+      # which clap exits before reaching). Ubuntu 24.04, not a Debian image:
+      # cargo-deb's $auto resolved these Depends against this same runner's
+      # dpkg database, so the .deb names Ubuntu 24.04's packages (the
+      # post-time_t "t64" ones) and only an Ubuntu 24.04 container can
+      # satisfy them.
       - name: The .deb installs and runs
         if: runner.os == 'Linux'
         run: |
           echo "--- Depends ---"
           dpkg-deb -f ./pheme_*_amd64.deb Depends
-          sudo apt-get install -y ./pheme_*_amd64.deb
-          pheme --version
-          for p in /usr/bin/pheme \
-                   /usr/lib/udev/rules.d/80-pheme.rules \
-                   /usr/lib/modules-load.d/pheme.conf \
-                   /usr/lib/systemd/user/pheme.service \
-                   /usr/share/applications/pheme.desktop \
-                   /usr/share/icons/hicolor/32x32/apps/pheme.png; do
-            test -f "$p" || { echo "MISSING: $p"; exit 1; }
-          done
-          # postinst runs again on upgrade; it must not fail the second time.
-          sudo apt-get install -y --reinstall ./pheme_*_amd64.deb
-          pheme --version
-          sudo apt-get remove -y pheme
-          test ! -e /usr/bin/pheme || { echo "remove left the binary"; exit 1; }
+          docker run --rm -v "$PWD:/w" ubuntu:24.04 sh -euxc '
+            apt-get update
+            apt-get install -y /w/pheme_*_amd64.deb
+            pheme --version
+            for p in /usr/bin/pheme \
+                     /usr/lib/udev/rules.d/80-pheme.rules \
+                     /usr/lib/modules-load.d/pheme.conf \
+                     /usr/lib/systemd/user/pheme.service \
+                     /usr/share/applications/pheme.desktop \
+                     /usr/share/icons/hicolor/32x32/apps/pheme.png; do
+              test -f "$p" || { echo "MISSING: $p"; exit 1; }
+            done
+            # postinst runs again on upgrade; it must not fail the second time.
+            apt-get install -y --reinstall /w/pheme_*_amd64.deb
+            pheme --version
+            apt-get remove -y pheme
+            test ! -e /usr/bin/pheme || { echo "remove left the binary"; exit 1; }
+          '
 
       - name: The .rpm installs and runs
         if: runner.os == 'Linux'
@@ -101,11 +114,20 @@ jobs:
             rpm -qp --requires /w/pheme-*.x86_64.rpm
             dnf install -y /w/pheme-*.x86_64.rpm
             pheme --version
-            test -f /usr/lib/systemd/user/pheme.service
+            for p in /usr/bin/pheme \
+                     /usr/lib/udev/rules.d/80-pheme.rules \
+                     /usr/lib/modules-load.d/pheme.conf \
+                     /usr/lib/systemd/user/pheme.service \
+                     /usr/share/applications/pheme.desktop \
+                     /usr/share/icons/hicolor/32x32/apps/pheme.png; do
+              test -f "$p" || { echo "MISSING: $p"; exit 1; }
+            done
             # post_install_script re-runs on an upgrade and must not fail
             # there, the same property the .deb step checks for postinst.
             dnf reinstall -y /w/pheme-*.x86_64.rpm
             pheme --version
+            dnf remove -y pheme
+            test ! -e /usr/bin/pheme || { echo "remove left the binary"; exit 1; }
           '
 
       # Link the CRT statically on Windows. Without this the binary imports
@@ -146,13 +168,16 @@ jobs:
         shell: pwsh
         run: |
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
-          # The runner image ships Inno Setup. Install it if a future image
-          # stops doing so, rather than fail on a missing tool.
-          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          # The script uses x64compatible, which Inno Setup understands only
+          # from 6.3. Test-Path alone would pass on a runner image that
+          # ships an older 6.x, and the compile would then fail on an
+          # unknown identifier after the whole matrix has already built.
+          # Check the version, not just presence, and upgrade rather than
+          # install, so this also fixes an already-present-but-too-old copy.
+          $needed = [version]'6.3'
+          $have = if (Test-Path $iscc) { [version](Get-Item $iscc).VersionInfo.ProductVersion } else { $null }
+          if (-not $have -or $have -lt $needed) { choco upgrade innosetup -y --no-progress }
           if (-not (Test-Path $iscc)) { throw "Inno Setup is not available at $iscc" }
-          # The script uses x64compatible, which needs Inno Setup 6.3 or
-          # newer. If a compile fails on an unknown identifier, the runner's
-          # Inno Setup is older than that and this is the line to look at.
           $version = ((cargo metadata --format-version 1 --no-deps | ConvertFrom-Json).packages |
             Where-Object { $_.name -eq 'pheme-app' }).version
           & $iscc "/DAppVersion=$version" packaging\windows\pheme.iss
@@ -169,11 +194,16 @@ jobs:
         shell: pwsh
         run: |
           $setup = (Get-ChildItem pheme-*-setup.exe)[0].FullName
-          Start-Process -Wait $setup -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/TASKS=startup,addtopath'
+          $p = Start-Process -Wait -PassThru $setup -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/TASKS=startup,addtopath'
+          if ($p.ExitCode -ne 0) { throw "the installer exited $($p.ExitCode)" }
           # Again, over the top, with the PATH task ticked both times. The
           # Check guard in the script is the only thing stopping the
           # directory being appended twice, and nothing else exercises it.
-          Start-Process -Wait $setup -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/TASKS=startup,addtopath'
+          # This is the run that actually matters: the first install is
+          # also checked by the Test-Path below, but nothing else notices
+          # if this second, over-the-top run silently fails.
+          $p = Start-Process -Wait -PassThru $setup -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/TASKS=startup,addtopath'
+          if ($p.ExitCode -ne 0) { throw "the reinstall exited $($p.ExitCode)" }
           $app = "$env:LOCALAPPDATA\Programs\Pheme"
           if (-not (Test-Path "$app\pheme.exe")) { throw "pheme.exe was not installed" }
           & "$app\pheme.exe" --version
@@ -184,13 +214,47 @@ jobs:
           $path = (Get-ItemProperty 'HKCU:\Environment' -Name Path).Path
           $hits = ($path -split ';' | Where-Object { $_ -eq $app }).Count
           if ($hits -ne 1) { throw "PATH holds the directory $hits times, expected once" }
-          Start-Process -Wait "$app\unins000.exe" -ArgumentList '/VERYSILENT'
+
+          $p = Start-Process -Wait -PassThru "$app\unins000.exe" -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES'
+          if ($p.ExitCode -ne 0) { throw "the uninstaller exited $($p.ExitCode)" }
+          # unins000.exe relaunches a copy of itself from %TEMP% so it can
+          # delete its own directory, and the process we waited on returns
+          # before that second phase finishes. Poll for the binary to
+          # disappear rather than asserting immediately, so a slow cleanup
+          # is not a spurious failure; RemovePath runs at usPostUninstall,
+          # one of the last things this second phase does, so once the
+          # binary (and its directory) are gone the registry cleanup below
+          # is done too.
+          $deadline = (Get-Date).AddSeconds(30)
+          while ((Test-Path "$app\pheme.exe") -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 1
+          }
           if (Test-Path "$app\pheme.exe") { throw "uninstall left the binary behind" }
           $run = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' `
                    -Name Pheme -ErrorAction SilentlyContinue
           if ($run) { throw "uninstall left the Run value behind" }
           $path = (Get-ItemProperty 'HKCU:\Environment' -Name Path).Path
           if ($path -split ';' -contains $app) { throw "uninstall left the PATH entry behind" }
+
+      # if-no-files-found: error below only notices a *completely* empty
+      # match; the tarball or the zip alone still satisfies it, so a
+      # missing .deb, .rpm or installer would otherwise upload silently.
+      - name: Check the expected artifacts exist
+        if: runner.os == 'Linux'
+        run: |
+          shopt -s nullglob
+          for g in "pheme-${{ matrix.name }}.tar.gz" "pheme_*_amd64.deb" "pheme-*.x86_64.rpm"; do
+            files=($g)
+            test "${#files[@]}" -ge 1 || { echo "MISSING artifact: $g"; exit 1; }
+          done
+
+      - name: Check the expected artifacts exist (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          foreach ($g in @("pheme-${{ matrix.name }}.zip", "pheme-*-setup.exe")) {
+            if (-not (Get-ChildItem $g -ErrorAction SilentlyContinue)) { throw "MISSING artifact: $g" }
+          }
 
       - uses: actions/upload-artifact@v4
         with:
