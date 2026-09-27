@@ -14,6 +14,7 @@ set -eu
 cd "$(dirname "$0")/.."
 
 docker run --rm -v "$PWD:/w" -w /w ubuntu:24.04 sh -eux -c '
+    export DEBIAN_FRONTEND=noninteractive
     apt-get update
     # Ubuntu 24.04 ships no Rust new enough to build this workspace, so
     # install one with rustup instead of the distro package, the same way

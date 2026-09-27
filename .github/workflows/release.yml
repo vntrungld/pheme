@@ -88,6 +88,7 @@ jobs:
           echo "--- Depends ---"
           dpkg-deb -f ./pheme_*_amd64.deb Depends
           docker run --rm -v "$PWD:/w" ubuntu:24.04 sh -euxc '
+            export DEBIAN_FRONTEND=noninteractive
             apt-get update
             apt-get install -y /w/pheme_*_amd64.deb
             pheme --version
@@ -167,17 +168,29 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           # The script uses x64compatible, which Inno Setup understands only
           # from 6.3. Test-Path alone would pass on a runner image that
           # ships an older 6.x, and the compile would then fail on an
           # unknown identifier after the whole matrix has already built.
-          # Check the version, not just presence, and upgrade rather than
-          # install, so this also fixes an already-present-but-too-old copy.
+          # Check the version, not just presence, and re-check it after an
+          # upgrade too: a failed choco upgrade that leaves the old binary
+          # in place must not read as success just because the file exists.
+          function Get-IsccVersion($p) {
+            if (-not (Test-Path $p)) { return $null }
+            try { return [version](Get-Item $p).VersionInfo.ProductVersion } catch { return $null }
+          }
+
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           $needed = [version]'6.3'
-          $have = if (Test-Path $iscc) { [version](Get-Item $iscc).VersionInfo.ProductVersion } else { $null }
-          if (-not $have -or $have -lt $needed) { choco upgrade innosetup -y --no-progress }
-          if (-not (Test-Path $iscc)) { throw "Inno Setup is not available at $iscc" }
+          $have = Get-IsccVersion $iscc
+          if (-not $have -or $have -lt $needed) {
+            choco upgrade innosetup -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw "choco upgrade innosetup exited $LASTEXITCODE" }
+            $have = Get-IsccVersion $iscc
+          }
+          if (-not $have -or $have -lt $needed) {
+            throw "Inno Setup $needed or newer is required at $iscc; found '$have'"
+          }
           $version = ((cargo metadata --format-version 1 --no-deps | ConvertFrom-Json).packages |
             Where-Object { $_.name -eq 'pheme-app' }).version
           & $iscc "/DAppVersion=$version" packaging\windows\pheme.iss
@@ -219,22 +232,26 @@ jobs:
           if ($p.ExitCode -ne 0) { throw "the uninstaller exited $($p.ExitCode)" }
           # unins000.exe relaunches a copy of itself from %TEMP% so it can
           # delete its own directory, and the process we waited on returns
-          # before that second phase finishes. Poll for the binary to
-          # disappear rather than asserting immediately, so a slow cleanup
-          # is not a spurious failure; RemovePath runs at usPostUninstall,
-          # one of the last things this second phase does, so once the
-          # binary (and its directory) are gone the registry cleanup below
-          # is done too.
+          # before that second phase finishes. Poll the LAST signal to
+          # change, not the first: Inno removes the files and the Run value
+          # during its standard uninstall pass, and RemovePath runs after
+          # that, at usPostUninstall, so PATH can still name the directory
+          # after the binary is already gone. Poll all three together and
+          # assert each separately, so a timeout says which one was wrong.
           $deadline = (Get-Date).AddSeconds(30)
-          while ((Test-Path "$app\pheme.exe") -and (Get-Date) -lt $deadline) {
+          do {
+            $gone = -not (Test-Path "$app\pheme.exe")
+            $run  = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' `
+                      -Name Pheme -ErrorAction SilentlyContinue
+            $path = (Get-ItemProperty 'HKCU:\Environment' -Name Path -ErrorAction SilentlyContinue).Path
+            $pathClean = -not (($path -split ';') -contains $app)
+            if ($gone -and -not $run -and $pathClean) { break }
             Start-Sleep -Seconds 1
-          }
-          if (Test-Path "$app\pheme.exe") { throw "uninstall left the binary behind" }
-          $run = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' `
-                   -Name Pheme -ErrorAction SilentlyContinue
-          if ($run) { throw "uninstall left the Run value behind" }
-          $path = (Get-ItemProperty 'HKCU:\Environment' -Name Path).Path
-          if ($path -split ';' -contains $app) { throw "uninstall left the PATH entry behind" }
+          } while ((Get-Date) -lt $deadline)
+
+          if (-not $gone)      { throw "uninstall left the binary behind" }
+          if ($run)            { throw "uninstall left the Run value behind" }
+          if (-not $pathClean) { throw "uninstall left the PATH entry behind" }
 
       # if-no-files-found: error below only notices a *completely* empty
       # match; the tarball or the zip alone still satisfies it, so a
