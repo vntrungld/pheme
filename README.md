@@ -79,6 +79,29 @@ front of you.
 sudo dnf install ./pheme-*.x86_64.rpm
 ```
 
+### Device permissions on a system without systemd-logind
+
+The udev rule both packages install tags `/dev/uinput` and `/dev/i2c-*`
+with `uaccess`, and on any system running systemd-logind that hands both
+to whoever is logged in at the seat — nothing further to do. Neither
+package adds anybody to a group, because a package installs system-wide
+and has no invoking user to add.
+
+Where there is no logind — a non-systemd init, or a seat-less machine you
+only reach over SSH — nothing acts on that tag. Add yourself to the group
+the rule names and log out and back in:
+
+```bash
+sudo usermod -aG input "$USER"      # required: no virtual keyboard or mouse without it
+sudo usermod -aG i2c "$USER"        # only for `pheme displays` / DDC/CI monitor switching
+```
+
+`pheme setup` does the first of those for a tarball install and only
+prints the second, because `i2c` grants raw access to every I2C bus on
+the machine for a feature many monitors do not support. The same
+reasoning applies here: add `input` if pheme cannot create its devices,
+add `i2c` only if you want display switching.
+
 ### Windows
 
 Run the installer. It needs no administrator: it installs into your own
