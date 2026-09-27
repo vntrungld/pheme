@@ -7,3 +7,8 @@
 /target-debian
 /target-fedora
 *.log
+
+# iscc writes the compiled installer here, both in CI and when the script is
+# compiled locally (Inno Setup runs under wine, which is how the compile is
+# checked without a Windows machine). OutputDir in pheme.iss names it.
+/packaging/windows/Output

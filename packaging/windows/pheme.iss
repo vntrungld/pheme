@@ -79,9 +79,13 @@ Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; \
 const
   EnvironmentKey = 'Environment';
 
-{ True when {app} is not already one of the user's PATH entries. The
-  comparison pads both sides with ';' so the first and last entries match
-  the same way every middle one does. }
+// True when {app} is not already one of the user's PATH entries. The
+// comparison pads both sides with ';' so the first and last entries match
+// the same way every middle one does.
+//
+// Line comments, not { }, throughout this section: a Pascal brace comment
+// does not nest, so the } of a constant like {app} ends it early and the
+// rest of the sentence is compiled as code.
 function NeedsAddPath(Param: string): Boolean;
 var
   OrigPath: string;
@@ -94,10 +98,10 @@ begin
   Result := Pos(';' + Uppercase(Param) + ';', ';' + Uppercase(OrigPath) + ';') = 0;
 end;
 
-{ True when the user already has a non-empty Path, so a new entry needs a
-  separator in front of it. Without this test, {olddata} expands to nothing
-  on a profile that never had one and the value becomes ";C:\...", whose
-  empty leading segment Windows resolves as the current directory. }
+// True when the user already has a non-empty Path, so a new entry needs a
+// separator in front of it. Without this test, {olddata} expands to nothing
+// on a profile that never had one and the value becomes ";C:\...", whose
+// empty leading segment Windows resolves as the current directory.
 function HasExistingPath(): Boolean;
 var
   OrigPath: string;
@@ -106,7 +110,7 @@ begin
             and (OrigPath <> '');
 end;
 
-{ Take {app} back out of PATH without disturbing anything else in it. }
+// Take {app} back out of PATH without disturbing anything else in it.
 procedure RemovePath(Path: string);
 var
   Paths: string;
@@ -118,7 +122,7 @@ begin
   P := Pos(';' + Uppercase(Path) + ';', Uppercase(Paths));
   if P = 0 then
     Exit;
-  { Delete the entry and the ';' that followed it, then the two sentinels. }
+  // Delete the entry and the ';' that followed it, then the two sentinels.
   Delete(Paths, P, Length(Path) + 1);
   Delete(Paths, 1, 1);
   if (Length(Paths) > 0) and (Paths[Length(Paths)] = ';') then
