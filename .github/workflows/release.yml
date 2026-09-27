@@ -128,8 +128,11 @@ jobs:
             rpm -qp --requires /w/pheme-*.x86_64.rpm
             dnf install -y /w/pheme-*.x86_64.rpm
             pheme --version
-            # As on the .deb leg: --version cannot see a dlopen'd library,
-            # so ask the loader for each one by name instead.
+            # As on the .deb leg: --version cannot see a library that is
+            # opened with dlopen, so ask the loader for each one by name.
+            # No apostrophe below this line: the whole block is a
+            # single-quoted argument to sh, and one would end it here and
+            # run the rest of these checks on the runner instead.
             sh /w/packaging/check-dlopen-sonames.sh
             for p in /usr/bin/pheme \
                      /usr/lib/udev/rules.d/80-pheme.rules \
