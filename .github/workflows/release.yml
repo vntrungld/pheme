@@ -62,7 +62,15 @@ jobs:
       - name: Build the Linux packages
         if: runner.os == 'Linux'
         run: |
-          cargo install cargo-deb cargo-generate-rpm --locked
+          # Pinned, not latest. Both tools decide the artifact's filename:
+          # cargo-deb's default Debian revision is what makes the file
+          # pheme_0.1.0-1_amd64.deb rather than pheme_0.1.0_amd64.deb, and
+          # a release that picked up a version changing that default would
+          # silently rename what it publishes, or stop matching the upload
+          # globs below. `@x.y.z` is an exact requirement, not a floor.
+          # These are the versions this packaging was built and verified
+          # against; packaging/verify-*.sh pin the same two.
+          cargo install cargo-deb@3.8.0 cargo-generate-rpm@0.21.0 --locked
           # --no-build reuses the binary the previous step produced rather
           # than compiling the workspace a second time.
           cargo deb -p pheme-app --no-build --no-strip

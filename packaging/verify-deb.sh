@@ -50,7 +50,9 @@ docker run --rm -v "$PWD:/w" -w /w ubuntu:24.04 sh -eux -c '
     # or not the rest of the script succeeds.
     trap '\''chown -R "$(stat -c %u:%g /w)" /w/target-debian 2>/dev/null || true'\'' EXIT
 
-    cargo install cargo-deb --locked
+    # Pinned to the version release.yml pins, so this script builds the
+    # same artifact, with the same filename, that CI publishes.
+    cargo install cargo-deb@3.8.0 --locked
     cargo build --release --locked
     cargo deb -p pheme-app --no-build --no-strip
 

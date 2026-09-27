@@ -34,7 +34,9 @@ docker run --rm -v "$PWD:/w" -w /w fedora:latest sh -eux -c '
     # or not the rest of the script succeeds.
     trap '\''chown -R "$(stat -c %u:%g /w)" /w/target-fedora 2>/dev/null || true'\'' EXIT
 
-    cargo install cargo-generate-rpm --locked
+    # Pinned to the version release.yml pins, so this script builds the
+    # same artifact, with the same filename, that CI publishes.
+    cargo install cargo-generate-rpm@0.21.0 --locked
     cargo build --release --locked
     cargo generate-rpm -p crates/pheme-app
 
