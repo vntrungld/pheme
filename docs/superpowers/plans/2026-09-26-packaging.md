@@ -1069,7 +1069,7 @@ EOF
 ```markdown
 ## Installing
 
-### Debian, Ubuntu
+### Ubuntu
 
 ```bash
 sudo apt install ./pheme_0.1.0_amd64.deb
@@ -1080,10 +1080,14 @@ the AppIndicator library for you. It also installs the udev rule and
 loads the kernel modules, which means `pheme setup` is not needed — it
 is there for people installing from the tarball.
 
-It is built on current Debian stable and declares a glibc floor to
-match, so it wants Debian 12 or Ubuntu 22.04 and newer. On anything
-older apt will refuse it, and the tarball is the way in. Check what the
-build actually asks for with:
+**This is an Ubuntu package, not a Debian one.** `cargo-deb` derives the
+dependency names from the machine that builds it, and Ubuntu 24.04
+renamed a number of libraries during the 64-bit `time_t` transition:
+`libgtk-3-0` became `libgtk-3-0t64`, and others with it. Debian does not
+provide those names, so this file will not satisfy on Debian 12 however
+new the glibc there is. Debian users want the tarball, or their own
+`cargo deb` run, which produces a package naming the libraries their
+release actually ships. Either way, what a given build asks for is:
 
 ```bash
 dpkg-deb -f pheme_*_amd64.deb Depends
