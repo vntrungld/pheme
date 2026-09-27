@@ -44,7 +44,7 @@ existing subcommand is unchanged.
 ### Ubuntu
 
 ```bash
-sudo apt install ./pheme_0.1.0_amd64.deb
+sudo apt install ./pheme_*_amd64.deb
 ```
 
 The package declares what it needs, so apt installs GTK 3, PipeWire and
@@ -68,7 +68,7 @@ dpkg-deb -f pheme_*_amd64.deb Depends
 ### Fedora
 
 ```bash
-sudo dnf install ./pheme-0.1.0-1.x86_64.rpm
+sudo dnf install ./pheme-*.x86_64.rpm
 ```
 
 ### Windows
