@@ -230,3 +230,24 @@ automated runs against a mock.
 | E8 | Remove `[display]`, cross the edge | the startup log never says "display switching is on", no DDC warning appears, and everything else is unchanged |
 | E9 | Unplug the monitor's second cable, cross the edge | the failed command warns once and does not repeat on later crossings |
 | E10 | Give both machines the same `display.input` and connect | the "same monitor input" warning appears on the server |
+
+## Packaging (sub-project 8)
+
+CI installs both packages and the Windows installer on every release
+build, so these rows cover what CI cannot see: a real desktop session, a
+reboot, and what a person actually meets.
+
+| # | Action | Pass |
+|---|---|---|
+| F1 | `apt install ./pheme_*.deb` on an Ubuntu with no GTK installed | apt pulls GTK and the AppIndicator library; `pheme --version` runs |
+| F2 | `dnf install ./pheme-*.rpm` on a clean Fedora | the same |
+| F3 | After F1, without rebooting, `pheme displays` | `/dev/i2c-*` is readable; no permission error |
+| F4 | After F1, `systemctl --user enable --now pheme`, then sign out and in | the tray icon or the window appears |
+| F5 | Open the application menu | Pheme is listed, with its icon |
+| F6 | `apt remove pheme`, then `apt purge pheme` | the binary, the unit, the udev rule and the desktop entry are gone; `~/.config/pheme/config.toml` is untouched |
+| F7 | Run the Windows installer as a standard user | no UAC prompt; it completes |
+| F8 | Tick "Start Pheme when I sign in", then sign out and in | pheme is running, and is listed in Task Manager > Startup |
+| F9 | Tick "Add Pheme to PATH", open a **new** terminal, run `pheme displays` | the command is found |
+| F10 | Install again over the top, with the PATH task ticked both times | PATH contains the directory once, not twice |
+| F11 | Uninstall on Windows | the directory, the shortcut, the Run value and the PATH entry are gone; `%APPDATA%\pheme\config.toml` is untouched |
+| F12 | Download the installer in a browser | SmartScreen warns; the README's steps get past it; the published SHA256 matches |

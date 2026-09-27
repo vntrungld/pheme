@@ -39,13 +39,53 @@ running behind it. To run Pheme without a GUI, run `pheme server` or
 `pheme client` directly from a terminal, exactly as below; every
 existing subcommand is unchanged.
 
-### Linux runtime dependencies
+## Installing
 
-`pheme` links against GTK 3 directly, so it has to be installed to run
-the binary **at all** on Linux — every subcommand, not only the tray
-and window. `libappindicator` (its Ayatana fork is tried first) is
-loaded by the tray specifically, the moment one is actually built;
-install both before running `pheme` rather than after something fails:
+### Ubuntu
+
+```bash
+sudo apt install ./pheme_0.1.0_amd64.deb
+```
+
+The package declares what it needs, so apt installs GTK 3, PipeWire and
+the AppIndicator library for you. It also installs the udev rule and
+loads the kernel modules, which means `pheme setup` is not needed — it
+is there for people installing from the tarball.
+
+**This is an Ubuntu package, not a Debian one.** `cargo-deb` derives the
+dependency names from the machine that builds it, and Ubuntu 24.04
+renamed a number of libraries during the 64-bit `time_t` transition:
+`libgtk-3-0` became `libgtk-3-0t64`, and others with it. Debian does not
+provide those names, so this file will not satisfy on Debian 12 however
+new the glibc there is. Debian users want the tarball, or their own
+`cargo deb` run, which produces a package naming the libraries their
+release actually ships. Either way, what a given build asks for is:
+
+```bash
+dpkg-deb -f pheme_*_amd64.deb Depends
+```
+
+### Fedora
+
+```bash
+sudo dnf install ./pheme-0.1.0-1.x86_64.rpm
+```
+
+### Windows
+
+Run the installer. It needs no administrator: it installs into your own
+profile, creates no service and writes nothing outside it.
+
+Windows will warn that it does not recognise the program, because the
+installer is not signed — a code-signing certificate is a recurring cost
+this project does not carry. Choose **More info**, then **Run anyway**.
+The SHA256 published beside the download is what you can check first, and
+it is worth checking.
+
+### From the tarball
+
+The tarball is the binary and nothing else, so its dependencies are
+yours to install:
 
 ```bash
 # Debian/Ubuntu
@@ -53,13 +93,28 @@ sudo apt install libgtk-3-0 libayatana-appindicator3-1
 # Arch
 sudo pacman -S gtk3 libayatana-appindicator
 # Fedora
-sudo dnf install gtk3 libappindicator-gtk3
+sudo dnf install gtk3 libayatana-appindicator-gtk3
 ```
 
-The release tarball does not bundle either. Building from source on
-Linux needs the matching `-dev` packages, plus a few X11/xcb headers
-`eframe` needs — see the packages `.github/workflows/ci.yml` installs
-before `cargo build`.
+`pheme` links GTK 3 directly, so it has to be present to run the binary
+**at all** — every subcommand, not only the tray and the window. Then run
+`sudo pheme setup` once, which installs the udev rule and loads the
+modules the packages would have handled.
+
+Building from source on Linux needs the matching `-dev` packages, plus
+a few X11/xcb headers `eframe` needs — see the packages
+`.github/workflows/ci.yml` installs before `cargo build`.
+
+### Starting with the session
+
+On Windows, tick "Start Pheme when I sign in" during installation, or
+find Pheme in Task Manager's Startup tab afterwards.
+
+On Linux, the packages install a systemd user unit, disabled:
+
+```bash
+systemctl --user enable --now pheme
+```
 
 **GNOME does not ship the AppIndicator shell extension enabled**, so
 the tray icon never appears there, even with the library installed —
