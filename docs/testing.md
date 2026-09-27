@@ -240,7 +240,7 @@ reboot, and what a person actually meets.
 | # | Action | Pass |
 |---|---|---|
 | F1 | `apt install ./pheme_*.deb` on an Ubuntu with no GTK installed | apt pulls GTK and the AppIndicator library; `pheme --version` runs |
-| F1b | After F1, on a real desktop session, run `pheme` with **no subcommand** | the window opens. `--version` exits inside clap before the first `dlopen`, so F1 says nothing about the twelve libraries opened that way; this is the row that does |
+| F1b | After F1, on a real desktop session, run `pheme` with **no subcommand** | the window opens. `--version` exits inside clap before the first `dlopen`, so F1 says nothing about the thirteen libraries opened that way; this row is the only manual one that reaches them. It proves the binary can open a window on *this* machine — a desktop session already has GL and X11 installed, so it cannot prove the *package* declared them. Only the clean-container soname check does that |
 | F2 | `dnf install ./pheme-*.rpm` on a clean Fedora | the same two |
 | F3 | After F1, without rebooting, `pheme displays` | `/dev/i2c-*` is readable; no permission error |
 | F4 | After F1, `systemctl --user enable --now pheme`, then sign out and in | the tray icon or the window appears |

@@ -78,7 +78,7 @@ docker run --rm -v "$PWD:/w:ro" ubuntu:24.04 sh -eux -c '
     pheme --version
 
     # --version exits inside clap, before the first dlopen, so it proves
-    # nothing about the twelve libraries that are opened that way. This is
+    # nothing about the thirteen libraries that are opened that way. This is
     # the check that can fail.
     sh /w/packaging/check-dlopen-sonames.sh
 

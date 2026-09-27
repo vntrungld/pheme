@@ -22,8 +22,26 @@
 #         | grep -oE 'lib[A-Za-z0-9_+.-]*?\.so(\.[0-9]+)*' | sort -u
 #
 # Every versioned soname the second command prints that the first does not
-# is opened with dlopen and belongs below. Keep it in step with
-# `[package.metadata.deb] depends` and
+# is opened with dlopen. That rule yields fourteen; thirteen of them are
+# below, and the fourteenth is left out deliberately:
+#
+#   libappindicator3.so.1 is the *alternative* half of the tray dependency
+#   (`libayatana-appindicator3-1 | libappindicator3-1`). A machine with the
+#   modern ayatana library does not have it and does not need it, so
+#   asserting it here would fail the check on every machine the package
+#   installs correctly on. apt and dnf enforce the either/or; this script
+#   only asserts the name the binary prefers.
+#
+# libxcb.so.1 is here even though libX11.so.6 lists it in its own
+# DT_NEEDED, so it cannot be missing wherever libX11 resolves. It costs one
+# line to assert the binary's real list rather than a reasoned-down one.
+#
+# Two of the commands above are worth repeating exactly: the sonames sit in
+# rodata with no separator between them, so an anchored regex (`\b`, `^`)
+# matches almost nothing. Both reviews of this list under-counted it that
+# way -- one found five, the next twelve. Use `grep -oE` as written.
+#
+# Keep this list in step with `[package.metadata.deb] depends` and
 # `[package.metadata.generate-rpm.requires]` in crates/pheme-app/Cargo.toml,
 # which are the two places the same list is declared to a package manager.
 set -eu
@@ -34,6 +52,7 @@ libEGL.so.1
 libGL.so.1
 libX11.so.6
 libX11-xcb.so.1
+libxcb.so.1
 libXcursor.so.1
 libXi.so.6
 libXrender.so.1

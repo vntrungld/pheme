@@ -63,21 +63,30 @@ resolves against providers.
 So both packages are built from one Ubuntu runner and each is correct for
 its own ecosystem.
 
-**Twelve dependencies `$auto` cannot see.** Automatic detection reads the
-ELF header, so it finds only what is in `DT_NEEDED` — and this binary
-`dlopen`s twelve libraries it never links. `readelf -d` lists the twelve
-that are linked; `strings` over the same binary finds twelve more versioned
-sonames that are not:
+**Thirteen dependencies `$auto` cannot see.** Automatic detection reads
+the ELF header, so it finds only what is in `DT_NEEDED` — and this binary
+`dlopen`s libraries it never links. `readelf -d` lists the twelve that are
+linked; `strings` over the same binary finds fourteen more versioned
+sonames that are not. Thirteen of those fourteen are declared; the
+fourteenth, `libappindicator3.so.1`, is the alternative half of the tray
+dependency and is deliberately not asserted, for the reason recorded in
+`packaging/check-dlopen-sonames.sh`.
+
+Counting this list is easy to get wrong, and two reviews did: the sonames
+sit in rodata with no separator between them, so any anchored regex
+(`\b`, `^`) matches almost nothing and silently under-reports. The
+commands in that script's header are the ones that give the real set:
 
 | soname | opened by |
 |---|---|
 | `libayatana-appindicator3.so.1` | the tray |
 | `libEGL.so.1`, `libGL.so.1` | glutin, to make a GL context |
 | `libX11.so.6`, `libX11-xcb.so.1`, `libXcursor.so.1`, `libXi.so.6`, `libXrender.so.1` | winit's X11 backend, via `x11-dl` |
+| `libxcb.so.1` | `x11rb`, whose load failure path panics |
 | `libxkbcommon.so.0`, `libxkbcommon-x11.so.0` | winit's keymap handling |
 | `libwayland-client.so.0`, `libwayland-egl.so.1` | winit's Wayland backend |
 
-All twelve are declared by hand. Four of them —
+All thirteen are declared by hand. Four of them —
 `libEGL.so.1`, `libGL.so.1`, `libX11-xcb.so.1` and
 `libxkbcommon-x11.so.0` — are absent from a clean `ubuntu:24.04` that has
 only the rest of the `Depends` satisfied, so leaving them out is not
@@ -116,8 +125,8 @@ people who installed from the tarball.
 
 ### 3.2 Dependencies
 
-`cargo-deb` is left on its default `$auto` and given the twelve `dlopen`'d
-libraries of §2 as Ubuntu package names:
+`cargo-deb` is left on its default `$auto` and given the thirteen
+`dlopen`'d libraries of §2 as Ubuntu package names:
 
 ```toml
 depends = "$auto, libayatana-appindicator3-1 | libappindicator3-1, \
@@ -391,9 +400,9 @@ disable a security feature.
 
 ## 12. Known risks
 
-- **`$auto` sees only what is linked.** All twelve `dlopen` dependencies
-  are declared by hand (§2), and a hand-written list is wrong as soon as a
-  crate upgrade adds a thirteenth. Installing and running the package does
+- **`$auto` sees only what is linked.** All thirteen `dlopen`
+  dependencies are declared by hand (§2), and a hand-written list is wrong
+  as soon as a crate upgrade adds a fourteenth. Installing and running the package does
   not catch that — `pheme --version` exits inside clap before the first
   `dlopen`, which is exactly how the first four went undeclared through six
   task reviews. `packaging/check-dlopen-sonames.sh` is what catches it: it
