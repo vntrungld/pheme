@@ -17,13 +17,32 @@
 #
 # The list is derived from the built binary, not remembered:
 #
-#     readelf -d target/release/pheme | grep NEEDED
+#     ldd target/release/pheme
 #     strings -a target/release/pheme \
 #         | grep -oE 'lib[A-Za-z0-9_+.-]*?\.so(\.[0-9]+)*' | sort -u
 #
-# Every versioned soname the second command prints that the first does not
-# is opened with dlopen. That rule yields fourteen; thirteen of them are
-# below, and the fourteenth is left out deliberately:
+# Subtract the first from the second. It must be `ldd` and not
+# `readelf -d ... NEEDED`: `$auto` runs ldd, so it sees the whole
+# transitive closure, and subtracting only the direct DT_NEEDED entries
+# over-counts badly. Measured on this binary, DT_NEEDED has 12 entries but
+# the ldd closure covers 8 of the sonames below -- libX11, libxcb,
+# libXcursor, libXi, libXrender and libxkbcommon arrive through libxdo and
+# libgtk-3, and the two libwayland ones likewise. Only **five** are
+# genuinely invisible to `$auto`:
+#
+#     libayatana-appindicator3.so.1  libEGL.so.1  libGL.so.1
+#     libX11-xcb.so.1                libxkbcommon-x11.so.0
+#
+# Those five are the ones a missing declaration actually breaks; an earlier
+# review said five and was right, and a later count of "twelve" came from
+# subtracting DT_NEEDED instead of ldd. The other eight are declared and
+# asserted anyway, on purpose: each is transitively guaranteed only for as
+# long as libxdo and GTK 3 keep pulling it in, and neither is a promise
+# this program controls. Asserting a library that is already present costs
+# one line and one `ldconfig` lookup.
+#
+# The thirteen below therefore deliberately exceed the five. A fourteenth
+# soname is left out, and that one is deliberate too:
 #
 #   libappindicator3.so.1 is the *alternative* half of the tray dependency
 #   (`libayatana-appindicator3-1 | libappindicator3-1`). A machine with the
@@ -32,14 +51,9 @@
 #   installs correctly on. apt and dnf enforce the either/or; this script
 #   only asserts the name the binary prefers.
 #
-# libxcb.so.1 is here even though libX11.so.6 lists it in its own
-# DT_NEEDED, so it cannot be missing wherever libX11 resolves. It costs one
-# line to assert the binary's real list rather than a reasoned-down one.
-#
-# Two of the commands above are worth repeating exactly: the sonames sit in
-# rodata with no separator between them, so an anchored regex (`\b`, `^`)
-# matches almost nothing. Both reviews of this list under-counted it that
-# way -- one found five, the next twelve. Use `grep -oE` as written.
+# One caution on the second command: the sonames sit in rodata with no
+# separator between them, so an anchored regex (`\b`, `^`) matches almost
+# nothing and silently under-reports. Use `grep -oE` as written.
 #
 # Keep this list in step with `[package.metadata.deb] depends` and
 # `[package.metadata.generate-rpm.requires]` in crates/pheme-app/Cargo.toml,

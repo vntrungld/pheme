@@ -260,4 +260,8 @@ installed. Only `packaging/check-dlopen-sonames.sh` inside a clean container
 proves the declaration, which is what F1/F2 and the release workflow run it
 for. Measured on Ubuntu 24.04 with only GTK 3 and the AppIndicator library
 present, that check reports `libEGL.so.1`, `libGL.so.1`, `libX11-xcb.so.1`
-and `libxkbcommon-x11.so.0` missing and exits 1.
+and `libxkbcommon-x11.so.0` missing and exits 1 — those four plus
+`libayatana-appindicator3.so.1` are the five outside the binary's `ldd`
+closure, and so the five `$auto` cannot declare for itself. The other eight
+the check asserts are inside the closure today, by way of `libxdo` and
+GTK 3; they are asserted so that stops being something to rediscover.

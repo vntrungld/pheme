@@ -63,19 +63,31 @@ resolves against providers.
 So both packages are built from one Ubuntu runner and each is correct for
 its own ecosystem.
 
-**Thirteen dependencies `$auto` cannot see.** Automatic detection reads
-the ELF header, so it finds only what is in `DT_NEEDED` — and this binary
-`dlopen`s libraries it never links. `readelf -d` lists the twelve that are
-linked; `strings` over the same binary finds fourteen more versioned
-sonames that are not. Thirteen of those fourteen are declared; the
-fourteenth, `libappindicator3.so.1`, is the alternative half of the tray
-dependency and is deliberately not asserted, for the reason recorded in
+**Five dependencies `$auto` cannot see.** `$auto` runs `ldd`, so it sees
+the binary's whole transitive closure — not just `DT_NEEDED`. Measured on
+the built binary, five of the sonames it opens with `dlopen` are outside
+that closure and so invisible to it:
+
+`libayatana-appindicator3.so.1`, `libEGL.so.1`, `libGL.so.1`,
+`libX11-xcb.so.1`, `libxkbcommon-x11.so.0`.
+
+Those five are what a missing declaration actually breaks. **Thirteen** are
+declared and asserted, because the other eight — `libX11`, `libxcb`,
+`libXcursor`, `libXi`, `libXrender`, `libxkbcommon` and the two
+`libwayland` ones — reach the closure only through `libxdo` and GTK 3, and
+neither of those is a promise this program controls. Declaring a library
+that is already there costs a line; discovering later that it was not
+costs a release. The fourteenth soname in the binary,
+`libappindicator3.so.1`, is the alternative half of the tray dependency and
+is deliberately not asserted, for the reason recorded in
 `packaging/check-dlopen-sonames.sh`.
 
-Counting this list is easy to get wrong, and two reviews did: the sonames
-sit in rodata with no separator between them, so any anchored regex
-(`\b`, `^`) matches almost nothing and silently under-reports. The
-commands in that script's header are the ones that give the real set:
+Counting this is easy to get wrong and was got wrong twice. Subtracting
+`readelf -d ... NEEDED` instead of `ldd` yields fourteen, because it
+ignores everything the closure already covers; and the sonames sit in
+rodata with no separator, so any anchored regex (`\b`, `^`) matches
+almost nothing and under-reports instead. The commands in that script's
+header are the ones that give the real set:
 
 | soname | opened by |
 |---|---|
@@ -86,7 +98,7 @@ commands in that script's header are the ones that give the real set:
 | `libxkbcommon.so.0`, `libxkbcommon-x11.so.0` | winit's keymap handling |
 | `libwayland-client.so.0`, `libwayland-egl.so.1` | winit's Wayland backend |
 
-All thirteen are declared by hand. Four of them —
+All thirteen are declared by hand, five of them necessarily. Four —
 `libEGL.so.1`, `libGL.so.1`, `libX11-xcb.so.1` and
 `libxkbcommon-x11.so.0` — are absent from a clean `ubuntu:24.04` that has
 only the rest of the `Depends` satisfied, so leaving them out is not
@@ -403,9 +415,10 @@ disable a security feature.
 
 ## 12. Known risks
 
-- **`$auto` sees only what is linked.** All thirteen `dlopen`
-  dependencies are declared by hand (§2), and a hand-written list is wrong
-  as soon as a crate upgrade adds a fourteenth. Installing and running the package does
+- **`$auto` sees only the `ldd` closure.** The five `dlopen` dependencies
+  outside it are declared by hand, along with eight more that are inside it
+  today but only via `libxdo` and GTK 3 (§2). A hand-written list is wrong
+  as soon as a crate upgrade adds a sixth outside the closure. Installing and running the package does
   not catch that — `pheme --version` exits inside clap before the first
   `dlopen`, which is exactly how the first four went undeclared through six
   task reviews. `packaging/check-dlopen-sonames.sh` is what catches it: it
