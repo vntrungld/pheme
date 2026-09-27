@@ -56,6 +56,15 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; \
 ; has never had a user Path, {olddata} expands to nothing and a single
 ; entry would write ";C:\...", whose empty leading segment Windows resolves
 ; as the current directory.
+;
+; Exactly one of the two fires. `HasExistingPath` and `not HasExistingPath`
+; are true complements, and Inno evaluates each Check immediately before
+; writing that entry rather than batching them, so the second one also sees
+; whatever the first wrote -- and `NeedsAddPath` re-reads the registry, so
+; it is already false by then. Anything added later that writes
+; Environment\Path must keep that property, or PATH gains a second copy of
+; the directory: a third entry needs a Check that cannot be true at the same
+; time as either of these.
 Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; \
     ValueData: "{olddata};{app}"; Tasks: addtopath; \
     Check: NeedsAddPath(ExpandConstant('{app}')) and HasExistingPath
