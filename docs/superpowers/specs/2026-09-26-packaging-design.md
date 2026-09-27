@@ -63,11 +63,34 @@ resolves against providers.
 So both packages are built from one Ubuntu runner and each is correct for
 its own ecosystem.
 
-**One dependency `$auto` cannot see.** `libayatana-appindicator` is opened
-with `dlopen` by the tray at runtime, not linked — confirmed by `ldd`,
-which lists GTK and GDK but no appindicator. Automatic detection reads the
-ELF header, so it will never find it. It is declared by hand, and §8's
-install-and-run step is what proves the declaration is complete.
+**Twelve dependencies `$auto` cannot see.** Automatic detection reads the
+ELF header, so it finds only what is in `DT_NEEDED` — and this binary
+`dlopen`s twelve libraries it never links. `readelf -d` lists the twelve
+that are linked; `strings` over the same binary finds twelve more versioned
+sonames that are not:
+
+| soname | opened by |
+|---|---|
+| `libayatana-appindicator3.so.1` | the tray |
+| `libEGL.so.1`, `libGL.so.1` | glutin, to make a GL context |
+| `libX11.so.6`, `libX11-xcb.so.1`, `libXcursor.so.1`, `libXi.so.6`, `libXrender.so.1` | winit's X11 backend, via `x11-dl` |
+| `libxkbcommon.so.0`, `libxkbcommon-x11.so.0` | winit's keymap handling |
+| `libwayland-client.so.0`, `libwayland-egl.so.1` | winit's Wayland backend |
+
+All twelve are declared by hand. Four of them —
+`libEGL.so.1`, `libGL.so.1`, `libX11-xcb.so.1` and
+`libxkbcommon-x11.so.0` — are absent from a clean `ubuntu:24.04` that has
+only the rest of the `Depends` satisfied, so leaving them out is not
+theoretical: `apt install` succeeds, `pheme --version` prints, `pheme
+server` and `pheme client` work, and `pheme` with no subcommand — what the
+desktop entry and the systemd unit both launch — cannot create a GL
+context. The remaining eight arrive transitively through GTK 3 today, and
+are declared anyway, because a transitive accident is not a dependency.
+
+`pheme --version` cannot prove any of this, because clap exits before the
+first `dlopen`. What proves it is `packaging/check-dlopen-sonames.sh`,
+which asks `ldconfig` for each soname by name inside the same clean
+container the package was just installed in. §8.
 
 ## 3. The Linux packages
 
@@ -93,20 +116,30 @@ people who installed from the tarball.
 
 ### 3.2 Dependencies
 
-`cargo-deb` is left on its default `$auto` and given one addition:
+`cargo-deb` is left on its default `$auto` and given the twelve `dlopen`'d
+libraries of §2 as Ubuntu package names:
 
 ```toml
-depends = "$auto, libayatana-appindicator3-1 | libappindicator3-1"
+depends = "$auto, libayatana-appindicator3-1 | libappindicator3-1, \
+libgl1, libegl1, libx11-6, libx11-xcb1, libxcursor1, libxi6, libxrender1, \
+libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libwayland-egl1"
 ```
 
-`cargo-generate-rpm` gets the equivalent, expressed as the soname rather
-than a package name, because the package providing it differs between
-Fedora and openSUSE while the soname does not:
+`cargo-generate-rpm` gets the equivalent, expressed as the sonames rather
+than package names, because what provides them differs between Fedora and
+openSUSE while the sonames do not:
 
 ```toml
 [package.metadata.generate-rpm.requires]
 "libayatana-appindicator3.so.1()(64bit)" = "*"
+"libEGL.so.1()(64bit)" = "*"
+# ...and one line per soname in §2's table.
 ```
+
+Both the X11 and the Wayland libraries are declared although a given
+machine runs only one display server. `Depends` has no way to say "X11 or
+Wayland", each package is small, and the alternative is a dependency list
+that is honest on half the machines.
 
 `auto-req` is left at its default, which is what selects the built-in ELF
 reader on a host with no `find-requires`.
@@ -280,11 +313,14 @@ will warn on download and on first run.
 This sub-project has almost nothing a unit test can reach. What it has
 instead is better, and it runs in CI on every release build:
 
-- **Debian/Ubuntu:** `sudo apt-get install -y ./pheme_*_amd64.deb`, then
-  `pheme --version`. A missing dependency fails the install; a wrong one
-  fails the run. This is the step that proves §2's claim about `$auto`
-  and §3.2's hand-declared addition.
-- **Fedora:** the same, inside `docker run --rm fedora:latest`, with
+- **Ubuntu:** `sudo apt-get install -y ./pheme_*_amd64.deb` inside a clean
+  `ubuntu:24.04` container, then `pheme --version`, then
+  `packaging/check-dlopen-sonames.sh`. A missing dependency fails the
+  install; a wrong one fails the run; an undeclared `dlopen`'d one fails
+  only the soname check, which is why that check exists. A clean container
+  and not the runner: the runner has already installed every `-dev`
+  package, so nothing about dependency closure can fail there.
+- **Fedora:** the same three, inside `docker run --rm fedora:latest`, with
   `dnf install -y`. The runner has Docker and the image is the only place
   an `.rpm` can honestly be tested from an Ubuntu host.
 - **File placement:** `dpkg -c` and `rpm -qlp` list the archive contents;
@@ -348,10 +384,16 @@ disable a security feature.
 
 ## 12. Known risks
 
-- **`$auto` sees only what is linked.** The one `dlopen` dependency is
-  declared by hand (§2). If another is added later and nobody declares it,
-  §8's install-and-run step is what catches it — which is why that step
-  exists rather than a note in the README.
+- **`$auto` sees only what is linked.** All twelve `dlopen` dependencies
+  are declared by hand (§2), and a hand-written list is wrong as soon as a
+  crate upgrade adds a thirteenth. Installing and running the package does
+  not catch that — `pheme --version` exits inside clap before the first
+  `dlopen`, which is exactly how the first four went undeclared through six
+  task reviews. `packaging/check-dlopen-sonames.sh` is what catches it: it
+  asks `ldconfig` for each soname inside the clean container, it runs on
+  both legs in CI and in both verify scripts, and it fails rather than
+  passing quietly. It carries the `readelf -d` and `strings` commands that
+  regenerate its own list.
 - **The PATH task.** Appending to a user's `Path` from an installer is a
   well-known source of duplicated and truncated variables. It is opt-in,
   it has a `Check` against duplication and an explicit uninstall step, and

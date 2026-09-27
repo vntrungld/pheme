@@ -75,13 +75,16 @@ jobs:
       #
       # This has to install inside a clean container, not on this runner:
       # the runner just ran "Linux build deps", so every runtime library the
-      # .deb depends on is already present here, and `pheme --version` never
-      # touches libayatana-appindicator anyway (it's dlopen'd by the tray,
-      # which clap exits before reaching). Ubuntu 24.04, not a Debian image:
-      # cargo-deb's $auto resolved these Depends against this same runner's
-      # dpkg database, so the .deb names Ubuntu 24.04's packages (the
-      # post-time_t "t64" ones) and only an Ubuntu 24.04 container can
+      # .deb depends on is already present here. Ubuntu 24.04, not a Debian
+      # image: cargo-deb's $auto resolved these Depends against this same
+      # runner's dpkg database, so the .deb names Ubuntu 24.04's packages
+      # (the post-time_t "t64" ones) and only an Ubuntu 24.04 container can
       # satisfy them.
+      #
+      # `pheme --version` is kept, but it is not the proof: clap exits
+      # before anything is dlopen'd, so it cannot notice a missing libGL any
+      # more than it noticed a missing appindicator. check-dlopen-sonames.sh
+      # is the check that can fail, and it asks the loader directly.
       - name: The .deb installs and runs
         if: runner.os == 'Linux'
         run: |
@@ -92,6 +95,7 @@ jobs:
             apt-get update
             apt-get install -y /w/pheme_*_amd64.deb
             pheme --version
+            sh /w/packaging/check-dlopen-sonames.sh
             for p in /usr/bin/pheme \
                      /usr/lib/udev/rules.d/80-pheme.rules \
                      /usr/lib/modules-load.d/pheme.conf \
@@ -115,6 +119,9 @@ jobs:
             rpm -qp --requires /w/pheme-*.x86_64.rpm
             dnf install -y /w/pheme-*.x86_64.rpm
             pheme --version
+            # As on the .deb leg: --version cannot see a dlopen'd library,
+            # so ask the loader for each one by name instead.
+            sh /w/packaging/check-dlopen-sonames.sh
             for p in /usr/bin/pheme \
                      /usr/lib/udev/rules.d/80-pheme.rules \
                      /usr/lib/modules-load.d/pheme.conf \

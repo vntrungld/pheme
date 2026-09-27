@@ -68,9 +68,24 @@ machines on the same network. The pointer crosses the screen edge and the \
 input follows it; a monitor cabled to both machines can follow it too."""
 # $auto asks dpkg which package provides each soname ldd reports, so the
 # dependency list is derived from the binary that was built rather than
-# remembered. It cannot see libayatana-appindicator, which the tray opens
-# with dlopen at runtime rather than linking, so that one is named here.
-depends = "$auto, libayatana-appindicator3-1 | libappindicator3-1"
+# remembered. It only sees DT_NEEDED, so every library this binary opens
+# with dlopen has to be named here instead: the tray's appindicator, the
+# GL/EGL stack glutin loads to make a context, and the X11, XCB, xkbcommon
+# and Wayland libraries winit loads to talk to whichever display server is
+# running. `packaging/verify-deb.sh` and the release workflow assert that
+# each of these sonames resolves after the package is installed in a clean
+# container, which is the check that catches an addition nobody declared.
+#
+# Both display-server families are declared even though a given machine
+# runs only one of them: Depends cannot express "X11 or Wayland", every one
+# of these packages is small, and GTK 3 pulls most of them in anyway. The
+# alternative is a Depends that is honest on half the machines.
+depends = """\
+$auto, libayatana-appindicator3-1 | libappindicator3-1, \
+libgl1, libegl1, \
+libx11-6, libx11-xcb1, libxcursor1, libxi6, libxrender1, \
+libxkbcommon0, libxkbcommon-x11-0, \
+libwayland-client0, libwayland-egl1"""
 assets = [
     ["target/release/pheme", "usr/bin/", "755"],
     ["../../packaging/linux/80-pheme.rules", "usr/lib/udev/rules.d/", "644"],
@@ -109,9 +124,27 @@ udevadm trigger --name-match=uinput || true
 udevadm trigger --subsystem-match=i2c-dev || true
 """
 
-# The soname rather than a package name: what provides it differs between
+# Sonames rather than package names: what provides them differs between
 # Fedora and openSUSE, the soname does not. Automatic requirement detection
-# cannot find this one, because the tray opens it with dlopen rather than
-# linking it.
+# reads the ELF header, so it finds none of these -- they are opened with
+# dlopen at runtime. The list is the same one the .deb's `depends` names
+# above, derived from the binary with `readelf -d` for what is linked and
+# `strings` for what is not.
+#
+# All of them are declared even though a Fedora install today happens to
+# pull in every one but libxkbcommon-x11.so.0 through gtk3's own
+# requirements. A transitive accident is not a dependency: it holds until
+# gtk3 drops one, and then it holds nowhere.
 [package.metadata.generate-rpm.requires]
 "libayatana-appindicator3.so.1()(64bit)" = "*"
+"libEGL.so.1()(64bit)" = "*"
+"libGL.so.1()(64bit)" = "*"
+"libX11.so.6()(64bit)" = "*"
+"libX11-xcb.so.1()(64bit)" = "*"
+"libXcursor.so.1()(64bit)" = "*"
+"libXi.so.6()(64bit)" = "*"
+"libXrender.so.1()(64bit)" = "*"
+"libxkbcommon.so.0()(64bit)" = "*"
+"libxkbcommon-x11.so.0()(64bit)" = "*"
+"libwayland-client.so.0()(64bit)" = "*"
+"libwayland-egl.so.1()(64bit)" = "*"
