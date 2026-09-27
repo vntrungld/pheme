@@ -195,28 +195,68 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          # The script uses x64compatible, which Inno Setup understands only
-          # from 6.3. Test-Path alone would pass on a runner image that
-          # ships an older 6.x, and the compile would then fail on an
-          # unknown identifier after the whole matrix has already built.
-          # Check the version, not just presence, and re-check it after an
-          # upgrade too: a failed choco upgrade that leaves the old binary
-          # in place must not read as success just because the file exists.
-          function Get-IsccVersion($p) {
-            if (-not (Test-Path $p)) { return $null }
-            try { return [version](Get-Item $p).VersionInfo.ProductVersion } catch { return $null }
+          # pheme.iss uses ArchitecturesAllowed=x64compatible, which Inno
+          # Setup understands only from 6.3, and Test-Path alone would pass
+          # on an image shipping an older 6.x and fail the compile later.
+          #
+          # Do not read a version number to decide this. The obvious field
+          # lies: the runner image ships 6.7.1 and ISCC.exe reports
+          # ProductVersion '0.0.0.0' -- Inno Setup is built with Delphi,
+          # which leaves that field at zero -- so a numeric guard here
+          # refused a compiler four minor versions newer than it needed.
+          #
+          # Ask the compiler the question we actually have instead: hand it a
+          # five-line script using the directive and see whether it compiles.
+          # That is the capability this step needs, no version field can fool
+          # it, and it re-checks correctly after an upgrade, which is what
+          # the numeric guard existed for.
+          #
+          # Every directive in that script is valid in every Inno Setup 6,
+          # including {autopf}, so a pre-6.3 compiler can fail it for exactly
+          # one reason. Nothing suppresses its output either: it writes a
+          # throwaway setup beside itself under RUNNER_TEMP. There is no
+          # PowerShell here to try this on, so the script avoids anything
+          # whose validity would have to be taken on trust -- a probe that
+          # fails for its own reasons would reject a good compiler, which is
+          # the bug being fixed.
+          #
+          # Built as an array rather than a here-string on purpose: a
+          # PowerShell here-string must close at column zero, which cannot be
+          # expressed inside a YAML block scalar.
+          function Invoke-IsccProbe($exe) {
+            $probe = Join-Path $env:RUNNER_TEMP 'x64probe.iss'
+            Set-Content -Path $probe -Encoding ascii -Value @(
+              '[Setup]',
+              'AppName=probe',
+              'AppVersion=1.0',
+              'DefaultDirName={autopf}\probe',
+              'ArchitecturesAllowed=x64compatible'
+            )
+            $out = (& $exe $probe 2>&1 | Out-String)
+            return [pscustomobject]@{ Ok = ($LASTEXITCODE -eq 0); Output = $out }
           }
 
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
-          $needed = [version]'6.3'
-          $have = Get-IsccVersion $iscc
-          if (-not $have -or $have -lt $needed) {
+          if (Test-Path $iscc) {
+            # Printed so the next surprise here is diagnosable from one log
+            # instead of another round trip. This is how 0.0.0.0 was found.
+            (Get-Item $iscc).VersionInfo |
+              Format-List FileVersion, ProductVersion, FileVersionRaw, ProductVersionRaw |
+              Out-String | Write-Host
+            $probe = Invoke-IsccProbe $iscc
+            Write-Host "x64compatible probe: $($probe.Ok)"
+          } else {
+            Write-Host "no ISCC.exe at $iscc"
+            $probe = [pscustomobject]@{ Ok = $false; Output = '(not installed)' }
+          }
+
+          if (-not $probe.Ok) {
             choco upgrade innosetup -y --no-progress
             if ($LASTEXITCODE -ne 0) { throw "choco upgrade innosetup exited $LASTEXITCODE" }
-            $have = Get-IsccVersion $iscc
+            $probe = Invoke-IsccProbe $iscc
           }
-          if (-not $have -or $have -lt $needed) {
-            throw "Inno Setup $needed or newer is required at $iscc; found '$have'"
+          if (-not $probe.Ok) {
+            throw "ISCC at $iscc does not accept ArchitecturesAllowed=x64compatible (Inno Setup 6.3+ required). Probe output:`n$($probe.Output)"
           }
           $version = ((cargo metadata --format-version 1 --no-deps | ConvertFrom-Json).packages |
             Where-Object { $_.name -eq 'pheme-app' }).version
