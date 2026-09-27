@@ -1,8 +1,11 @@
 #!/bin/sh
-# Build the .deb inside Debian and install it there, because this is the
+# Build the .deb inside Ubuntu and install it there, because this is the
 # only way to see what `$auto` resolves to: cargo-deb asks dpkg which
 # package owns each soname, and there is no dpkg on the development
-# machine.
+# machine. Ubuntu 24.04 specifically, and not a Debian image: it is what
+# CI's own runner is, so this validates the same package CI ships (with
+# Ubuntu 24.04's post-time_t "t64" library names) rather than a
+# Debian-named package nobody will actually download.
 #
 # Usage: packaging/verify-deb.sh
 # Needs: docker, and a user in the docker group.
@@ -10,13 +13,21 @@ set -eu
 
 cd "$(dirname "$0")/.."
 
-docker run --rm -v "$PWD:/w" -w /w rust:1-bookworm sh -eux -c '
+docker run --rm -v "$PWD:/w" -w /w ubuntu:24.04 sh -eux -c '
     apt-get update
+    # Ubuntu 24.04 ships no Rust new enough to build this workspace, so
+    # install one with rustup instead of the distro package, the same way
+    # a from-source Linux build (see the README) would.
     apt-get install -y --no-install-recommends \
+        curl ca-certificates build-essential \
         libx11-dev libxi-dev libxtst-dev libxfixes-dev libxrandr-dev \
         libpipewire-0.3-dev libspa-0.2-dev clang pkg-config \
         libgtk-3-dev libayatana-appindicator3-dev libxdo-dev \
         libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
+
+    curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --profile minimal
+    . "$HOME/.cargo/env"
 
     # A separate target directory: the host is Arch and its artifacts are
     # linked against a different glibc.
