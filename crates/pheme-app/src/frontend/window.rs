@@ -13,6 +13,7 @@
 //! on screen can be tested without a window at all.
 
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -591,17 +592,50 @@ impl PhemeApp {
     /// window's own Start/Stop button drives -- see [`toggle_lock`][Self::toggle_lock]'s
     /// doc comment for why both go through one method.
     fn start_stop(&mut self) {
+        self.start_stop_at(&Config::default_path());
+    }
+
+    /// [`start_stop`][Self::start_stop] against an explicit configuration
+    /// path, so a test can point it somewhere other than the real one.
+    fn start_stop_at(&mut self, config_path: &Path) {
         self.action_error = None;
         match self.supervisor.state() {
             CoreState::Running(_) => {
                 self.handle.block_on(self.supervisor.shutdown());
             }
+            // Nothing has ever been configured. `restart` cannot help here:
+            // it respawns whatever the supervisor is holding, and it is
+            // holding nothing, so the click wrote no file, spawned no child
+            // and left the state at `NoConfig` -- which is what kept the
+            // button reading "Start" after a click that looked like it had
+            // worked. The form is already showing `Config::default()` (see
+            // `ConfigForm::from_config(&supervisor.config().unwrap_or_default())`
+            // in `run`), so Start here means: commit what is on screen and
+            // run it. That is `apply_config`, the same call Save makes.
+            CoreState::NoConfig => match self.config_form.build() {
+                Ok(cfg) => {
+                    self.config_errors = ConfigFormErrors::default();
+                    if let Err(e) = self
+                        .handle
+                        .block_on(self.supervisor.apply_config(cfg, config_path))
+                    {
+                        self.action_error = Some(format!("could not start: {e:#}"));
+                    }
+                }
+                // The defaults validate, so this is only reachable once
+                // somebody has edited the form into an invalid state and
+                // pressed Start instead of Save. Report it where Save
+                // reports it, against the fields themselves.
+                Err(errors) => {
+                    self.config_errors = *errors;
+                    self.action_error = Some("fix the configuration below before starting".into());
+                }
+            },
             // `restart` respawns from whatever `Supervisor` is already
             // holding; starting a child back up is not a configuration
             // change, so this never touches disk the way `apply_config`
-            // does. A `NoConfig` restart is a harmless no-op, so there is
-            // nothing to report there either.
-            CoreState::Stopped(_) | CoreState::NoConfig => {
+            // does.
+            CoreState::Stopped(_) => {
                 if let Err(e) = self.handle.block_on(self.supervisor.restart()) {
                     // Surfaced the same way a link failure is: a silently
                     // discarded error here would leave a Start click with
@@ -1683,6 +1717,42 @@ mod tests {
             config_warned: false,
             devices: Arc::new(Mutex::new(DeviceListState::Loading)),
         }
+    }
+
+    /// Start, on a machine that has never been configured, must commit the
+    /// configuration the form is already showing and run it -- not quietly
+    /// do nothing.
+    ///
+    /// The production change that breaks this: have the `NoConfig` arm of
+    /// `start_stop_at` call `self.supervisor.restart()` again, which is
+    /// what it did before. `restart` respawns whatever the supervisor
+    /// holds, and with nothing configured it holds nothing, so no file is
+    /// written and the state stays `NoConfig` -- which is exactly why the
+    /// button went on reading "Start" after a click that appeared to work.
+    // Multi-thread flavour with `block_in_place`: `start_stop_at` is called
+    // from the repaint thread in production and uses `Handle::block_on`,
+    // which panics on a current-thread runtime.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn start_with_nothing_configured_writes_the_config_it_runs() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("config.toml");
+        let mut app = test_app().await;
+        assert!(
+            matches!(app.supervisor.state(), CoreState::NoConfig),
+            "precondition: test_app starts with nothing configured"
+        );
+
+        tokio::task::block_in_place(|| app.start_stop_at(&path));
+
+        assert!(
+            path.exists(),
+            "Start wrote no configuration, so nothing can have been started"
+        );
+        assert!(
+            !matches!(app.supervisor.state(), CoreState::NoConfig),
+            "the core state stayed NoConfig after Start, which is what keeps \
+             the button reading \"Start\" forever"
+        );
     }
 
     #[tokio::test]
