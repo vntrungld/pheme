@@ -1,6 +1,6 @@
 //! Server runtime: capture thread → core router → QUIC peer.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -1017,6 +1017,10 @@ pub async fn main(
     pair: bool,
     stats: bool,
     ipc: Option<PathBuf>,
+    // Only so a message can name the file the person actually passed.
+    // Reporting the default path to somebody who used --config would send
+    // them to edit a file that is not the one being read.
+    config_path: Option<&Path>,
 ) -> anyhow::Result<()> {
     let dir = config_dir();
     let identity = Identity::load_or_create(&dir, &cfg.name)?;
@@ -1060,7 +1064,7 @@ pub async fn main(
         }
     }
     if cfg.clients.is_empty() {
-        warn!("no [[clients]] configured; nothing will ever switch screens");
+        warn!("{}", no_clients_advice(&Config::resolve_path(config_path)));
     }
 
     let capture = pheme_input::detect_capture().context("input capture backend")?;
@@ -1106,9 +1110,57 @@ pub async fn main(
     .await
 }
 
+/// What to tell somebody whose server has no `[[clients]]`.
+///
+/// A server in this state starts cleanly, advertises itself and accepts
+/// audio and clipboard, but the pointer can never leave this machine --
+/// so from the outside it looks like nothing happened. Saying only that
+/// is a correct diagnosis with no next step, which is how somebody ends
+/// up reading logs to find out that the fix is four lines of TOML. Name
+/// the file and show the lines.
+fn no_clients_advice(config_path: &Path) -> String {
+    format!(
+        "no [[clients]] configured, so the pointer will never leave this \
+         machine. Add the other machine to {}, for example:\n\n    \
+         [[clients]]\n    name = \"laptop\"    # its `name`, as that \
+         machine's own config sets it\n    side = \"right\"    # which edge \
+         of this screen it sits past\n\nAudio and clipboard work without \
+         this; only screen switching needs it.",
+        config_path.display()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A server with no clients does nothing a person can see, so the
+    /// warning has to say where to fix that and what to write. Naming
+    /// neither -- which is what it did before -- leaves someone who has
+    /// just installed Pheme with a correct diagnosis and no next step.
+    ///
+    /// The production change that breaks this: drop the path and the
+    /// example from `no_clients_advice` and return the old bare sentence.
+    #[test]
+    fn the_no_clients_warning_says_where_and_what_to_write() {
+        let advice = no_clients_advice(Path::new("/tmp/somewhere/config.toml"));
+
+        assert!(
+            advice.contains("/tmp/somewhere/config.toml"),
+            "the warning must name the file to edit, got: {advice}"
+        );
+        assert!(
+            advice.contains("[[clients]]"),
+            "the warning must show the section to add, got: {advice}"
+        );
+        for key in ["name", "side"] {
+            assert!(
+                advice.contains(key),
+                "the example must show `{key}`, without which the section \
+                 does not load, got: {advice}"
+            );
+        }
+    }
 
     #[test]
     fn a_playback_frame_is_not_for_the_server_to_send() {

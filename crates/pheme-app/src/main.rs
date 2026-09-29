@@ -114,7 +114,7 @@ async fn run_subcommand(cmd: Cmd) -> anyhow::Result<()> {
             ipc,
         } => {
             let cfg = Config::load(config.as_deref())?;
-            pheme_app::server::main(cfg, pair, stats, ipc).await
+            pheme_app::server::main(cfg, pair, stats, ipc, config.as_deref()).await
         }
         Cmd::Client {
             host,

@@ -201,11 +201,17 @@ impl Config {
         config_dir().join("config.toml")
     }
 
+    /// The file an explicit `--config` names, or the default path when it
+    /// names none. Shared with the callers that need to *report* which file
+    /// they read, rather than read it.
+    pub fn resolve_path(path: Option<&Path>) -> PathBuf {
+        path.map(Path::to_path_buf)
+            .unwrap_or_else(Config::default_path)
+    }
+
     /// Loads `path` (or the default path). A missing file yields defaults.
     pub fn load(path: Option<&Path>) -> anyhow::Result<Config> {
-        let path = path
-            .map(Path::to_path_buf)
-            .unwrap_or_else(Config::default_path);
+        let path = Config::resolve_path(path);
         if !path.exists() {
             return Ok(Config::default());
         }
