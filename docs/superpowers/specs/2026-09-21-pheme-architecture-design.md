@@ -174,6 +174,11 @@ Each sub-project gets its own spec and plan, building on the previous one.
    dependencies, a Windows installer (Inno Setup) needing no administrator,
    start with Windows, a systemd `--user` unit, and CI that installs each
    package and runs the binary from it.
+9. **Automated cross-OS test rig (tier 1)** — an Ubuntu VM and a Windows VM
+   on one libvirt network, driven over SSH, running the machine-checkable
+   rows of §10's matrix on demand. Exists because none of those rows had
+   ever been run. Display switching (§9.7) stays manual: no virtual monitor
+   answers DDC/CI.
 
 ## 10. Testing
 
