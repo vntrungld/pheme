@@ -4,3 +4,7 @@
 # ship a udev rule with carriage returns in it, so their line endings are
 # pinned rather than left to each machine's Git configuration.
 packaging/** text eol=lf
+
+# The rig's scripts run under sh on a Linux host and inside the Ubuntu VM, and
+# a CRLF checkout turns every line into a command ending in a carriage return.
+testrig/** text eol=lf

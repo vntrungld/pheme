@@ -12,3 +12,10 @@
 # compiled locally (Inno Setup runs under wine, which is how the compile is
 # checked without a Windows machine). OutputDir in pheme.iss names it.
 /packaging/windows/Output
+
+# The rig's SSH keypair, generated per checkout, and its scratch state. The
+# key authorises access to throwaway VMs and must never be committed; the
+# state directory holds generated XML, seed ISOs and the run lock.
+/testrig/id_rig
+/testrig/id_rig.pub
+/testrig/.state
