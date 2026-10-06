@@ -27,37 +27,37 @@ Run before every release, for **each** row of the matrix. Record the result
 
 ## Steps and pass criteria
 
-1. **Pairing** — `pheme server --pair` on the server, `pheme pair <ip> <code>` on the
+1. **S1 Pairing** — `pheme server --pair` on the server, `pheme pair <ip> <code>` on the
    client. Both print "Paired". Then from a third, unpaired machine (or after deleting
    the client's `trusted.toml`) run `pheme client <ip>`: the connection must be refused
    and the server log must show "rejecting untrusted peer".
-2. **Edge switch** — with `pheme server` and `pheme client <ip>` running, push the
+2. **S2 Edge switch** — with `pheme server` and `pheme client <ip>` running, push the
    pointer through the server's right edge: the server cursor disappears, the client
    cursor appears at the matching height on its left edge. Move left past the client's
    left edge: control returns, the server cursor reappears one pixel inside its right
    edge at the matching height.
-3. **Sliding along the edge** — drag the pointer up and down while touching the right
+3. **S3 Sliding along the edge** — drag the pointer up and down while touching the right
    edge for 5 s: no switch.
-4. **Typing** — on the client, open a text editor and type 100 characters including
+4. **S4 Typing** — on the client, open a text editor and type 100 characters including
    `Shift+letters`, `Ctrl+A`/`Ctrl+C`/`Ctrl+V`, `Alt+Tab`, arrows, Home/End, Numpad
    digits with NumLock on, `PrintScreen`, `Pause`, F1–F12. Everything arrives, nothing
    repeats, no key is left held (check with `xev`/`evtest` on Linux or by typing after).
-5. **Modifier across the edge** — hold Shift on the server, cross to the client, release
+5. **S5 Modifier across the edge** — hold Shift on the server, cross to the client, release
    Shift on the client, then type `a` on the client (expect `a`) and, after crossing
    back, `a` on the server (expect `a`): nothing stays stuck on either side. (The
    modifier state at `Enter` is logged, not replayed on the client.)
-6. **Scrolling** — vertical and horizontal wheel on the client scroll smoothly; one
+6. **S6 Scrolling** — vertical and horizontal wheel on the client scroll smoothly; one
    notch = one notch. Hi-res mice (free-spin) scroll proportionally.
-7. **Lock hotkey** — press ScrollLock on the server: the pointer can no longer leave;
+7. **S7 Lock hotkey** — press ScrollLock on the server: the pointer can no longer leave;
    press again: it can. While on the client, press ScrollLock: the pointer cannot
    return until pressed again.
-8. **Client disconnect** — while controlling the client, unplug its network. Within
+8. **S8 Client disconnect** — while controlling the client, unplug its network. Within
    5 s the server regains its cursor at the screen centre and no key stays held on the
    client. Plug the cable back in: the client reconnects within 10 s and the edge
    switch works again.
-9. **Multi-monitor client** — with two monitors on the client, `Enter` lands on the
+9. **S9 Multi-monitor client** — with two monitors on the client, `Enter` lands on the
    monitor adjacent to the server edge and the pointer can travel across both.
-10. **Stats** — run both sides with `--stats`. The client logs a `stats/s` line every
+10. **S10 Stats** — run both sides with `--stats`. The client logs a `stats/s` line every
     second with `rtt_us`, `received` and `lost` (datagrams missing from the `seq`
     numbering); the server logs `events`, `control` and `datagrams` sent. On a wired
     LAN `rtt_us` stays below 1000 and `lost` stays at 0 during 1 minute of continuous

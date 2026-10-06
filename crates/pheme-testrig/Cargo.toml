@@ -1,0 +1,22 @@
+[package]
+name = "pheme-testrig"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+# Test equipment for testrig/, never shipped: it is in no package's asset list.
+publish = false
+
+# Deliberately depends on no pheme crate. The runner's job is to judge pheme
+# from outside, and a runner that linked the product could accidentally assert
+# against its types instead of against the machine's behaviour.
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

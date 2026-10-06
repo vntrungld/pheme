@@ -1,0 +1,6 @@
+#!/bin/sh
+# Entry point. Builds the runner if needed, then hands over.
+set -eu
+cd "$(dirname "$0")/.."
+cargo build --release -p pheme-testrig
+exec ./target/release/pheme-testrig "$@"
