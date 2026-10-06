@@ -4,3 +4,11 @@
 
 pub mod emit;
 pub mod gesture;
+pub mod record;
+pub mod selfcheck;
+pub mod tally;
+
+#[cfg(target_os = "linux")]
+mod record_linux;
+#[cfg(target_os = "windows")]
+mod record_windows;

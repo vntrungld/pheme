@@ -18,11 +18,6 @@ use crate::gesture::ProbeEvent;
 /// One notch, in the 1/120ths `InputInject::wheel` takes.
 const NOTCH: i32 = 120;
 
-/// The name `pheme-input`'s uinput backend gives its device -- the one pheme's
-/// client injects through, and the one this probe creates when it emits.
-#[cfg(target_os = "linux")]
-pub const PHEME_DEVICE: &str = "Pheme Virtual Input";
-
 #[cfg(target_os = "linux")]
 fn device_listed(name: &str) -> bool {
     evdev::enumerate().any(|(_, d)| d.name() == Some(name))
@@ -52,7 +47,7 @@ pub fn open() -> Result<Box<dyn InputInject>> {
     // it, and events sent in that gap go nowhere. Wait until it is listed
     // among the system's input devices -- a condition, against a deadline.
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !device_listed(PHEME_DEVICE) {
+    while !device_listed(crate::record::PHEME_DEVICE) {
         if Instant::now() >= deadline {
             return Err(anyhow!(
                 "the uinput device never appeared among /dev/input devices"
