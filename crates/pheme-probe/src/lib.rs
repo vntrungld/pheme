@@ -1,0 +1,6 @@
+//! The rig's instrument. Runs inside the test VMs: emits input on the machine
+//! acting as server, and records what arrives on the machine acting as client.
+//! See `testrig/` and `docs/superpowers/specs/2026-09-30-test-rig-design.md`.
+
+pub mod emit;
+pub mod gesture;

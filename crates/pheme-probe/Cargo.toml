@@ -1,0 +1,31 @@
+[package]
+name = "pheme-probe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+# Test equipment for testrig/, never shipped: it is in no package's asset list.
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+# The probe reuses the product's key table and its injectors rather than
+# growing its own. A probe with its own idea of a keyboard would test itself.
+pheme-proto = { workspace = true }
+pheme-input = { workspace = true }
+
+# Same versions pheme-input pins, so the workspace resolves one copy of each.
+[target.'cfg(target_os = "linux")'.dependencies]
+evdev = "0.13"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
