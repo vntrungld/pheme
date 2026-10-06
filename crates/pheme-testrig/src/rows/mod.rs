@@ -9,6 +9,8 @@ use anyhow::{bail, Result};
 
 use crate::verdict::{RowResult, Verdict};
 
+pub mod pkg;
+
 /// How a row is judged.
 #[derive(Debug, Clone, Copy)]
 pub enum Run {
@@ -16,6 +18,8 @@ pub enum Run {
     Skip(&'static str),
     /// Judged by the rig, but not implemented yet. Reported SKIPPED.
     NotYet,
+    /// Judged from installing the `.deb` on the Ubuntu VM; see [`pkg`].
+    Package,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -36,7 +40,7 @@ const fn row(id: &'static str, what: &'static str, run: Run) -> RowSpec {
     RowSpec { id, what, run }
 }
 
-use Run::{NotYet, Skip};
+use Run::{NotYet, Package, Skip};
 
 const ROWS: &[RowSpec] = &[
     row("S1", "pairing, and refusal of an untrusted peer", NotYet),
@@ -136,13 +140,13 @@ const ROWS: &[RowSpec] = &[
     row(
         "F1",
         "apt install of the .deb on a machine with no GTK",
-        NotYet,
+        Package,
     ),
     row("F2", "dnf install of the .rpm on a clean Fedora", Skip(RPM)),
-    row("F3", "pheme displays right after install", NotYet),
+    row("F3", "pheme displays right after install", Package),
     row("F4", "systemd user service across a sign-in", Skip(SESSION)),
     row("F5", "application menu entry", Skip(SESSION)),
-    row("F6", "remove and purge keep only the user config", NotYet),
+    row("F6", "remove and purge keep only the user config", Package),
     row("F7", "Windows installer as a standard user", Skip(SESSION)),
     row("F8", "start at sign-in", Skip(SESSION)),
     row("F9", "Add to PATH, new terminal", Skip(SESSION)),
@@ -185,10 +189,9 @@ pub fn without_vms(row: &RowSpec, dry_run: bool) -> Option<RowResult> {
     let evidence = match row.run {
         Run::Skip(why) => why,
         Run::NotYet => "not implemented in the rig yet",
+        Run::Package if dry_run => "dry run: no VM was touched",
+        Run::Package => return None,
     };
-    // Every arm above is decidable without a VM until rows can run, at which
-    // point `dry_run` is what keeps a dry run from touching one.
-    let _ = dry_run;
     Some(RowResult {
         id: row.id.to_string(),
         what: row.what.to_string(),
@@ -288,6 +291,18 @@ mod tests {
         let e1 = select("E1").expect("known")[0];
         let got = without_vms(&e1, true).expect("permanent skips need no VM");
         assert!(got.evidence.contains("VCP 0x60"), "{}", got.evidence);
+    }
+
+    /// The production change that breaks this: decide a runnable row without
+    /// a VM -- it would be reported without ever being run -- or let a dry
+    /// run reach one.
+    #[test]
+    fn a_runnable_row_needs_a_vm_except_in_a_dry_run() {
+        let f1 = select("F1").expect("known")[0];
+        assert!(without_vms(&f1, false).is_none());
+        let dry = without_vms(&f1, true).expect("a dry run decides alone");
+        assert_eq!(dry.verdict, Verdict::Skipped);
+        assert!(dry.evidence.contains("dry run"), "{}", dry.evidence);
     }
 
     #[test]
