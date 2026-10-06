@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="utf-8"?>
+<unattend xmlns="urn:schemas-microsoft-com:unattend"
+          xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+  <settings pass="windowsPE">
+    <component name="Microsoft-Windows-International-Core-WinPE"
+               processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35"
+               language="neutral" versionScope="nonSxS">
+      <SetupUILanguage><UILanguage>en-US</UILanguage></SetupUILanguage>
+      <InputLocale>en-US</InputLocale><SystemLocale>en-US</SystemLocale>
+      <UILanguage>en-US</UILanguage><UserLocale>en-US</UserLocale>
+    </component>
+    <component name="Microsoft-Windows-Setup" processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <UserData>
+        <AcceptEula>true</AcceptEula>
+        <!-- The Evaluation image needs no key. -->
+      </UserData>
+      <ImageInstall><OSImage><InstallTo>
+        <DiskID>0</DiskID><PartitionID>3</PartitionID>
+      </InstallTo></OSImage></ImageInstall>
+      <DiskConfiguration>
+        <WillShowUI>OnError</WillShowUI>
+        <Disk wcm:action="add">
+          <DiskID>0</DiskID><WillWipeDisk>true</WillWipeDisk>
+          <CreatePartitions>
+            <CreatePartition wcm:action="add"><Order>1</Order><Type>EFI</Type><Size>260</Size></CreatePartition>
+            <CreatePartition wcm:action="add"><Order>2</Order><Type>MSR</Type><Size>16</Size></CreatePartition>
+            <CreatePartition wcm:action="add"><Order>3</Order><Type>Primary</Type><Extend>true</Extend></CreatePartition>
+          </CreatePartitions>
+          <ModifyPartitions>
+            <ModifyPartition wcm:action="add"><Order>1</Order><PartitionID>1</PartitionID><Format>FAT32</Format></ModifyPartition>
+            <ModifyPartition wcm:action="add"><Order>2</Order><PartitionID>2</PartitionID></ModifyPartition>
+            <ModifyPartition wcm:action="add"><Order>3</Order><PartitionID>3</PartitionID><Format>NTFS</Format><Letter>C</Letter></ModifyPartition>
+          </ModifyPartitions>
+        </Disk>
+      </DiskConfiguration>
+    </component>
+  </settings>
+  <settings pass="specialize">
+    <!-- OpenSSH is set up here, as SYSTEM, and not in FirstLogonCommands:
+         those run as the account that logs on, and `rig` is deliberately not
+         an administrator, so installing a capability, a service and a
+         firewall rule would all be refused.
+
+         The seed is a CD-ROM whose drive letter depends on enumeration
+         order, so it is found by the file it carries rather than assumed. -->
+    <component name="Microsoft-Windows-Deployment" processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <RunSynchronous>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Path>cmd /c for %i in (D E F G H I J) do @if exist %i:\setup-ssh.ps1 powershell -NoProfile -ExecutionPolicy Bypass -File %i:\setup-ssh.ps1 &gt; C:\Windows\Temp\pheme-rig-setup.log 2&gt;&amp;1</Path>
+        </RunSynchronousCommand>
+      </RunSynchronous>
+    </component>
+  </settings>
+  <settings pass="oobeSystem">
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <OOBE>
+        <HideEULAPage>true</HideEULAPage><HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE><ProtectYourPC>3</ProtectYourPC>
+      </OOBE>
+      <UserAccounts>
+        <!-- `rig` is a STANDARD user on purpose: row F7 asserts the installer
+             needs no elevation, and an administrator would pass that row no
+             matter what the installer does. -->
+        <LocalAccounts>
+          <LocalAccount wcm:action="add">
+            <Name>rig</Name><Group>Users</Group>
+            <Password><Value>rig</Value><PlainText>true</PlainText></Password>
+          </LocalAccount>
+        </LocalAccounts>
+      </UserAccounts>
+      <AutoLogon><Username>rig</Username><Enabled>true</Enabled><LogonCount>999</LogonCount>
+        <Password><Value>rig</Value><PlainText>true</PlainText></Password></AutoLogon>
+    </component>
+  </settings>
+</unattend>
