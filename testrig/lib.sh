@@ -49,3 +49,11 @@ rig_ssh() {
         -o LogLevel=ERROR -o ConnectTimeout=5 \
         "$_user@$_ip" "$@"
 }
+
+# The guest's IPv4 address, from the DHCP lease libvirt handed it. Printed on
+# stdout; empty and non-zero if the guest has no lease yet, which is what
+# makes it usable as a wait_until condition.
+rig_vm_ip() {
+    virsh -c qemu:///system domifaddr "$1" 2>/dev/null \
+        | awk '/ipv4/ {sub("/.*","",$4); print $4; found=1} END {exit !found}'
+}
