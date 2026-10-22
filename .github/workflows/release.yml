@@ -17,7 +17,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # Pinned, not ubuntu-latest: cargo-deb's $auto resolves the .deb's
+          # Depends against this runner's own dpkg database, and the install
+          # check below runs it in an ubuntu:24.04 container. The two must be
+          # the same release. When ubuntu-latest moved to Ubuntu 26 the .deb
+          # named packages 24.04 does not have and the install failed.
+          - os: ubuntu-24.04
             name: x86_64-linux
           - os: windows-latest
             name: x86_64-windows
