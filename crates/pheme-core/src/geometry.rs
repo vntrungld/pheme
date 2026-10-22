@@ -117,15 +117,27 @@ pub fn on_edge(rect: &Rect, side: Side, x: i32, y: i32) -> Option<i32> {
     })
 }
 
+/// How far inside the client's return edge the pointer enters: 1% of the client's extent
+/// across that edge, and at least one pixel.
+///
+/// Entering *on* the return edge put the virtual position on the leave threshold, so the
+/// first backward count of a slowly moved mouse -- sensor jitter, 7 ms after the crossing
+/// on a real link -- sent the pointer straight back. The inset is the hysteresis: a twitch
+/// stays on the client, a deliberate move of a few millimetres returns.
+pub fn entry_inset(extent: i32) -> i32 {
+    (extent / 100).max(1)
+}
+
 /// Maps an along-edge coordinate on the server segment to the entry point on the client's
-/// opposite edge, relative to the client rect origin.
+/// opposite edge, relative to the client rect origin, [`entry_inset`] inside that edge.
 pub fn project_entry(seg: &EdgeSegment, along: i32, client: &Rect) -> (u16, u16) {
     let t = (along - seg.start) as f32 / seg.len() as f32;
+    let (ix, iy) = (entry_inset(client.w), entry_inset(client.h));
     let (x, y) = match seg.side {
-        Side::Right => (0, (t * client.h as f32) as i32),
-        Side::Left => (client.w - 1, (t * client.h as f32) as i32),
-        Side::Bottom => ((t * client.w as f32) as i32, 0),
-        Side::Top => ((t * client.w as f32) as i32, client.h - 1),
+        Side::Right => (ix, (t * client.h as f32) as i32),
+        Side::Left => (client.w - 1 - ix, (t * client.h as f32) as i32),
+        Side::Bottom => ((t * client.w as f32) as i32, iy),
+        Side::Top => ((t * client.w as f32) as i32, client.h - 1 - iy),
     };
     (
         x.clamp(0, client.w - 1) as u16,
@@ -281,25 +293,25 @@ mod tests {
             w: 500,
             h: 2000,
         };
-        assert_eq!(project_entry(&seg, 500, &client), (0, 1000));
+        assert_eq!(project_entry(&seg, 500, &client), (5, 1000));
         let seg = EdgeSegment {
             side: Side::Left,
             start: 0,
             end: 1000,
         };
-        assert_eq!(project_entry(&seg, 0, &client), (499, 0));
+        assert_eq!(project_entry(&seg, 0, &client), (494, 0));
         let seg = EdgeSegment {
             side: Side::Bottom,
             start: 200,
             end: 400,
         };
-        assert_eq!(project_entry(&seg, 300, &client), (250, 0));
+        assert_eq!(project_entry(&seg, 300, &client), (250, 20));
         let seg = EdgeSegment {
             side: Side::Top,
             start: 0,
             end: 100,
         };
-        assert_eq!(project_entry(&seg, 99, &client), (495, 1999));
+        assert_eq!(project_entry(&seg, 99, &client), (495, 1979));
     }
 
     #[test]

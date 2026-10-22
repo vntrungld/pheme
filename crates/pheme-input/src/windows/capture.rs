@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
 use pheme_core::{CaptureEvent, Rect};
@@ -34,6 +34,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::keymap::{scancode_to_hid, KEY_NUM_LOCK, KEY_PAUSE, KEY_PRINT_SCREEN};
 use crate::windows::screens::{ensure_dpi_aware, enum_screens};
+use crate::windows::settle::{Settle, Verdict};
 use crate::{CaptureMode, Error, InputCapture, Result};
 
 const WM_SET_MODE: u32 = WM_APP + 1;
@@ -49,6 +50,10 @@ struct Hooks {
     grab: bool,
     /// Where the hook thread reports the result of the pending `WM_SET_MODE`, if any.
     ack: Option<mpsc::Sender<Result<()>>>,
+    /// Set by `release` for the moves still queued from the grab; see [`Settle`].
+    settle: Option<Settle>,
+    /// Set by `release`: where the ungrab puts the cursor before showing it again.
+    warp_to: Option<(i32, i32)>,
 }
 
 /// Shared with the hook procedures (they are plain functions without a `self`).
@@ -72,6 +77,32 @@ fn send(ev: CaptureEvent) {
 fn set_grab_flag(on: bool) {
     if let Some(h) = HOOKS.lock().unwrap().as_mut() {
         h.grab = on;
+        if on {
+            h.settle = None;
+            h.warp_to = None;
+        }
+    }
+}
+
+fn take_warp_to() -> Option<(i32, i32)> {
+    HOOKS
+        .lock()
+        .unwrap()
+        .as_mut()
+        .and_then(|h| h.warp_to.take())
+}
+
+/// Where a move at `pt` really belongs while a release is settling: `Some` for a stale
+/// move, which the caller swallows and replaces with a warp there; `None` to pass it on.
+fn settle_move(pt: (i32, i32)) -> Option<(i32, i32)> {
+    let mut hooks = HOOKS.lock().unwrap();
+    let h = hooks.as_mut()?;
+    match h.settle.as_mut()?.judge(pt, Instant::now()) {
+        Verdict::Stale { to } => Some(to),
+        Verdict::Done => {
+            h.settle = None;
+            None
+        }
     }
 }
 
@@ -123,10 +154,18 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
             let msg = wparam.0 as u32;
             let grab = grabbing();
             match msg {
-                WM_MOUSEMOVE if !grab => send(CaptureEvent::MotionAbs {
-                    x: m.pt.x,
-                    y: m.pt.y,
-                }),
+                WM_MOUSEMOVE if !grab => match settle_move((m.pt.x, m.pt.y)) {
+                    Some((x, y)) => {
+                        // Stale: applying it would undo the release's warp.
+                        let _ = SetCursorPos(x, y);
+                        send(CaptureEvent::MotionAbs { x, y });
+                        return LRESULT(1);
+                    }
+                    None => send(CaptureEvent::MotionAbs {
+                        x: m.pt.x,
+                        y: m.pt.y,
+                    }),
+                },
                 WM_MOUSEMOVE => {} // deltas come from Raw Input while grabbing
                 _ if !grab => {}
                 WM_LBUTTONDOWN | WM_LBUTTONUP => send(CaptureEvent::Button {
@@ -329,7 +368,15 @@ impl HookThread {
                 }
             }
         } else {
-            let r = ClipCursor(None).map_err(|e| Error::Backend(format!("ClipCursor(None): {e}")));
+            let mut r =
+                ClipCursor(None).map_err(|e| Error::Backend(format!("ClipCursor(None): {e}")));
+            // Warp before showing: the cursor is still at the park point, and showing it
+            // there first flashed it in the middle of the screen for a few milliseconds.
+            if let Some((x, y)) = take_warp_to() {
+                r = r.and(
+                    SetCursorPos(x, y).map_err(|e| Error::Backend(format!("SetCursorPos: {e}"))),
+                );
+            }
             // Show the cursor even if unclipping failed: staying invisible is worse.
             self.show_cursor();
             if r.is_err() {
@@ -424,6 +471,8 @@ fn hook_thread_main(
             tx,
             grab: false,
             ack: None,
+            settle: None,
+            warp_to: None,
         });
         let _ = ready.send(Ok(GetCurrentThreadId()));
         let mut ht = ht;
@@ -512,13 +561,28 @@ impl InputCapture for WindowsCapture {
         self.screens.clone()
     }
 
-    /// Ungrab, then warp. Both are attempted even if the first fails: the previous
-    /// `Ungrab` + `WarpCursor` pair kept going after a failed ungrab, and dropping the
-    /// warp would leave the pointer wherever the grab had parked it.
+    /// Ungrab and warp. The hook thread does the warp itself, between unclipping and
+    /// showing the cursor, so the cursor never appears at the park point. When the ungrab
+    /// fails the warp is attempted again from here: dropping it would leave the pointer
+    /// wherever the grab had parked it.
+    ///
+    /// The settle is armed before the ungrab: the stale moves are released the moment
+    /// the hook stops swallowing, which is before `set_mode` returns.
     fn release(&mut self, x: i32, y: i32) -> Result<()> {
+        let bounds = Rect::bounds(&self.screens);
+        // The same park point `start` hands the hook thread.
+        let park = bounds.center();
+        let radius = bounds.w.min(bounds.h) / 4;
+        if let Some(h) = HOOKS.lock().unwrap().as_mut() {
+            h.settle = Some(Settle::new(park, (x, y), radius, Instant::now()));
+            h.warp_to = Some((x, y));
+        }
         let ungrab = self.set_mode(CaptureMode::Observe);
-        let warp = self.warp_cursor(x, y);
-        ungrab.and(warp)
+        if ungrab.is_err() {
+            take_warp_to();
+            return ungrab.and(self.warp_cursor(x, y));
+        }
+        ungrab
     }
 
     fn stop(&mut self) {

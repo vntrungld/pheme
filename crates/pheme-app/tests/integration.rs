@@ -250,7 +250,7 @@ async fn server_and_client_exchange_input_over_quic() {
     assert!(connected, "client never connected");
     assert!(
         wait_until(
-            || inj_log.calls().contains(&InjectCall::MoveAbs(0, 250)),
+            || inj_log.calls().contains(&InjectCall::MoveAbs(10, 250)),
             Duration::from_secs(2)
         )
         .await
@@ -621,7 +621,7 @@ async fn failed_grab_leaves_server_local() {
     // One full successful cycle first: Enter reaches the client, then cross back.
     assert!(
         wait_until(
-            || inj.calls().contains(&InjectCall::MoveAbs(0, 250)),
+            || inj.calls().contains(&InjectCall::MoveAbs(10, 250)),
             Duration::from_secs(2)
         )
         .await
@@ -671,7 +671,7 @@ async fn failed_grab_leaves_server_local() {
     assert!(
         wait_until(
             || inj.calls().len() > inj_before.len()
-                && inj.calls()[inj_before.len()..].contains(&InjectCall::MoveAbs(0, 250)),
+                && inj.calls()[inj_before.len()..].contains(&InjectCall::MoveAbs(10, 250)),
             Duration::from_secs(2)
         )
         .await,

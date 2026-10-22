@@ -566,7 +566,7 @@ mod tests {
         let actions = enter_right(&mut c);
         assert!(matches!(actions[0], Action::Grab));
         assert!(matches!(actions[1], Action::WarpCursor { x: 960, y: 540 }));
-        assert_eq!(has_enter(&actions), Some((0, 250, Modifiers(0))));
+        assert_eq!(has_enter(&actions), Some((10, 250, Modifiers(0))));
         assert_eq!(c.active(), Active::Remote("lap".into()));
     }
 
@@ -575,17 +575,17 @@ mod tests {
         let mut c = core(Side::Left, (0.0, 1.0));
         c.on_event(CaptureEvent::MotionAbs { x: 5, y: 0 });
         let a = c.on_event(CaptureEvent::MotionAbs { x: 0, y: 0 });
-        assert_eq!(has_enter(&a), Some((999, 0, Modifiers(0))));
+        assert_eq!(has_enter(&a), Some((989, 0, Modifiers(0))));
 
         let mut c = core(Side::Top, (0.0, 1.0));
         c.on_event(CaptureEvent::MotionAbs { x: 960, y: 5 });
         let a = c.on_event(CaptureEvent::MotionAbs { x: 960, y: 0 });
-        assert_eq!(has_enter(&a), Some((500, 499, Modifiers(0))));
+        assert_eq!(has_enter(&a), Some((500, 494, Modifiers(0))));
 
         let mut c = core(Side::Bottom, (0.0, 1.0));
         c.on_event(CaptureEvent::MotionAbs { x: 0, y: 1000 });
         let a = c.on_event(CaptureEvent::MotionAbs { x: 0, y: 1079 });
-        assert_eq!(has_enter(&a), Some((0, 0, Modifiers(0))));
+        assert_eq!(has_enter(&a), Some((0, 5, Modifiers(0))));
     }
 
     #[test]
@@ -596,7 +596,7 @@ mod tests {
         assert!(a.is_empty());
         c.on_event(CaptureEvent::MotionAbs { x: 1900, y: 810 });
         let a = c.on_event(CaptureEvent::MotionAbs { x: 1919, y: 810 });
-        assert_eq!(has_enter(&a), Some((0, 250, Modifiers(0))));
+        assert_eq!(has_enter(&a), Some((10, 250, Modifiers(0))));
     }
 
     #[test]
@@ -642,10 +642,41 @@ mod tests {
         assert!(enter_right(&mut c).is_empty());
     }
 
+    /// Measured on a real link: entering at the return edge itself meant the
+    /// next jitter of a slowly moved mouse (`dx = -1`, 7 ms after the crossing)
+    /// sent the pointer straight back. Entry is inset so that a backward
+    /// twitch stays on the client and only a deliberate move returns.
+    #[test]
+    fn a_backward_twitch_right_after_entering_stays_on_the_client() {
+        for (side, dx, dy) in [
+            (Side::Right, -1, 0),
+            (Side::Left, 1, 0),
+            (Side::Bottom, 0, -1),
+            (Side::Top, 0, 1),
+        ] {
+            let mut c = core(side, (0.0, 1.0));
+            let (x, y) = match side {
+                Side::Right => (1919, 540),
+                Side::Left => (0, 540),
+                Side::Bottom => (960, 1079),
+                Side::Top => (960, 0),
+            };
+            c.on_event(CaptureEvent::MotionAbs { x: 960, y: 540 });
+            assert!(has_enter(&c.on_event(CaptureEvent::MotionAbs { x, y })).is_some());
+            let a = c.on_event(CaptureEvent::MotionRel { dx, dy });
+            assert!(
+                !a.iter()
+                    .any(|a| matches!(a, Action::SendControl(Msg::Leave { .. }))),
+                "{side:?}: a one-count twitch left the client: {a:?}"
+            );
+            assert_eq!(c.active(), Active::Remote("lap".into()), "{side:?}");
+        }
+    }
+
     #[test]
     fn remote_motion_forwards_and_leaves_through_the_return_edge() {
         let mut c = core(Side::Right, (0.0, 1.0));
-        enter_right(&mut c); // virtual position (0, 250)
+        enter_right(&mut c); // virtual position (10, 250)
         let a = c.on_event(CaptureEvent::MotionRel { dx: 10, dy: -5 });
         assert!(matches!(
             a[..],
@@ -656,7 +687,7 @@ mod tests {
         assert_eq!(a.len(), 1);
         assert_eq!(c.active(), Active::Remote("lap".into()));
         // cross back through the client's left edge at vy = 0 → server (1918, 0)
-        let a = c.on_event(CaptureEvent::MotionRel { dx: -20, dy: 0 });
+        let a = c.on_event(CaptureEvent::MotionRel { dx: -30, dy: 0 });
         assert!(matches!(a[0], Action::SendControl(Msg::Leave { .. })));
         assert!(matches!(a[1], Action::Ungrab { x: 1918, y: 0 }));
         assert_eq!(c.active(), Active::Local);
@@ -872,7 +903,7 @@ mod tests {
     #[test]
     fn leaving_a_client_ungrabs_at_the_reentry_point() {
         let mut c = core(Side::Right, (0.0, 1.0));
-        enter_right(&mut c); // virtual position (0, 250), entered at server y = 540
+        enter_right(&mut c); // virtual position (10, 250), entered at server y = 540
                              // Walk back past the client's left edge without moving vertically, so the
                              // re-entry point stays at server y = 540.
         let actions = c.on_event(CaptureEvent::MotionRel { dx: -5000, dy: 0 });

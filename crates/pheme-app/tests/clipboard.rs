@@ -67,7 +67,7 @@ impl ClipPair {
     /// from the client's left edge (x = 0) -- the same call
     /// `server_and_client_exchange_input_over_quic` asserts on in `integration.rs`.
     fn injected_enter(&self) -> bool {
-        self.inj.calls().contains(&InjectCall::MoveAbs(0, 250))
+        self.inj.calls().contains(&InjectCall::MoveAbs(10, 250))
     }
 
     async fn shutdown(self) {
