@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
 use pheme_core::{CaptureEvent, Rect};
-use pheme_proto::{Button, ScreenInfo};
+use pheme_proto::{Button, KeyCode, ScreenInfo};
 use tracing::{debug, error, info, warn};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
@@ -15,7 +15,7 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
-use windows::Win32::UI::Input::KeyboardAndMouse::{VK_NUMLOCK, VK_PAUSE, VK_SNAPSHOT};
+use windows::Win32::UI::Input::KeyboardAndMouse::{VK_NUMLOCK, VK_PAUSE, VK_RSHIFT, VK_SNAPSHOT};
 use windows::Win32::UI::Input::{
     GetRawInputData, RegisterRawInputDevices, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, RAWINPUT,
     RAWINPUTDEVICE, RAWINPUTHEADER, RIDEV_INPUTSINK, RID_INPUT, RIM_TYPEMOUSE,
@@ -120,6 +120,21 @@ fn grabbing() -> bool {
         .unwrap_or(false)
 }
 
+/// The key a `WH_KEYBOARD_LL` event is for. Mostly the scancode, except where the hook's
+/// scancode or extended flag does not say which key it was.
+///
+/// Right Shift arrives as scancode 0x36 *with* `LLKHF_EXTENDED` set, which no table entry
+/// matches, so it was dropped as unmapped; its virtual key is unambiguous.
+fn hook_key_to_hid(vk: u16, sc: u16, extended: bool) -> Option<KeyCode> {
+    match vk {
+        v if v == VK_PAUSE.0 => Some(KEY_PAUSE),
+        v if v == VK_NUMLOCK.0 => Some(KEY_NUM_LOCK),
+        v if v == VK_SNAPSHOT.0 => Some(KEY_PRINT_SCREEN),
+        v if v == VK_RSHIFT.0 => Some(KeyCode::RIGHT_SHIFT),
+        _ => scancode_to_hid(sc, extended),
+    }
+}
+
 unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code >= 0 {
         let k = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
@@ -128,12 +143,11 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
             let down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
             let up = msg == WM_KEYUP || msg == WM_SYSKEYUP;
             if down || up {
-                let hid = match k.vkCode as u16 {
-                    v if v == VK_PAUSE.0 => Some(KEY_PAUSE),
-                    v if v == VK_NUMLOCK.0 => Some(KEY_NUM_LOCK),
-                    v if v == VK_SNAPSHOT.0 => Some(KEY_PRINT_SCREEN),
-                    _ => scancode_to_hid(k.scanCode as u16, k.flags.contains(LLKHF_EXTENDED)),
-                };
+                let hid = hook_key_to_hid(
+                    k.vkCode as u16,
+                    k.scanCode as u16,
+                    k.flags.contains(LLKHF_EXTENDED),
+                );
                 match hid {
                     Some(code) => send(CaptureEvent::Key { code, down }),
                     None => debug!(vk = k.vkCode, sc = k.scanCode, "unmapped key"),
@@ -596,5 +610,31 @@ impl InputCapture for WindowsCapture {
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{VK_LSHIFT, VK_RCONTROL};
+
+    #[test]
+    fn right_shift_is_mapped_although_the_hook_flags_it_extended() {
+        assert_eq!(
+            hook_key_to_hid(VK_RSHIFT.0, 0x36, true),
+            Some(KeyCode::RIGHT_SHIFT)
+        );
+        assert_eq!(
+            hook_key_to_hid(VK_RSHIFT.0, 0x36, false),
+            Some(KeyCode::RIGHT_SHIFT)
+        );
+        assert_eq!(
+            hook_key_to_hid(VK_LSHIFT.0, 0x2A, false),
+            Some(KeyCode::LEFT_SHIFT)
+        );
+        assert_eq!(
+            hook_key_to_hid(VK_RCONTROL.0, 0x1D, true),
+            Some(KeyCode::RIGHT_CTRL)
+        );
     }
 }
